@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+webenv/
+venv/
+env/
+
+# Credentials (НИКОГДА не коммитить)
+.env
+exchange_rates.json
+
+# PostgreSQL
+*.sql.bak
+
+# Logs
+*.log
+/tmp/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Project data (слишком большие для GitHub)
+platforms_scan.json
+batch_import_results.json
+batch_import_fast_results.json
+magento_api_check.json
+magento_import_results.json
+shopify_sites.json
+
+# DB dumps
+*.dump
+*.backup
