@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Price Intelligence Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-100">
+    <div class="container mx-auto px-4 py-8">
+        <h1 class="text-4xl font-bold mb-8 text-center">🔥 Price Intelligence Dashboard</h1>
+        
+        <div class="grid grid-cols-4 gap-4 mb-8">
+            <div class="bg-white rounded-lg shadow p-6">
+                <h3 class="text-gray-500 text-sm">Stores</h3>
+                <p class="text-3xl font-bold">{{ stats.stores }}</p>
+            </div>
+            <div class="bg-white rounded-lg shadow p-6">
+                <h3 class="text-gray-500 text-sm">Products</h3>
+                <p class="text-3xl font-bold">{{ stats.products }}</p>
+            </div>
+            <div class="bg-white rounded-lg shadow p-6">
+                <h3 class="text-gray-500 text-sm">Variants</h3>
+                <p class="text-3xl font-bold">{{ stats.variants }}</p>
+            </div>
+            <div class="bg-white rounded-lg shadow p-6">
+                <h3 class="text-gray-500 text-sm">Matches</h3>
+                <p class="text-3xl font-bold">{{ stats.matches }}</p>
+            </div>
+        </div>
+        
+        <!-- Поиск и фильтры -->
+        <form method="get" action="/" class="bg-white rounded-lg shadow p-4 mb-8 flex gap-4 items-end">
+            <div class="flex-1">
+                <label class="block text-sm text-gray-600 mb-1">Search (name / SKU / brand)</label>
+                <input type="text" name="q" value="{{ q }}" placeholder="e.g. Jordan, U990WK4, Nike..."
+                       class="w-full border rounded px-3 py-2">
+            </div>
+            <div>
+                <label class="block text-sm text-gray-600 mb-1">Min Deal Score</label>
+                <select name="min_score" class="border rounded px-3 py-2">
+                    <option value="0"  {% if min_score == 0 %}selected{% endif %}>All</option>
+                    <option value="40" {% if min_score == 40 %}selected{% endif %}>40+ (Normal+)</option>
+                    <option value="60" {% if min_score == 60 %}selected{% endif %}>60+ (Good+)</option>
+                    <option value="80" {% if min_score == 80 %}selected{% endif %}>80+ (Very Good)</option>
+                </select>
+            </div>
+            <button type="submit" class="bg-blue-600 text-white px-6 py-2 rounded hover:bg-blue-700">
+                Filter
+            </button>
+        </form>
+        
+        <h2 class="text-2xl font-bold mb-4">🏆 Top Deals (sorted by Deal Score)</h2>
+        
+        <div class="bg-white rounded-lg shadow overflow-hidden">
+            <table class="min-w-full">
+                <thead class="bg-gray-50">
+                    <tr>
+                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Product</th>
+                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">SKU</th>
+                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Best Price</th>
+                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Market</th>
+                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Discount</th>
+                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Score</th>
+                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Stores</th>
+                    </tr>
+                </thead>
+                <tbody class="divide-y divide-gray-200">
+                    {% for deal in deals %}
+                    <tr class="hover:bg-gray-50 cursor-pointer" onclick="window.location='/product/{{ deal.id }}'">
+                        <td class="px-6 py-4">
+                            <div class="text-sm font-medium text-gray-900">{{ deal.brand }}</div>
+                            <div class="text-sm text-gray-500">{{ deal.name }}</div>
+                        </td>
+                        <td class="px-6 py-4 text-sm text-gray-500 font-mono">{{ deal.sku }}</td>
+                        <td class="px-6 py-4 text-sm font-bold text-green-600">${{ "%.2f"|format(deal.best_price) }}</td>
+                        <td class="px-6 py-4 text-sm text-gray-500">${{ "%.2f"|format(deal.market_median) }}</td>
+                        <td class="px-6 py-4 text-sm font-bold text-{{ deal.color }}-600">{{ "%.1f"|format(deal.discount_pct) }}%</td>
+                        <td class="px-6 py-4">
+                            <span class="px-2 py-1 text-xs font-semibold rounded-full bg-{{ deal.color }}-100 text-{{ deal.color }}-800 whitespace-nowrap">
+                                {{ deal.classification }} {{ deal.deal_score }}
+                            </span>
+                        </td>
+                        <td class="px-6 py-4 text-sm text-gray-500">{{ deal.store_count }}</td>
+                    </tr>
+                    {% else %}
+                    <tr><td colspan="7" class="px-6 py-8 text-center text-gray-500">No deals found. Try lowering the Min Deal Score.</td></tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</body>
+</html>
