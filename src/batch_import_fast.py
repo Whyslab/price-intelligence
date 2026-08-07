@@ -7,7 +7,44 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from src.config import DATABASE_URL
 from src.adapters.shopify_adapter import ShopifyAdapter
+from src.models import Store
 from urllib.parse import urlparse
+from datetime import datetime, timezone
+from sqlalchemy import text
+
+def update_store_sync_metadata(db, domain: str, status: str, error: str = None, products_count: int = 0):
+    """
+    Обновляет sync metadata для магазина.
+    
+    Args:
+        db: SQLAlchemy session
+        domain: домен магазина
+        status: 'success', 'error', 'empty'
+        error: текст ошибки (для status='error')
+        products_count: количество импортированных товаров
+    """
+    try:
+        now = datetime.now(timezone.utc)
+        
+        # Найти магазин по домену
+        store = db.query(Store).filter(Store.domain == domain).first()
+        if not store:
+            return
+        
+        store.last_sync = now
+        store.sync_status = status
+        store.last_error = error
+        
+        if status == 'success':
+            store.last_successful_sync = now
+            store.products_count = products_count
+        
+        db.commit()
+    except Exception as e:
+        print(f"   ⚠️  Failed to update sync metadata: {e}")
+        db.rollback()
+
+
 
 def batch_import_fast(
     max_products_per_store: int = 500,
@@ -61,6 +98,7 @@ def batch_import_fast(
             
             if first_page.status_code != 200:
                 print(f"   ⚠️  Cannot access products.json")
+                update_store_sync_metadata(db, domain, 'error', 'Cannot access products.json')
                 results.append({
                     'store': store_name,
                     'status': 'error',
@@ -104,6 +142,7 @@ def batch_import_fast(
             
             if not products:
                 print(f"   ⚠️  No products found")
+                update_store_sync_metadata(db, domain, 'empty')
                 results.append({
                     'store': store_name,
                     'status': 'empty',
@@ -114,6 +153,9 @@ def batch_import_fast(
             
             # Импортируем
             adapter.import_products(db, products)
+            
+            # Обновляем sync metadata
+            update_store_sync_metadata(db, domain, 'success', products_count=len(products))
             
             results.append({
                 'store': store_name,
@@ -126,12 +168,17 @@ def batch_import_fast(
             db.close()
             
         except Exception as e:
-            print(f"   ❌ Error: {str(e)[:80]}")
+            error_msg = str(e)[:200]
+            print(f"   ❌ Error: {error_msg[:80]}")
+            try:
+                update_store_sync_metadata(db, domain, 'error', error_msg)
+            except:
+                pass
             results.append({
                 'store': store_name,
                 'status': 'error',
                 'products': 0,
-                'error': str(e)[:80]
+                'error': error_msg
             })
         
         # Пауза

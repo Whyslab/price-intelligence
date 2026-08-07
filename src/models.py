@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Text, Numeric, Boolean, Index
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Text, Numeric, Boolean, Index, Float
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import declarative_base
 from sqlalchemy.sql import func
@@ -19,6 +19,12 @@ class Store(Base):
     domain = Column(String, nullable=False)
     currency = Column(String(3), nullable=False)
     region = Column(String(2))
+    last_sync = Column(DateTime(timezone=True))
+    last_successful_sync = Column(DateTime(timezone=True))
+    sync_status = Column(String(20), default='unknown')
+    last_error = Column(Text)
+    products_count = Column(Integer, default=0)
+    reliability_score = Column(Integer, default=0)
 
 class Product(Base):
     __tablename__ = 'products'
@@ -36,6 +42,8 @@ class ProductVariant(Base):
     ean = Column(String, index=True)
     size = Column(String)
     color = Column(String)
+    normalized_size = Column(String(20), index=True)
+    normalized_color = Column(String(20), index=True)
     attributes = Column(JSONB)
     __table_args__ = (
         Index('ix_variant_ean', 'ean'),
@@ -51,6 +59,9 @@ class Offer(Base):
     current_price = Column(Numeric(10, 2), nullable=False)
     old_price = Column(Numeric(10, 2))
     in_stock = Column(Boolean, default=True)
+    original_currency = Column(String(3))
+    exchange_rate = Column(Numeric(12, 6))
+    exchange_rate_timestamp = Column(DateTime(timezone=True))
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     __table_args__ = (
         Index('ix_offer_store_variant', 'store_id', 'variant_id', unique=True),
@@ -63,7 +74,81 @@ class PriceHistory(Base):
     timestamp = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     price = Column(Numeric(10, 2), nullable=False)
     old_price = Column(Numeric(10, 2))
+    original_currency = Column(String(3))
+    exchange_rate = Column(Numeric(12, 6))
     __table_args__ = (
         PrimaryKeyConstraint('variant_id', 'store_id', 'timestamp'),
         Index('ix_price_history_variant_time', 'variant_id', 'timestamp'),
     )
+
+class PriceChange(Base):
+    __tablename__ = 'price_changes'
+    variant_id = Column(Integer, ForeignKey('product_variants.id'), primary_key=True)
+    store_id = Column(Integer, ForeignKey('stores.id'), primary_key=True)
+    started_at = Column(DateTime(timezone=True), primary_key=True)
+    price = Column(Numeric(10, 2), nullable=False)
+    old_price = Column(Numeric(10, 2))
+    ended_at = Column(DateTime(timezone=True))
+    original_currency = Column(String(3))
+    exchange_rate = Column(Numeric(12, 6))
+
+class ProductMatch(Base):
+    __tablename__ = 'product_matches'
+    id = Column(Integer, primary_key=True)
+    canonical_variant_id = Column(Integer, ForeignKey('product_variants.id', ondelete='CASCADE'), nullable=False)
+    matched_variant_id = Column(Integer, ForeignKey('product_variants.id', ondelete='CASCADE'), nullable=False)
+    match_method = Column(String(50), nullable=False)
+    confidence_score = Column(Numeric(3, 2), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    __table_args__ = (
+        Index('idx_matches_canonical', 'canonical_variant_id'),
+        Index('idx_matches_matched', 'matched_variant_id'),
+    )
+
+class PipelineRun(Base):
+    __tablename__ = 'pipeline_runs'
+    id = Column(Integer, primary_key=True)
+    started_at = Column(DateTime(timezone=True), server_default=func.now())
+    finished_at = Column(DateTime(timezone=True))
+    duration_seconds = Column(Integer)
+    status = Column(String(20), nullable=False)
+    steps_completed = Column(Integer, default=0)
+    steps_total = Column(Integer, default=0)
+    error_message = Column(Text)
+
+class CurrencyError(Base):
+    __tablename__ = 'currency_errors'
+    id = Column(Integer, primary_key=True)
+    url = Column(Text)
+    domain = Column(Text)
+    detected_currency = Column(String(3))
+    error_type = Column(String(50))
+    raw_price = Column(Numeric(12, 2))
+    timestamp = Column(DateTime(timezone=False), server_default=func.now())
+
+class BrandCanonical(Base):
+    __tablename__ = 'brand_canonical'
+    id = Column(Integer, primary_key=True)
+    name = Column(String(100), unique=True, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+class BrandAlias(Base):
+    __tablename__ = 'brand_aliases'
+    brand_id = Column(Integer, ForeignKey('brands.id'), primary_key=True)
+    canonical_id = Column(Integer, ForeignKey('brand_canonical.id'))
+    confidence = Column(Float, default=1.0)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+class ColorCanonical(Base):
+    __tablename__ = 'color_canonical'
+    id = Column(Integer, primary_key=True)
+    name = Column(String(50), unique=True, nullable=False)
+    hex_code = Column(String(10))
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+class ColorAlias(Base):
+    __tablename__ = 'color_aliases'
+    original_color = Column(String(200), primary_key=True)
+    canonical_id = Column(Integer, ForeignKey('color_canonical.id'))
+    confidence = Column(Float, default=1.0)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())

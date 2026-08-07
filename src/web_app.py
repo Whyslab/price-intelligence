@@ -103,13 +103,20 @@ async def product_detail(request: Request, product_id: int):
 
     # === ИСТОРИЯ ЦЕН ===
     history_rows = conn.execute(text("""
-        SELECT ph.timestamp, ph.price, s.name FROM price_history ph
-        JOIN stores s ON ph.store_id = s.id WHERE ph.variant_id = :id
-        UNION ALL
-        SELECT ph.timestamp, ph.price, s.name FROM price_history ph
-        JOIN stores s ON ph.store_id = s.id
-        JOIN product_matches pm ON ph.variant_id = pm.matched_variant_id
-        WHERE pm.canonical_variant_id = :id
+        SELECT t.ts, t.price, s.name FROM (
+            SELECT variant_id, store_id, started_at AS ts, price FROM price_changes WHERE variant_id = :id
+            UNION ALL
+            SELECT variant_id, store_id, COALESCE(ended_at, NOW()) AS ts, price FROM price_changes WHERE variant_id = :id
+            UNION ALL
+            SELECT pc.variant_id, pc.store_id, pc.started_at AS ts, pc.price FROM price_changes pc
+            JOIN product_matches pm ON pc.variant_id = pm.matched_variant_id
+            WHERE pm.canonical_variant_id = :id
+            UNION ALL
+            SELECT pc.variant_id, pc.store_id, COALESCE(pc.ended_at, NOW()) AS ts, pc.price FROM price_changes pc
+            JOIN product_matches pm ON pc.variant_id = pm.matched_variant_id
+            WHERE pm.canonical_variant_id = :id
+        ) t
+        JOIN stores s ON t.store_id = s.id
         ORDER BY 1
     """), {'id': product_id}).fetchall()
 
