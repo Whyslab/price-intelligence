@@ -12,7 +12,7 @@ def cleanup():
         
         # 1. Удаляем все данные для чистого старта
         print("  Deleting price_history...")
-        conn.execute(text("DELETE FROM price_history"))
+        conn.execute(text("DELETE FROM price_changes; DELETE FROM price_history"))
         
         print("  Deleting offers...")
         conn.execute(text("DELETE FROM offers"))

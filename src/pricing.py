@@ -4,7 +4,7 @@ Price Sanity Layer + исторические метрики + объясним�
 import statistics
 
 MAX_PRICE = 20000.0
-OUTLIER_RATIO = 5.0
+OUTLIER_RATIO = 3.0
 
 def sanitize_prices(prices: list) -> list:
     """Убирает невозможные цены и выбросы."""

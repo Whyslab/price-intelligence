@@ -124,7 +124,9 @@ def scan_all_sites(sites_file: str, output_file: str):
     print(f"\n✅ Results saved to {output_file}")
 
 if __name__ == "__main__":
+    import sys
+    sites_file = sys.argv[1] if len(sys.argv) > 1 else "all_sites_combined.txt"
     scan_all_sites(
-        sites_file="sites_list.txt",
+        sites_file=sites_file,
         output_file="platforms_scan.json"
     )
