@@ -1,6 +1,8 @@
 from sqlalchemy import create_engine
+
 from src.config import DATABASE_URL
 from src.models import Base
+
 
 def init_db():
     print(f"Connecting to {DATABASE_URL}...")

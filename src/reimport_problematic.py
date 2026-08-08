@@ -1,8 +1,9 @@
 """Перезапуск импорта для магазинов с мусорными ценами"""
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-from src.config import DATABASE_URL
+
 from src.adapters.shopify_adapter import ShopifyAdapter
+from src.config import DATABASE_URL
 
 PROBLEMATIC_STORES = [
     ("Dope-Factory", "https://www.dope-factory.com"),

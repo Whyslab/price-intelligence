@@ -3,11 +3,14 @@ Batch importer для всех Shopify сайтов с rate limiting и логи
 """
 import json
 import time
+from urllib.parse import urlparse
+
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-from src.config import DATABASE_URL
+
 from src.adapters.shopify_adapter import ShopifyAdapter
-from urllib.parse import urlparse
+from src.config import DATABASE_URL
+
 
 def batch_import(batch_size: int = 10, delay: float = 2.0):
     """
@@ -50,7 +53,7 @@ def batch_import(batch_size: int = 10, delay: float = 2.0):
             products = adapter.fetch_products(limit=250)
             
             if not products:
-                print(f"   ⚠️  No products found")
+                print("   ⚠️  No products found")
                 results.append({
                     'store': store_name,
                     'status': 'empty',
@@ -109,10 +112,10 @@ def batch_import(batch_size: int = 10, delay: float = 2.0):
     with open('batch_import_results.json', 'w') as f:
         json.dump(results, f, indent=2)
     
-    print(f"\n✅ Results saved to batch_import_results.json")
+    print("\n✅ Results saved to batch_import_results.json")
     
     if errors:
-        print(f"\n⚠️  Failed stores:")
+        print("\n⚠️  Failed stores:")
         for r in errors[:10]:
             print(f"   {r['store']}: {r['error'][:50]}")
 

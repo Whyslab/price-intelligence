@@ -7,10 +7,24 @@ def validate_gtin_checksum(gtin: str) -> bool:
     gtin = str(gtin).strip()
     if len(gtin) not in [8, 12, 13, 14]:
         return False
+    
+    # Pad to 14 digits
     padded = gtin.zfill(14)
-    total = sum(int(padded[i]) * (1 if i % 2 == 0 else 3) for i in range(13))
-    check = (10 - (total % 10)) % 10
-    return check == int(padded[13])
+    
+    # Calculate checksum: positions 1,3,5,... (1-indexed) multiply by 1
+    # positions 2,4,6,... multiply by 3
+    # In 0-indexed: positions 0,2,4,... (even) multiply by 1
+    # positions 1,3,5,... (odd) multiply by 3
+    total = 0
+    for i in range(13):
+        digit = int(padded[i])
+        if i % 2 == 0:  # 0-indexed even = 1-indexed odd
+            total += digit * 1
+        else:  # 0-indexed odd = 1-indexed even
+            total += digit * 3
+    
+    check_digit = (10 - (total % 10)) % 10
+    return check_digit == int(padded[13])
 
 def is_valid_gtin(gtin) -> bool:
     """Full GTIN validation"""

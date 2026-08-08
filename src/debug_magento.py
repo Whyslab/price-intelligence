@@ -1,8 +1,9 @@
 """
 Диагностика: смотрим сырой ответ от Magento API.
 """
-import requests
 import json
+
+import requests
 
 url = "https://www.footlocker.com/rest/V1/products"
 params = {
@@ -38,7 +39,7 @@ try:
         print(f"Items count: {len(data['items'])}")
         if data['items']:
             print(f"\nFirst item keys: {list(data['items'][0].keys())}")
-            print(f"\nFirst item (truncated):")
+            print("\nFirst item (truncated):")
             print(json.dumps(data['items'][0], indent=2)[:1000])
 except Exception as e:
     print(f"\n❌ Not JSON: {e}")

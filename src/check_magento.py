@@ -2,8 +2,10 @@
 Проверяет доступность Magento API (REST/GraphQL) для 81 сайта.
 """
 import json
-import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import requests
+
 
 def check_magento_api(url: str) -> dict:
     """Проверяет REST и GraphQL endpoints."""
@@ -109,7 +111,7 @@ def scan_magento_sites():
     with open('magento_api_check.json', 'w') as f:
         json.dump(results, f, indent=2)
     
-    print(f"\n✅ Results saved to magento_api_check.json")
+    print("\n✅ Results saved to magento_api_check.json")
     
     # Показываем сайты с доступным API
     working = [r for r in results if r['rest_api'] == 'available' or 'available' in r['graphql']]

@@ -3,10 +3,12 @@ Telegram Notifications: отправляет уведомления о лучш�
 Использует Deal Engine v2 + Fake Discount Analysis + 24h cooldown.
 """
 import os
+
 import requests
-from sqlalchemy import create_engine, text
-from src.config import DATABASE_URL
 from dotenv import load_dotenv
+from sqlalchemy import create_engine, text
+
+from src.config import DATABASE_URL
 
 load_dotenv()
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")

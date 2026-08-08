@@ -1,11 +1,13 @@
 """Импортирует только новые Shopify магазины"""
 import json
 import time
+from urllib.parse import urlparse
+
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-from src.config import DATABASE_URL
+
 from src.adapters.shopify_adapter import ShopifyAdapter
-from urllib.parse import urlparse
+from src.config import DATABASE_URL
 
 # Загружаем список новых магазинов
 with open('new_shopify_stores.json', 'r') as f:
@@ -32,7 +34,7 @@ for i, site in enumerate(new_stores, 1):
         products = adapter.fetch_products(limit=250)
         
         if not products:
-            print(f"   ⚠️  No products")
+            print("   ⚠️  No products")
             results.append({'store': store_name, 'status': 'empty', 'products': 0})
             db.close()
             continue
@@ -76,4 +78,4 @@ print(f"📦 Total products: {sum(r['products'] for r in success)}")
 with open('new_stores_import_results.json', 'w') as f:
     json.dump(results, f, indent=2)
 
-print(f"\n✅ Results saved to new_stores_import_results.json")
+print("\n✅ Results saved to new_stores_import_results.json")

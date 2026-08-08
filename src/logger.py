@@ -2,11 +2,12 @@
 Structured JSON Logger for Price Intelligence.
 Supports correlation IDs (run_id) for tracing pipeline runs across subprocesses.
 """
-import logging
 import json
-import sys
+import logging
 import os
+import sys
 from datetime import datetime, timezone
+
 
 class JsonFormatter(logging.Formatter):
     def format(self, record):

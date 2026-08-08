@@ -2,15 +2,15 @@
 Canonical Deal Score Engine - единый источник истины для Deal Score.
 Все компоненты (Dashboard, Telegram, CLI) ДОЛЖНЫ использовать только эту функцию.
 """
-from typing import Dict, List, Optional
-from src.robust_statistics import robust_market_metrics, calculate_confidence
+
+from src.robust_statistics import calculate_confidence, robust_market_metrics
 
 
 def calculate_canonical_deal_score(
-    prices_data: List[Dict],
-    historical_metrics: Optional[Dict] = None,
+    prices_data: list[dict],
+    historical_metrics: dict | None = None,
     conn=None
-) -> Dict:
+) -> dict:
     """
     Canonical Deal Score.
     

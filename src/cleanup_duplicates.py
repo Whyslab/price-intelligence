@@ -2,7 +2,9 @@
 Скрипт для удаления дубликатов и нормализации брендов.
 """
 from sqlalchemy import create_engine, text
+
 from src.config import DATABASE_URL
+
 
 def cleanup():
     engine = create_engine(DATABASE_URL)

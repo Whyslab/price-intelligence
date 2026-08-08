@@ -6,11 +6,13 @@ Deal Engine v2: находит лучшие сделки с учётом ист�
 - Enhanced Confidence: freshness, store count, price variance
 - Weighted statistics по интервалам (не observations)
 """
-from sqlalchemy import create_engine, text
-from src.config import DATABASE_URL
-from decimal import Decimal
 import statistics
+
+from sqlalchemy import create_engine, text
+
+from src.config import DATABASE_URL
 from src.pricing import sanitize_prices
+
 
 def get_historical_metrics(conn, variant_ids: list) -> dict:
     """
@@ -406,7 +408,7 @@ def analyze_discount_duration_v2(conn, variant_id, store_id, current_price):
             'price_change_frequency': price_change_frequency
         }
         
-    except Exception as e:
+    except Exception:
         return {'is_fake': False, 'discount_tag': '💰 DEAL', 'old_price_duration_days': None, 'price_change_frequency': 0}
 
 

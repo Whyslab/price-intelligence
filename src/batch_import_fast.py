@@ -3,14 +3,16 @@
 """
 import json
 import time
+from datetime import datetime, timezone
+from urllib.parse import urlparse
+
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-from src.config import DATABASE_URL
+
 from src.adapters.shopify_adapter import ShopifyAdapter
+from src.config import DATABASE_URL
 from src.models import Store
-from urllib.parse import urlparse
-from datetime import datetime, timezone
-from sqlalchemy import text
+
 
 def update_store_sync_metadata(db, domain: str, status: str, error: str = None, products_count: int = 0):
     """
@@ -107,7 +109,7 @@ def batch_import_fast(
             )
             
             if first_page.status_code != 200:
-                print(f"   ⚠️  Cannot access products.json")
+                print("   ⚠️  Cannot access products.json")
                 update_store_sync_metadata(db, domain, 'error', 'Cannot access products.json')
                 results.append({
                     'store': store_name,
@@ -152,7 +154,7 @@ def batch_import_fast(
                         break
             
             if not products:
-                print(f"   ⚠️  No products found")
+                print("   ⚠️  No products found")
                 update_store_sync_metadata(db, domain, 'empty')
                 results.append({
                     'store': store_name,
@@ -219,7 +221,7 @@ def batch_import_fast(
     with open('batch_import_fast_results.json', 'w') as f:
         json.dump(results, f, indent=2)
     
-    print(f"\n✅ Results saved to batch_import_fast_results.json")
+    print("\n✅ Results saved to batch_import_fast_results.json")
 
 if __name__ == "__main__":
     batch_import_fast(

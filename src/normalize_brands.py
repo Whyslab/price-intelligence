@@ -2,10 +2,13 @@
 Нормализует существующие бренды с учётом Unicode (умлауты, акценты).
 """
 import unicodedata
+
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
+
 from src.config import DATABASE_URL
 from src.models import Brand
+
 
 def strip_accents(text: str) -> str:
     """Удаляет диакритические знаки: Ü→U, É→E, Ñ→N"""

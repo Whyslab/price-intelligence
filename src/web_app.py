@@ -1,16 +1,19 @@
 from src.canonical_deal_engine import calculate_canonical_deal_score
+
 """
 Web Dashboard: FastAPI + история цен.
 Запуск: python -m src.web_app
 """
-from fastapi import FastAPI, Request, HTTPException
+import statistics
+from collections import defaultdict
+
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import create_engine, text
+
 from src.config import DATABASE_URL
-from src.pricing import deal_metrics, MAX_PRICE
-import statistics
-from collections import defaultdict
+from src.pricing import MAX_PRICE
 
 app = FastAPI(title="Price Intelligence Dashboard")
 templates = Jinja2Templates(directory="templates")

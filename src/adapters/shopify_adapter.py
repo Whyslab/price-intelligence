@@ -1,14 +1,24 @@
-import requests
 import re
-from sqlalchemy.orm import Session
-from src.models import Brand, Store, Product, ProductVariant, Offer, PriceHistory, PriceChange
-from src.config import DATABASE_URL
-from src.pricing import MAX_PRICE
-from src.currency_normalizer import normalize_price, detect_currency
-from src.data_provenance import save_raw_snapshot, get_provenance_metadata
-from sqlalchemy import create_engine
 from datetime import datetime, timezone
 from decimal import Decimal
+
+import requests
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session
+
+from src.config import DATABASE_URL
+from src.currency_normalizer import detect_currency, normalize_price
+from src.data_provenance import save_raw_snapshot
+from src.models import (
+    Brand,
+    Offer,
+    PriceChange,
+    Product,
+    ProductVariant,
+    Store,
+)
+from src.pricing import MAX_PRICE
+
 
 class ShopifyAdapter:
     def __init__(self, store_name: str, base_url: str):
@@ -143,7 +153,7 @@ class ShopifyAdapter:
         if old is None or old <= 0:
             return True
         ratio = new / old
-        return Decimal('0.25') <= ratio <= Decimal('4')
+        return Decimal('0.25') <= ratio <= Decimal(4)
     
     def get_or_create_variant(self, db: Session, product: Product, variant_data: dict) -> ProductVariant:
         """P0-10/P0-12: Использует external_variant_id и with_for_update() для предотвращения race conditions."""
@@ -301,7 +311,7 @@ class ShopifyAdapter:
                             normalized_size=variant.normalized_size,
                             in_stock=variant_data.get('available', True),
                             region=store.region))
-            except Exception as e:
+            except Exception:
                 continue
         
         db.commit()

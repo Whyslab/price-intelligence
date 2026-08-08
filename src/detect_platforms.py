@@ -1,10 +1,11 @@
 """
 Detects platform type for each site (Shopify, WooCommerce, Magento, Custom).
 """
-import requests
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import time
+
+import requests
+
 
 def detect_platform(url: str) -> dict:
     """Определяет платформу сайта."""

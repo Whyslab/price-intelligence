@@ -3,7 +3,9 @@
 Запуск: python -m src.dedup_variants
 """
 from sqlalchemy import create_engine, text
+
 from src.config import DATABASE_URL
+
 
 def dedup():
     engine = create_engine(DATABASE_URL)
