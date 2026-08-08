@@ -106,7 +106,7 @@ def get_exchange_rates() -> tuple:
             for currency, rate in eur_rates.items():
                 if currency == 'USD':
                     continue
-                usd_rates[currency] = Decimal(str(usd_in_eur * rate))
+                usd_rates[currency] = Decimal(str(rate)) / Decimal(str(usd_in_eur))  # 1 USD = rate/usd_in_eur foreign
             
             save_rates_to_cache({k: float(v) for k, v in usd_rates.items()})
             return usd_rates, datetime.now()

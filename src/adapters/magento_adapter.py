@@ -153,15 +153,47 @@ class MagentoAdapter:
                     skipped += 1
                     continue
                 
-                price = Decimal(str(price_str))
+                regular_price = Decimal(str(price_str))
                 
-                # Извлекаем старую цену (special_price)
+                # P0-7: Correct special_price interpretation
+                # special_price = скидочная цена (current), price = обычная цена (old)
+                current_price = regular_price
                 old_price = None
+                
                 special_price = product_data.get('special_price')
                 if special_price:
-                    old_price = Decimal(str(special_price))
+                    special_decimal = Decimal(str(special_price))
+                    # Проверяем, что special_price меньше regular_price
+                    if special_decimal < regular_price:
+                        # Проверяем даты действия special_price (если есть)
+                        from datetime import datetime, timezone
+                        special_from = product_data.get('special_from_date')
+                        special_to = product_data.get('special_to_date')
+                        
+                        now = datetime.now(timezone.utc)
+                        is_active = True
+                        
+                        if special_from:
+                            try:
+                                from_date = datetime.fromisoformat(special_from.replace('Z', '+00:00'))
+                                if now < from_date:
+                                    is_active = False
+                            except:
+                                pass
+                        
+                        if special_to and is_active:
+                            try:
+                                to_date = datetime.fromisoformat(special_to.replace('Z', '+00:00'))
+                                if now > to_date:
+                                    is_active = False
+                            except:
+                                pass
+                        
+                        if is_active:
+                            current_price = special_decimal
+                            old_price = regular_price
                 
-                if not self.is_sane_price(price):
+                if not self.is_sane_price(current_price):
                     skipped += 1
                     continue
                 
@@ -174,7 +206,7 @@ class MagentoAdapter:
                 product_url = f"{self.base_url}/catalog/product/view/id/{product_data.get('id', '')}"
                 
                 if existing_offer:
-                    existing_offer.current_price = price
+                    existing_offer.current_price = current_price
                     existing_offer.old_price = old_price
                     existing_offer.in_stock = product_data.get('status', 1) == 1
                     existing_offer.url = product_url
@@ -183,7 +215,7 @@ class MagentoAdapter:
                         store_id=store.id,
                         variant_id=variant.id,
                         url=product_url,
-                        current_price=price,
+                        current_price=current_price,
                         old_price=old_price,
                         in_stock=product_data.get('status', 1) == 1
                     ))
@@ -193,7 +225,7 @@ class MagentoAdapter:
                     variant_id=variant.id,
                     store_id=store.id,
                     timestamp=datetime.now(timezone.utc),
-                    price=price,
+                    price=current_price,
                     old_price=old_price
                 ))
                 

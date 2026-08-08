@@ -1,4 +1,5 @@
 import requests
+import re
 from sqlalchemy.orm import Session
 from src.models import Brand, Store, Product, ProductVariant, Offer, PriceHistory, PriceChange
 from src.config import DATABASE_URL
@@ -20,28 +21,59 @@ class ShopifyAdapter:
         # Определяем валюту магазина ОДИН РАЗ (v2: None если неизвестна)
         self.store_currency = detect_currency(self.base_url) or 'USD'
     
-    def fetch_products(self, limit: int = 250, max_pages: int = 5) -> list:
-        all_products, page = [], 1
-        while page <= max_pages:
-            url = f"{self.products_url}?limit={limit}&page={page}"
-            response = self.session.get(url, timeout=30)
-            if response.status_code != 200:
+    def fetch_products(self, limit: int = 250, max_pages: int = 50) -> list:
+        """P0-8: Cursor-based pagination через Link header (deprecated page=N)."""
+        all_products = []
+        url = f"{self.products_url}?limit={limit}"
+        page_count = 0
+        
+        while url and page_count < max_pages:
+            try:
+                response = self.session.get(url, timeout=30)
+            except requests.RequestException as e:
+                print(f"   ⚠️  Request failed at page {page_count}: {e}")
                 break
-            products = response.json().get('products', [])
+            
+            if response.status_code != 200:
+                print(f"   ⚠️  HTTP {response.status_code} at page {page_count}")
+                break
+            
+            try:
+                data = response.json()
+            except ValueError:
+                print(f"   ⚠️  Invalid JSON at page {page_count}")
+                break
+            
+            products = data.get('products', [])
             if not products:
                 break
+            
             all_products.extend(products)
-            if len(products) < limit:
+            page_count += 1
+            
+            # Parse Link header для cursor-based pagination
+            link_header = response.headers.get('Link', '')
+            next_url = None
+            for part in link_header.split(','):
+                if 'rel="next"' in part:
+                    match = re.search(r'<([^>]+)>', part.strip())
+                    if match:
+                        next_url = match.group(1)
+                        break
+            
+            if not next_url:
                 break
-            page += 1
+            url = next_url
+        
         return all_products
     
     def normalize_brand_name(self, brand_name: str) -> str:
         return (brand_name or "unknown").lower().strip()
     
     def get_or_create_brand(self, db: Session, brand_name: str) -> Brand:
+        """P0-12: Использует with_for_update() для предотвращения race conditions."""
         normalized = self.normalize_brand_name(brand_name)
-        brand = db.query(Brand).filter(Brand.normalized_name == normalized).first()
+        brand = db.query(Brand).filter(Brand.normalized_name == normalized).with_for_update().first()
         if not brand:
             brand = Brand(name=brand_name or "Unknown", normalized_name=normalized)
             db.add(brand)
@@ -49,9 +81,10 @@ class ShopifyAdapter:
         return brand
     
     def get_or_create_store(self, db: Session) -> Store:
+        """P0-12: Использует with_for_update() для предотвращения race conditions."""
         from urllib.parse import urlparse
         domain = urlparse(self.base_url).netloc
-        store = db.query(Store).filter(Store.domain == domain).first()
+        store = db.query(Store).filter(Store.domain == domain).with_for_update().first()
         if not store:
             store = Store(name=self.store_name, domain=domain, 
                          currency=self.store_currency, region="US")
@@ -72,22 +105,41 @@ class ShopifyAdapter:
         return Decimal('0.25') <= ratio <= Decimal('4')
     
     def get_or_create_variant(self, db: Session, product: Product, variant_data: dict) -> ProductVariant:
+        """P0-10/P0-12: Использует external_variant_id и with_for_update() для предотвращения race conditions."""
         sku = variant_data.get('sku', '')
+        external_variant_id = str(variant_data.get('id', ''))
+        external_product_id = str(variant_data.get('product_id', ''))
+        
         variant = None
-        if sku:
+        
+        # 1. Сначала ищем по external_variant_id (самый надежный идентификатор)
+        if external_variant_id:
+            variant = db.query(ProductVariant).filter(
+                ProductVariant.external_variant_id == external_variant_id
+            ).with_for_update().first()
+        
+        # 2. Если не найден, ищем по SKU (в рамках продукта)
+        if not variant and sku:
             variant = db.query(ProductVariant).filter(
                 ProductVariant.sku == sku,
                 ProductVariant.product_id == product.id
-            ).first()
+            ).with_for_update().first()
+        
+        # 3. Если все еще не найден, создаем новый
         if not variant:
             variant = ProductVariant(
-                product_id=product.id, sku=sku, ean=None,
+                product_id=product.id,
+                sku=sku,
+                ean=variant_data.get('barcode'),
+                external_product_id=external_product_id,
+                external_variant_id=external_variant_id,
                 size=variant_data.get('option1', ''),
                 color=variant_data.get('option2', ''),
                 attributes={'option3': variant_data.get('option3')}
             )
             db.add(variant)
             db.flush()
+        
         return variant
     
     def import_products(self, db: Session, products: list):
@@ -122,7 +174,7 @@ class ShopifyAdapter:
                     if not price_str:
                         continue
                     price = Decimal(price_str)
-                    old_price = Decimal(variant_data['compare_at_price']) if variant_data.get('compare_at_price') else None
+                    old_price_str = variant_data.get('compare_at_price')
                     
                     product_url = f"{self.base_url}/products/{product_data.get('handle', '')}"
                     
@@ -133,6 +185,12 @@ class ShopifyAdapter:
                         # Reject: неизвестная валюта или нет курса
                         currency_rejected += 1
                         continue
+                    
+                    # P0-6: Конвертируем compare_at_price в USD (а не сохраняем в исходной валюте)
+                    old_price = None
+                    if old_price_str:
+                        usd_old, _, _ = normalize_price(Decimal(old_price_str), product_url, api_currency)
+                        old_price = usd_old
                     
                     if original_currency != 'USD':
                         currency_converted += 1

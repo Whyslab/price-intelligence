@@ -47,7 +47,7 @@ def update_store_sync_metadata(db, domain: str, status: str, error: str = None, 
 
 
 def batch_import_fast(
-    max_products_per_store: int = 500,
+    max_products_per_store: int = 50000,  # P0-9: увеличен лимит
     max_pages: int = 10,
     delay: float = 1.0,
     skip_large_stores: bool = False
@@ -61,7 +61,9 @@ def batch_import_fast(
         delay: пауза между сайтами
         skip_large_stores: пропускать магазины с >5000 товаров
     """
-    with open('shopify_sites.json', 'r') as f:
+    import os
+    _base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(_base_dir, 'shopify_sites.json'), 'r') as f:
         sites = json.load(f)
     
     print(f"🚀 Fast batch import of {len(sites)} Shopify sites")
@@ -212,7 +214,7 @@ def batch_import_fast(
 
 if __name__ == "__main__":
     batch_import_fast(
-        max_products_per_store=500,  # Максимум 500 товаров с магазина
+        max_products_per_store=50000,  # P0-9: практически без лимита
         max_pages=5,                  # Максимум 5 страниц (1250 товаров)
         delay=1.0,                    # 1 секунда между сайтами
         skip_large_stores=False
