@@ -1,15 +1,15 @@
 """
-Product Matching v2: связи одинаковых товаров в разных магазинах.
+Product Matching v3: связи одинаковых товаров в разных магазинах.
 
-Правила v2 (вместо v1):
+Правила v3 (улучшения v2):
+- P1-14: EAN/GTIN используется как основной идентификатор (приоритет над SKU)
+- P1-17: Strict size matching - только если оба значения известны и равны
+- P1-18: Strict gender matching - убираем UNKNOWN wildcard
+- P1-20: Canonical выбирается по quality_score (ean > size > color > sku length)
 - только cross-store пары;
-- SKU: btrim + upper;
-- rejected: len<=4, generic (ONE SIZE/DEFAULT/...), числовые 1-6,
-  числовые кроме 12-13 (GTIN UPC/EAN);
 - не-GTIN группы требуют brand consistency (normalized brand_key);
-- canonical = MIN(variant_id) — детерминированно, без циклов;
-- confidence: 0.99 gtin_exact / 0.95 sku_exact.
-Ребилд идемпотентен и атомен (одна транзакция).
+- confidence: 0.99 ean_gtin / 0.97 sku_gtin / 0.95 sku_exact
+- Ребилд идемпотентен и атомен (одна транзакция).
 """
 from sqlalchemy import create_engine, text
 from src.config import DATABASE_URL
@@ -29,7 +29,19 @@ norm AS (
          pv.normalized_size AS nsize,
          pv.normalized_color AS ncolor,
          pv.normalized_gender_age AS ngender,
-         (btrim(pv.sku) ~ '^[0-9]{12,13}$') AS is_gtin
+         -- P1-14: Проверяем оба поля: ean и sku на GTIN
+         (btrim(coalesce(pv.ean, '')) ~ '^[0-9]{12,14}$') AS is_gtin_ean,
+         (btrim(pv.sku) ~ '^[0-9]{12,13}$') AS is_gtin_sku,
+         (btrim(coalesce(pv.ean, '')) ~ '^[0-9]{12,14}$') OR (btrim(pv.sku) ~ '^[0-9]{12,13}$') AS is_gtin,
+         -- P1-20: Quality score для выбора canonical variant
+         (
+           CASE WHEN btrim(coalesce(pv.ean, '')) ~ '^[0-9]{12,14}$' THEN 100 ELSE 0 END +
+           CASE WHEN pv.normalized_size IS NOT NULL AND pv.normalized_size != '' THEN 10 ELSE 0 END +
+           CASE WHEN pv.normalized_color IS NOT NULL AND pv.normalized_color != '' THEN 10 ELSE 0 END +
+           CASE WHEN pv.normalized_gender_age IS NOT NULL AND pv.normalized_gender_age != 'UNKNOWN' THEN 5 ELSE 0 END +
+           CASE WHEN btrim(pv.sku) ~ '^[0-9]{12,13}$' THEN 50 ELSE 0 END +
+           CASE WHEN length(btrim(coalesce(pv.sku, ''))) > 6 THEN 5 ELSE 0 END
+         ) AS quality_score
   FROM product_variants pv
   JOIN vo ON vo.variant_id = pv.id
   JOIN products p ON p.id = pv.product_id
@@ -42,16 +54,43 @@ norm AS (
     AND NOT (btrim(pv.sku) ~ '^[0-9]{1,6}$')
     AND NOT (btrim(pv.sku) ~ '^[0-9]+$' AND length(btrim(pv.sku)) NOT IN (12,13))
 ),
+-- P1-20: Canonical = вариант с максимальным quality_score (а не MIN(id))
+ranked AS (
+  SELECT *,
+         ROW_NUMBER() OVER (
+           PARTITION BY sku 
+           ORDER BY quality_score DESC, variant_id ASC
+         ) AS rank
+  FROM norm
+),
+canonical_selection AS (
+  SELECT sku, variant_id AS canonical
+  FROM ranked
+  WHERE rank = 1
+),
 agg AS (
-  SELECT sku,
-         COUNT(DISTINCT store_id) AS stores,
-         MIN(variant_id) AS canonical,
-         COUNT(DISTINCT brand_key) AS brands
-  FROM norm GROUP BY sku
+  SELECT n.sku,
+         COUNT(DISTINCT n.store_id) AS stores,
+         cs.canonical,
+         COUNT(DISTINCT n.brand_key) AS brands,
+         MAX(n.is_gtin_ean) AS has_ean_gtin,
+         MAX(n.is_gtin_sku) AS has_sku_gtin
+  FROM norm n
+  JOIN canonical_selection cs ON cs.sku = n.sku
+  GROUP BY n.sku, cs.canonical
 )
 SELECT a.canonical, n.variant_id,
-       CASE WHEN n.is_gtin THEN 'gtin_exact' ELSE 'sku_exact' END,
-       CASE WHEN n.is_gtin THEN 0.99 ELSE 0.95 END
+       -- P1-14: Приоритет метода матчинга: EAN > SKU
+       CASE 
+         WHEN n.is_gtin_ean THEN 'ean_gtin'
+         WHEN n.is_gtin_sku THEN 'sku_gtin'
+         ELSE 'sku_exact'
+       END AS match_method,
+       CASE 
+         WHEN n.is_gtin_ean THEN 0.99
+         WHEN n.is_gtin_sku THEN 0.97
+         ELSE 0.95
+       END AS confidence_score
 FROM norm n
 JOIN agg a ON a.sku = n.sku
 JOIN norm cn ON cn.variant_id = a.canonical
@@ -65,13 +104,23 @@ WHERE a.stores >= 2
         AND o2.variant_id = n.variant_id
   )
   AND (n.is_gtin OR a.brands = 1)
-  -- size-aware: матч только при совпадении normalized_size (NULL = unknown, разрешён)
-  AND (n.nsize IS NULL OR cn.nsize IS NULL OR n.nsize = cn.nsize)
-  -- color-aware: матч только при совпадении normalized_color (NULL = unknown, разрешён)
-  AND (n.ncolor IS NULL OR cn.ncolor IS NULL OR n.ncolor = cn.ncolor)
-  -- gender-aware: матч только при совместимости normalized_gender_age
-  AND (n.ngender IS NULL OR cn.ngender IS NULL OR n.ngender = cn.ngender
-       OR n.ngender = 'UNKNOWN' OR cn.ngender = 'UNKNOWN')
+  -- P1-17: Strict size matching - только если оба известны и равны
+  AND (
+    (n.nsize IS NOT NULL AND cn.nsize IS NOT NULL AND n.nsize = cn.nsize)
+    OR (n.nsize IS NULL AND cn.nsize IS NULL AND n.is_gtin)  -- только для GTIN разрешаем оба NULL
+  )
+  -- P1-17: Strict color matching
+  AND (
+    (n.ncolor IS NOT NULL AND cn.ncolor IS NOT NULL AND n.ncolor = cn.ncolor)
+    OR (n.ncolor IS NULL AND cn.ncolor IS NULL AND n.is_gtin)
+  )
+  -- P1-18: Strict gender matching - убираем UNKNOWN wildcard
+  AND (
+    (n.ngender IS NOT NULL AND cn.ngender IS NOT NULL 
+     AND n.ngender != 'UNKNOWN' AND cn.ngender != 'UNKNOWN'
+     AND n.ngender = cn.ngender)
+    OR n.is_gtin  -- для GTIN разрешаем любые комбинации
+  )
 """
 
 
