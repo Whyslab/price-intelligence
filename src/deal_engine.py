@@ -20,6 +20,9 @@ def get_historical_metrics(conn, variant_ids: list) -> dict:
     if not variant_ids:
         return {}
     
+    # P1-22: True weighted median через репликацию данных
+    # PostgreSQL не поддерживает weighted PERCENTILE_CONT напрямую,
+    # поэтому используем трюк: реплицируем строки пропорционально весам
     sql = text("""
         WITH all_variants AS (
             SELECT pm.canonical_variant_id AS vid FROM product_matches pm
@@ -48,6 +51,17 @@ def get_historical_metrics(conn, variant_ids: list) -> dict:
                 MAX(ended_at) OVER (PARTITION BY vid) AS last_observed,
                 FIRST_VALUE(price) OVER (PARTITION BY vid ORDER BY ended_at DESC) AS current_price
             FROM intervals
+        ),
+        replicated AS (
+            -- P1-22: Реплицируем строки пропорционально days_at_price (округляем до целых дней)
+            SELECT 
+                vid,
+                price,
+                total_days,
+                last_observed,
+                current_price,
+                generate_series(1, GREATEST(1, ROUND(days_at_price)::int)) AS replica
+            FROM weighted
         )
         SELECT 
             vid,
@@ -59,8 +73,8 @@ def get_historical_metrics(conn, variant_ids: list) -> dict:
             MAX(total_days) AS total_days,
             MAX(current_price) AS current_price,
             EXTRACT(EPOCH FROM (NOW() - MAX(last_observed))) / 86400 AS days_since_last_update,
-            COUNT(*) AS total_intervals
-        FROM weighted
+            COUNT(DISTINCT price) AS total_intervals
+        FROM replicated
         GROUP BY vid
     """)
     
