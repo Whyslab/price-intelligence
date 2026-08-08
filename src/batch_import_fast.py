@@ -56,7 +56,7 @@ def batch_import_fast(
 
     max_products_per_store: int = 50000,  # P0-9: увеличен лимит
     max_pages: int = 10,
-    delay: float = 1.0,
+    delay: float = 15.0,
     skip_large_stores: bool = False
 ):
     """
