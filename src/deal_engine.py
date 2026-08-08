@@ -54,33 +54,28 @@ def get_historical_metrics(conn, variant_ids: list) -> dict:
                 FIRST_VALUE(price) OVER (PARTITION BY vid ORDER BY ended_at DESC) AS current_price
             FROM intervals
         ),
-        median_calc AS (
-            SELECT 
+        medians AS (
+            SELECT DISTINCT ON (vid)
                 vid,
-                price,
-                cumulative_weight,
-                total_days,
-                last_observed,
-                current_price,
-                ROW_NUMBER() OVER (PARTITION BY vid ORDER BY price) as rn
+                price AS weighted_median
             FROM weighted
+            WHERE cumulative_weight >= total_days / 2.0
+            ORDER BY vid, cumulative_weight
         )
         SELECT 
-            vid,
-            (SELECT price FROM median_calc m2 
-             WHERE m2.vid = median_calc.vid 
-               AND m2.cumulative_weight >= median_calc.total_days / 2.0
-             ORDER BY m2.rn LIMIT 1) AS weighted_median,
-            PERCENTILE_CONT(0.1) WITHIN GROUP (ORDER BY price) AS percentile_10,
-            PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY price) AS percentile_90,
-            MIN(price) AS historical_min,
-            MAX(price) AS historical_max,
-            MAX(total_days) AS total_days,
-            MAX(current_price) AS current_price,
-            EXTRACT(EPOCH FROM (NOW() - MAX(last_observed))) / 86400 AS days_since_last_update,
-            COUNT(DISTINCT price) AS total_intervals
-        FROM median_calc
-        GROUP BY vid
+            w.vid,
+            m.weighted_median,
+            PERCENTILE_CONT(0.1) WITHIN GROUP (ORDER BY w.price) AS percentile_10,
+            PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY w.price) AS percentile_90,
+            MIN(w.price) AS historical_min,
+            MAX(w.price) AS historical_max,
+            MAX(w.total_days) AS total_days,
+            MAX(w.current_price) AS current_price,
+            EXTRACT(EPOCH FROM (NOW() - MAX(w.last_observed))) / 86400 AS days_since_last_update,
+            COUNT(DISTINCT w.price) AS total_intervals
+        FROM weighted w
+        JOIN medians m ON m.vid = w.vid
+        GROUP BY w.vid, m.weighted_median
     """)
     
     result = conn.execute(sql, {'ids': variant_ids}).fetchall()

@@ -108,7 +108,7 @@ def batch_import_fast(
             # Быстрая проверка размера магазина (только первая страница)
             adapter.products_url = f"{adapter.base_url}/products.json"
             first_page = adapter.session.get(
-                f"{adapter.products_url}?limit=250&page=1",
+                f"{adapter.products_url}?limit=250",
                 timeout=10
             )
             
