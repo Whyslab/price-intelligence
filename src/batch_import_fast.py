@@ -115,7 +115,8 @@ def batch_import_fast(
             # Если на первой странице меньше 250 товаров, магазин маленький
             if len(first_page_products) < 250:
                 # Маленький магазин — импортируем всё
-                products = adapter.fetch_products(limit=250)
+                store = adapter.get_or_create_store(db)
+                products, snapshot_id = adapter.fetch_products(limit=250, db=db, store_id=store.id)
             else:
                 # Большой магазин — импортируем только первые N страниц
                 products = []
@@ -154,7 +155,7 @@ def batch_import_fast(
                 continue
             
             # Импортируем
-            adapter.import_products(db, products)
+            adapter.import_products(db, products, snapshot_id=snapshot_id)
             
             # Обновляем sync metadata
             update_store_sync_metadata(db, domain, 'success', products_count=len(products))
