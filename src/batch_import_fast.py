@@ -234,6 +234,6 @@ if __name__ == "__main__":
     batch_import_fast(
         max_products_per_store=50000,  # P0-9: практически без лимита
         max_pages=5,                  # Максимум 5 страниц (1250 товаров)
-        delay=1.0,                    # 1 секунда между сайтами
+        delay=30.0,                    # 1 секунда между сайтами
         skip_large_stores=False
     )
