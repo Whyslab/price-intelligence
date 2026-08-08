@@ -43,16 +43,21 @@ SUPPORTED_CURRENCIES = {'CNY',
     'USD', 'EUR', 'GBP', 'JPY', 'KRW', 'CAD', 'AUD', 'CHF', 'SEK', 'NOK', 'DKK', 'PLN', 'CZK', 'HUF'}
 
 def detect_currency(url: str) -> str:
-    """Определяет валюту по домену. Возвращает None если неизвестна."""
-    domain = urlparse(url).netloc.lower()
-    for store_domain, currency in STORE_CURRENCY_MAP.items():
-        if store_domain in domain:
-            return currency
-    for suffix, currency in DOMAIN_CURRENCY_MAP.items():
-        if domain.endswith(suffix):
-            return currency
-    return None  # Раньше возвращал 'USD' — это было опасно
+    try:
+        """Определяет валюту по домену. Возвращает None если неизвестна."""
+        domain = urlparse(url).netloc.lower()
+        for store_domain, currency in STORE_CURRENCY_MAP.items():
+            if store_domain in domain:
+                return currency
+        for suffix, currency in DOMAIN_CURRENCY_MAP.items():
+            if domain.endswith(suffix):
+                return currency
+        return None  # Раньше возвращал 'USD' — это было опасно
 
+        return None
+    except Exception as e:
+        print(f'⚠️ detect_currency crashed: {e}')
+        return None
 def load_cached_rates() -> dict:
     try:
         with open(CACHE_FILE, 'r') as f:
