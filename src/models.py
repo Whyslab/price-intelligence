@@ -65,6 +65,10 @@ class Offer(Base):
     original_currency = Column(String(3))
     exchange_rate = Column(Numeric(12, 6))
     exchange_rate_timestamp = Column(DateTime(timezone=True))
+    exchange_rate_source = Column(String(50))  # P0-72: 'fixer_io', 'fallback', 'api'
+    currency_source = Column(String(50))  # P0-68: 'api', 'domain', 'manual'
+    parser_version = Column(String(20), default='1.0')  # P0-70
+    raw_snapshot_id = Column(Integer, ForeignKey('raw_snapshots.id'))  # P0-69
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     __table_args__ = (
         UniqueConstraint('store_id', 'variant_id', name='uq_offer_store_variant'),  # P0-12: UNIQUE constraint
@@ -94,6 +98,9 @@ class PriceChange(Base):
     ended_at = Column(DateTime(timezone=True))
     original_currency = Column(String(3))
     exchange_rate = Column(Numeric(12, 6))
+    exchange_rate_source = Column(String(50))  # P0-72
+    parser_version = Column(String(20), default='1.0')  # P0-70
+    raw_snapshot_id = Column(Integer, ForeignKey('raw_snapshots.id'))  # P0-69
 
 class ProductMatch(Base):
     __tablename__ = 'product_matches'
@@ -174,4 +181,24 @@ class DealAlert(Base):
     
     __table_args__ = (
         Index('idx_deal_alerts_sku_store_date', 'sku', 'store_id', 'sent_date', unique=True),
+    )
+
+
+class RawSnapshot(Base):
+    """P0-69: Raw Data Layer — сохраняет оригинальный HTTP response для дебага."""
+    __tablename__ = 'raw_snapshots'
+    id = Column(Integer, primary_key=True)
+    store_id = Column(Integer, ForeignKey('stores.id'), nullable=False)
+    pipeline_run_id = Column(Integer, ForeignKey('pipeline_runs.id'), nullable=True)
+    adapter_name = Column(String(50), nullable=False)  # 'shopify', 'magento'
+    url = Column(Text, nullable=False)
+    http_status = Column(Integer)
+    raw_payload = Column(JSONB, nullable=False)  # Оригинальный JSON
+    response_headers = Column(JSONB)  # HTTP headers (для debug rate limits)
+    parser_version = Column(String(20), default='1.0')
+    products_count = Column(Integer, default=0)
+    fetched_at = Column(DateTime(timezone=True), server_default=func.now())
+    __table_args__ = (
+        Index('ix_raw_snapshot_store_time', 'store_id', 'fetched_at'),
+        Index('ix_raw_snapshot_pipeline', 'pipeline_run_id'),
     )

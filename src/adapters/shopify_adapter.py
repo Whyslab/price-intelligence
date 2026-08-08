@@ -5,6 +5,7 @@ from src.models import Brand, Store, Product, ProductVariant, Offer, PriceHistor
 from src.config import DATABASE_URL
 from src.pricing import MAX_PRICE
 from src.currency_normalizer import normalize_price, detect_currency
+from src.data_provenance import save_raw_snapshot, get_provenance_metadata
 from sqlalchemy import create_engine
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -21,9 +22,16 @@ class ShopifyAdapter:
         # Определяем валюту магазина ОДИН РАЗ (v2: None если неизвестна)
         self.store_currency = detect_currency(self.base_url) or 'USD'
     
-    def fetch_products(self, limit: int = 250, max_pages: int = 50) -> list:
-        """P0-8: Cursor-based pagination через Link header (deprecated page=N)."""
+    def fetch_products(self, limit: int = 250, max_pages: int = 50, db: Session = None, store_id: int = None) -> tuple:
+        """
+        P0-8: Cursor-based pagination через Link header.
+        P0-69: Возвращает (products, snapshot_id) для provenance.
+        
+        Returns:
+            tuple: (list of products, snapshot_id or None)
+        """
         all_products = []
+        all_responses = []  # Собираем raw responses для snapshot
         url = f"{self.products_url}?limit={limit}"
         page_count = 0
         
@@ -43,6 +51,14 @@ class ShopifyAdapter:
             except ValueError:
                 print(f"   ⚠️  Invalid JSON at page {page_count}")
                 break
+            
+            # P0-69: сохраняем raw response
+            all_responses.append({
+                'url': url,
+                'status': response.status_code,
+                'headers': dict(response.headers),
+                'data': data
+            })
             
             products = data.get('products', [])
             if not products:
@@ -65,7 +81,29 @@ class ShopifyAdapter:
                 break
             url = next_url
         
-        return all_products
+        # P0-69: сохраняем aggregated snapshot в БД
+        snapshot_id = None
+        if db and store_id and all_responses:
+            try:
+                aggregated_payload = {
+                    'pages': all_responses,
+                    'total_products': len(all_products),
+                    'fetched_at': datetime.now(timezone.utc).isoformat()
+                }
+                snapshot_id = save_raw_snapshot(
+                    db=db,
+                    store_id=store_id,
+                    adapter_name='shopify',
+                    url=self.products_url,
+                    http_status=all_responses[-1]['status'],
+                    payload=aggregated_payload,
+                    response_headers=all_responses[-1]['headers'],
+                    pipeline_run_id=None  # будет добавлено через env var
+                )
+            except Exception as e:
+                print(f"   ⚠️  Failed to save raw snapshot: {e}")
+        
+        return all_products, snapshot_id
     
     def normalize_brand_name(self, brand_name: str) -> str:
         return (brand_name or "unknown").lower().strip()
@@ -142,7 +180,8 @@ class ShopifyAdapter:
         
         return variant
     
-    def import_products(self, db: Session, products: list):
+    def import_products(self, db: Session, products: list, snapshot_id: int = None):
+        """P0-69: принимает snapshot_id для provenance."""
         store = self.get_or_create_store(db)
         imported = updated = skipped = currency_converted = currency_rejected = 0
         
@@ -219,6 +258,10 @@ class ShopifyAdapter:
                         existing_offer.original_currency = original_currency
                         existing_offer.exchange_rate = exchange_rate
                         existing_offer.exchange_rate_timestamp = now_utc
+                        existing_offer.parser_version = '1.0'
+                        existing_offer.raw_snapshot_id = snapshot_id
+                        existing_offer.exchange_rate_source = 'fixer_io' if original_currency != 'USD' else None
+                        existing_offer.currency_source = 'api' if original_currency else None
                     else:
                         db.add(Offer(
                             store_id=store.id, variant_id=variant.id,
@@ -227,7 +270,11 @@ class ShopifyAdapter:
                             in_stock=variant_data.get('available', True),
                             original_currency=original_currency,
                             exchange_rate=exchange_rate,
-                            exchange_rate_timestamp=now_utc
+                            exchange_rate_timestamp=now_utc,
+                            parser_version='1.0',
+                            raw_snapshot_id=snapshot_id,
+                            exchange_rate_source='fixer_io' if original_currency != 'USD' else None,
+                            currency_source='api'
                         ))
                     
                     open_interval = db.query(PriceChange).filter(
@@ -243,7 +290,10 @@ class ShopifyAdapter:
                             started_at=now_utc,
                             price=usd_price, old_price=old_price,
                             original_currency=original_currency,
-                            exchange_rate=exchange_rate
+                            exchange_rate=exchange_rate,
+                            parser_version='1.0',
+                            raw_snapshot_id=snapshot_id,
+                            exchange_rate_source='fixer_io' if original_currency != 'USD' else None
                         ))
             except Exception as e:
                 continue
@@ -260,8 +310,9 @@ if __name__ == "__main__":
     db = Session()
     try:
         adapter = ShopifyAdapter("A Ma Maniere", "https://www.a-ma-maniere.com")
-        products = adapter.fetch_products(limit=50)
-        adapter.import_products(db, products)
+        store = adapter.get_or_create_store(db)
+        products, snapshot_id = adapter.fetch_products(limit=50, db=db, store_id=store.id)
+        adapter.import_products(db, products, snapshot_id=snapshot_id)
     except Exception as e:
         db.rollback()
         print(f"Failed: {e}")
