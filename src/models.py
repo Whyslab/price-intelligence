@@ -101,6 +101,10 @@ class PriceChange(Base):
     exchange_rate_source = Column(String(50))  # P0-72
     parser_version = Column(String(20), default='1.0')  # P0-70
     raw_snapshot_id = Column(Integer, ForeignKey('raw_snapshots.id'))  # P0-69
+    # P1-24/25: Контекстные поля для точной истории
+    normalized_size = Column(String(20))  # P1-24: размер варианта в момент записи
+    in_stock = Column(Boolean, default=True)  # P1-25: был ли товар в наличии
+    region = Column(String(2))  # P1-26: регион магазина (EU/US/UK/...)
 
 class ProductMatch(Base):
     __tablename__ = 'product_matches'

@@ -72,9 +72,7 @@ agg AS (
   SELECT n.sku,
          COUNT(DISTINCT n.store_id) AS stores,
          cs.canonical,
-         COUNT(DISTINCT n.brand_key) AS brands,
-         MAX(n.is_gtin_ean) AS has_ean_gtin,
-         MAX(n.is_gtin_sku) AS has_sku_gtin
+         COUNT(DISTINCT n.brand_key) AS brands
   FROM norm n
   JOIN canonical_selection cs ON cs.sku = n.sku
   GROUP BY n.sku, cs.canonical
