@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Text, Numeric, Boolean, Index, Float
+from sqlalchemy import Column, Integer, String, DateTime, Date, UniqueConstraint, ForeignKey, Text, Numeric, Boolean, Index, Float
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import declarative_base
 from sqlalchemy.sql import func
@@ -9,14 +9,14 @@ Base = declarative_base()
 class Brand(Base):
     __tablename__ = 'brands'
     id = Column(Integer, primary_key=True)
-    name = Column(String, unique=True, nullable=False)
-    normalized_name = Column(String, index=True)
+    name = Column(String, nullable=False)
+    normalized_name = Column(String, unique=True, index=True)  # P0-12: UNIQUE на normalized_name
 
 class Store(Base):
     __tablename__ = 'stores'
     id = Column(Integer, primary_key=True)
     name = Column(String, unique=True, nullable=False)
-    domain = Column(String, nullable=False)
+    domain = Column(String, nullable=False, unique=True)  # P0-12: UNIQUE constraint
     currency = Column(String(3), nullable=False)
     region = Column(String(2))
     last_sync = Column(DateTime(timezone=True))
@@ -40,10 +40,13 @@ class ProductVariant(Base):
     product_id = Column(Integer, ForeignKey('products.id'), nullable=False)
     sku = Column(String, index=True)
     ean = Column(String, index=True)
+    external_product_id = Column(String, index=True)  # P0-11: Shopify/Magento product ID
+    external_variant_id = Column(String, unique=True, index=True)  # P0-12: UNIQUE constraint
     size = Column(String)
     color = Column(String)
     normalized_size = Column(String(20), index=True)
     normalized_color = Column(String(20), index=True)
+    normalized_gender_age = Column(String(20), index=True)
     attributes = Column(JSONB)
     __table_args__ = (
         Index('ix_variant_ean', 'ean'),
@@ -64,7 +67,7 @@ class Offer(Base):
     exchange_rate_timestamp = Column(DateTime(timezone=True))
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     __table_args__ = (
-        Index('ix_offer_store_variant', 'store_id', 'variant_id', unique=True),
+        UniqueConstraint('store_id', 'variant_id', name='uq_offer_store_variant'),  # P0-12: UNIQUE constraint
     )
 
 class PriceHistory(Base):
@@ -152,3 +155,23 @@ class ColorAlias(Base):
     canonical_id = Column(Integer, ForeignKey('color_canonical.id'))
     confidence = Column(Float, default=1.0)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class DealAlert(Base):
+    __tablename__ = 'deal_alerts'
+    id = Column(Integer, primary_key=True)
+    fingerprint = Column(String(16), unique=True, nullable=False)
+    canonical_variant_id = Column(Integer, ForeignKey('product_variants.id'))
+    matched_variant_id = Column(Integer, ForeignKey('product_variants.id'))
+    store_id = Column(Integer, ForeignKey('stores.id'), nullable=False)
+    price = Column(Numeric(10, 2), nullable=False)
+    deal_score = Column(Integer)
+    confidence = Column(Integer)
+    classification = Column(String(50))
+    reason = Column(Text)
+    sku = Column(String)
+    sent_date = Column(Date, nullable=False, server_default=func.now())
+    
+    __table_args__ = (
+        Index('idx_deal_alerts_sku_store_date', 'sku', 'store_id', 'sent_date', unique=True),
+    )

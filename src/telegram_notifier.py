@@ -23,7 +23,23 @@ def send_telegram_message(msg: str):
                   "disable_web_page_preview": True},
             timeout=10
         )
-        print("✅ Sent" if r.status_code == 200 else f"❌ {r.text[:100]}")
+        # P1-42: Проверяем JSON response, а не только HTTP 200
+        if r.status_code == 200:
+            try:
+                resp_json = r.json()
+                if resp_json.get("ok"):
+                    print("✅ Sent")
+                else:
+                    print(f"❌ Telegram API error: {resp_json.get('description', 'Unknown')}")
+            except ValueError:
+                print("❌ Invalid JSON from Telegram")
+        elif r.status_code == 429:
+            # P1-43: Rate limit handling
+            retry_after = r.json().get('parameters', {}).get('retry_after', 5)
+            print(f"⚠️ Telegram rate limit. Retry after {retry_after}s")
+            import time; time.sleep(retry_after)
+        else:
+            print(f"❌ HTTP {r.status_code}: {r.text[:100]}")
     except Exception as e:
         print(f"❌ {e}")
 
