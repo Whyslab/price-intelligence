@@ -47,7 +47,6 @@ def update_store_sync_metadata(db, domain: str, status: str, error: str = None, 
 
 
 def batch_import_fast(
-    snapshot_id = None
     max_products_per_store: int = 50000,  # P0-9: увеличен лимит
     max_pages: int = 10,
     delay: float = 1.0,

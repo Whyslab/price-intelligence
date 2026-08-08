@@ -44,7 +44,7 @@ class ProductVariant(Base):
     ean = Column(String, index=True)
     external_product_id = Column(String, index=True)  # P0-11: Shopify/Magento product ID
     external_variant_id = Column(
-        String,, index=True)  # P0-12: UNIQUE constraint
+        String, index=True)  # P0-12: UNIQUE constraint
     size = Column(String)
     color = Column(String)
     normalized_size = Column(String(20), index=True)
