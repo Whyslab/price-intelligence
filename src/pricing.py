@@ -2,6 +2,7 @@
 Price Sanity Layer + исторические метрики + объяснимость.
 """
 import statistics
+from src.robust_statistics import remove_outliers_mad, remove_outliers_iqr
 
 MAX_PRICE = 20000.0
 OUTLIER_RATIO = 3.0
@@ -34,7 +35,9 @@ def deal_metrics(prices: list, best_price: float,
         return None
 
     med = statistics.median(clean)
-    if not (med / OUTLIER_RATIO <= best_price <= med * OUTLIER_RATIO):
+    # P1-30: Проверяем через MAD
+    clean_prices = remove_outliers_mad([float(p) for p in valid if p and p > 0], threshold=3.5)
+    if best_price not in clean_prices:
         return None
 
     discount_pct = ((med - best_price) / med) * 100 if med > 0 else 0

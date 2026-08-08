@@ -7,6 +7,7 @@ from sqlalchemy.orm import sessionmaker
 from src.config import DATABASE_URL
 from decimal import Decimal
 import statistics
+from src.robust_statistics import robust_market_metrics, calculate_confidence
 
 def get_matched_prices(db, canonical_variant_id: int) -> list:
     """
