@@ -25,7 +25,7 @@ norm AS (
          upper(btrim(pv.sku)) AS sku,
          vo.store_id,
          -- canonical brand (brand_canonical) если есть mapping, иначе normalized_name
-         regexp_replace(regexp_replace(lower(coalesce(bc.name, b.normalized_name, b.name, '')), '[^a-z0-9]', '', 'g'), '^by', '') AS brand_key,
+         regexp_replace(regexp_replace(lower(NULLIF(coalesce(bc.name, b.normalized_name, b.name, ''), '')), '[^a-z0-9]', '', 'g'), '^by', '') AS brand_key,
          pv.normalized_size AS nsize,
          pv.normalized_color AS ncolor,
          pv.normalized_gender_age AS ngender,
@@ -46,7 +46,7 @@ norm AS (
   JOIN vo ON vo.variant_id = pv.id
   JOIN products p ON p.id = pv.product_id
   LEFT JOIN brands b ON b.id = p.brand_id
-  LEFT JOIN brand_aliases ba ON ba.brand_id = b.id
+  LEFT JOIN (SELECT DISTINCT brand_id, canonical_id FROM brand_aliases) ba ON ba.brand_id = b.id
   LEFT JOIN brand_canonical bc ON bc.id = ba.canonical_id
   WHERE btrim(coalesce(pv.sku,'')) <> ''
     AND length(btrim(pv.sku)) > 4
@@ -93,6 +93,11 @@ FROM norm n
 JOIN agg a ON a.sku = n.sku
 JOIN norm cn ON cn.variant_id = a.canonical
 WHERE a.stores >= 2
+      AND NOT EXISTS (
+          SELECT 1 FROM norm n2 WHERE n2.sku = n.sku 
+            AND n2.variant_id != n.variant_id
+            AND n2.ean IS NOT NULL AND n.ean IS NOT NULL AND n2.ean != n.ean
+      )
   AND n.variant_id <> a.canonical
   -- cross-store: canonical и matched не должны иметь общих stores
   AND NOT EXISTS (

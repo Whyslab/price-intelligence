@@ -251,7 +251,7 @@ def robust_market_metrics(prices: List[float], weights: Optional[List[float]] = 
     std = float(np.std(clean_prices)) if len(clean_prices) > 1 else 0.0
     
     # Confidence scoring
-    num_stores = len(set(prices))  # предполагаем, что каждая цена от уникального магазина
+    num_stores = len(set(store_ids)) if 'store_ids' in locals() else len(set(prices))  # предполагаем, что каждая цена от уникального магазина
     cv = std / mean if mean > 0 else 0
     confidence = calculate_confidence(
         num_observations=len(prices),

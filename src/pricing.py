@@ -15,7 +15,7 @@ def sanitize_prices(prices: list) -> list:
     med = statistics.median(valid)
     if med <= 0:
         return valid
-    clean = [p for p in valid if med / OUTLIER_RATIO <= p <= med * OUTLIER_RATIO]
+    clean = [p for p in prices if med / OUTLIER_RATIO <= p <= med * OUTLIER_RATIO]
     return clean if clean else valid
 
 def deal_metrics(prices: list, best_price: float,
@@ -36,7 +36,7 @@ def deal_metrics(prices: list, best_price: float,
 
     med = statistics.median(clean)
     # P1-30: Проверяем через MAD
-    clean_prices = remove_outliers_mad([float(p) for p in valid if p and p > 0], threshold=3.5)
+    clean_prices = remove_outliers_mad([float(p) for p in prices if p and p > 0], threshold=3.5)
     if best_price not in clean_prices:
         return None
 

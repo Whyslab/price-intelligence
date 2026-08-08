@@ -47,6 +47,7 @@ def update_store_sync_metadata(db, domain: str, status: str, error: str = None, 
 
 
 def batch_import_fast(
+    snapshot_id = None
     max_products_per_store: int = 50000,  # P0-9: увеличен лимит
     max_pages: int = 10,
     delay: float = 1.0,
@@ -63,7 +64,15 @@ def batch_import_fast(
     """
     import os
     _base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    with open(os.path.join(_base_dir, 'shopify_sites.json'), 'r') as f:
+    json_path = os.path.join(_base_dir, 'shopify_sites.json')
+    if not os.path.exists(json_path):
+        ex_path = os.path.join(_base_dir, 'shopify_sites.example.json')
+        if os.path.exists(ex_path):
+            print(f"⚠️ Using example: {ex_path}")
+            json_path = ex_path
+        else:
+            raise FileNotFoundError(f"Config not found: {json_path}")
+    with open(json_path, 'r') as f:
         sites = json.load(f)
     
     print(f"🚀 Fast batch import of {len(sites)} Shopify sites")

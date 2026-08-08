@@ -1,3 +1,4 @@
+from src.canonical_deal_engine import calculate_canonical_deal_score
 """
 Web Dashboard: FastAPI + история цен.
 Запуск: python -m src.web_app
@@ -48,7 +49,7 @@ async def dashboard(request: Request, min_score: int = 40, q: str = ""):
             WHERE pm.canonical_variant_id = :id
         """), {'id': canon_id}).fetchall()]
 
-        metrics = deal_metrics(prices, best_price)
+        metrics = calculate_canonical_deal_score(prices, best_price)
         if not metrics or metrics['deal_score'] < min_score:
             continue
         deals.append({'id': canon_id, 'sku': sku, 'name': name, 'brand': brand,
@@ -136,7 +137,7 @@ async def product_detail(request: Request, product_id: int):
     ]
 
     best = offers[0] if offers else None
-    metrics = deal_metrics(
+    metrics = calculate_canonical_deal_score(
         prices, best['price'] if best else 0,
         history_prices=hist_prices,
         old_price=best['old_price'] if best else None

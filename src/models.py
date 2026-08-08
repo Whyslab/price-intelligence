@@ -32,7 +32,9 @@ class Product(Base):
     brand_id = Column(Integer, ForeignKey('brands.id'))
     canonical_name = Column(String, nullable=False)
     category = Column(String)
-    __table_args__ = (Index('ix_product_category', 'category'),)
+    __table_args__ = (
+        UniqueConstraint('store_id', 'external_product_id', name='uq_store_external_product'),
+        UniqueConstraint('store_id', 'external_variant_id', name='uq_store_external_variant'),Index('ix_product_category', 'category'),)
 
 class ProductVariant(Base):
     __tablename__ = 'product_variants'
@@ -41,7 +43,8 @@ class ProductVariant(Base):
     sku = Column(String, index=True)
     ean = Column(String, index=True)
     external_product_id = Column(String, index=True)  # P0-11: Shopify/Magento product ID
-    external_variant_id = Column(String, unique=True, index=True)  # P0-12: UNIQUE constraint
+    external_variant_id = Column(
+        String,, index=True)  # P0-12: UNIQUE constraint
     size = Column(String)
     color = Column(String)
     normalized_size = Column(String(20), index=True)
@@ -181,7 +184,7 @@ class DealAlert(Base):
     classification = Column(String(50))
     reason = Column(Text)
     sku = Column(String)
-    sent_date = Column(Date, nullable=False, server_default=func.now())
+    sent_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     
     __table_args__ = (
         Index('idx_deal_alerts_sku_store_date', 'sku', 'store_id', 'sent_date', unique=True),

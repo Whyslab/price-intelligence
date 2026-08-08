@@ -73,7 +73,7 @@ def get_historical_metrics(conn, variant_ids: list) -> dict:
             MAX(total_days) AS total_days,
             MAX(current_price) AS current_price,
             EXTRACT(EPOCH FROM (NOW() - MAX(last_observed))) / 86400 AS days_since_last_update,
-            COUNT(DISTINCT price) AS total_intervals
+            COUNT(*) AS total_intervals
         FROM replicated
         GROUP BY vid
     """)
