@@ -22,7 +22,7 @@ def get_historical_metrics(conn, variant_ids: list) -> dict:
     if not variant_ids:
         return {}
     
-    # P1-22: Efficient weighted median without generate_series()
+    # P1-22: Efficient weighted median without ()
     # Используем cumulative weights для нахождения weighted percentile
     sql = text("""
         WITH all_variants AS (
