@@ -5,35 +5,14 @@ Uses standard GTIN checksum algorithm (works for EAN-8, UPC-A, EAN-13, GTIN-14).
 from typing import Optional
 
 
-def _compute_check_digit(digits_13: str) -> int:
-    """
-    Computes GTIN check digit from first 13 digits.
-    
-    Algorithm (GS1 standard):
-    - Position 1, 3, 5, ... (odd, 1-indexed) = weight 1
-    - Position 2, 4, 6, ... (even, 1-indexed) = weight 3
-    
-    For 14-digit GTIN padded from shorter:
-    - 0-indexed positions 0,2,4,6,8,10,12 have weight 1
-    - 0-indexed positions 1,3,5,7,9,11 have weight 3
-    """
-    total = 0
-    for i, ch in enumerate(digits_13):
-        digit = int(ch)
-        # For GTIN-14: weights alternate 1,3,1,3,...
-        weight = 1 if i % 2 == 0 else 3
-        total += digit * weight
-    
-    check = (10 - (total % 10)) % 10
-    return check
-
-
 def validate_gtin_checksum(gtin: str) -> bool:
     """
     Validates GTIN checksum (EAN-8, UPC-A, EAN-13, GTIN-14).
     
-    All these formats use the same check digit algorithm after
-    padding to 14 digits (zero-pad on the left).
+    Algorithm:
+    - For GTIN-8/12/13: odd positions (1-indexed) = weight 3, even = weight 1
+    - For GTIN-14: odd positions (1-indexed) = weight 1, even = weight 3
+    - Sum all weighted digits, check digit = (10 - (sum % 10)) % 10
     """
     if not gtin:
         return False
@@ -48,14 +27,27 @@ def validate_gtin_checksum(gtin: str) -> bool:
     if len(gtin) not in (8, 12, 13, 14):
         return False
     
-    # Pad to 14 digits
-    padded = gtin.zfill(14)
+    # Convert to list of digits
+    digits = [int(d) for d in gtin]
     
-    # Compute expected check digit from first 13 digits
-    expected = _compute_check_digit(padded[:13])
-    actual = int(padded[13])
+    # Calculate checksum
+    total = 0
+    for i in range(len(digits) - 1):  # Exclude check digit
+        # 0-indexed position i corresponds to 1-indexed position (i+1)
+        if len(digits) == 14:
+            # GTIN-14: odd positions (1-indexed) = weight 1, even = weight 3
+            weight = 1 if (i + 1) % 2 == 1 else 3
+        else:
+            # GTIN-8/12/13: odd positions (1-indexed) = weight 3, even = weight 1
+            weight = 3 if (i + 1) % 2 == 1 else 1
+        
+        total += digits[i] * weight
     
-    return expected == actual
+    # Check digit
+    expected_check = (10 - (total % 10)) % 10
+    actual_check = digits[-1]
+    
+    return expected_check == actual_check
 
 
 def is_valid_gtin(gtin) -> bool:
