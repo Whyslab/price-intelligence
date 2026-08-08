@@ -294,7 +294,10 @@ class ShopifyAdapter:
                             parser_version='1.0',
                             raw_snapshot_id=snapshot_id,
                             exchange_rate_source='fixer_io' if original_currency != 'USD' else None
-                        ))
+                        ,
+                            normalized_size=variant.normalized_size,
+                            in_stock=variant_data.get('available', True),
+                            region=store.region))
             except Exception as e:
                 continue
         

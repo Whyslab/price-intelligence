@@ -4,7 +4,7 @@ Magento Adapter: импорт товаров через REST API (Magento 2.x).
 """
 import requests
 from sqlalchemy.orm import Session
-from src.models import Brand, Store, Product, ProductVariant, Offer, PriceHistory
+from src.models import Brand, Store, Product, ProductVariant, Offer, PriceHistory, PriceChange
 from src.config import DATABASE_URL
 from src.pricing import MAX_PRICE
 from sqlalchemy import create_engine
@@ -228,6 +228,25 @@ class MagentoAdapter:
                     price=current_price,
                     old_price=old_price
                 ))
+                
+                # P1-24/25/26: PriceChange с контекстом
+                now_utc = datetime.now(timezone.utc)
+                open_interval = db.query(PriceChange).filter(
+                    PriceChange.variant_id == variant.id,
+                    PriceChange.store_id == store.id,
+                    PriceChange.ended_at.is_(None)
+                ).first()
+                if open_interval is None or open_interval.price != current_price:
+                    if open_interval:
+                        open_interval.ended_at = now_utc
+                    db.add(PriceChange(
+                        variant_id=variant.id, store_id=store.id,
+                        started_at=now_utc,
+                        price=current_price, old_price=old_price,
+                        normalized_size=variant.normalized_size,
+                        in_stock=product_data.get('status', 1) == 1,
+                        region=store.region
+                    ))
                 
             except Exception as e:
                 print(f"   Error: {e}")
