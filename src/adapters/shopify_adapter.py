@@ -65,7 +65,7 @@ class ShopifyAdapter:
                 print(f"   ⚠️  Request failed at page {page_count}: {e}")
                 break
             
-            if response.status_code != 200:
+            if response is None or response.status_code != 200:
                 print(f"   ⚠️  HTTP {response.status_code} at page {page_count}")
                 break
             
