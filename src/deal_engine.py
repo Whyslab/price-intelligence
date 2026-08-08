@@ -22,9 +22,8 @@ def get_historical_metrics(conn, variant_ids: list) -> dict:
     if not variant_ids:
         return {}
     
-    # P1-22: True weighted median через репликацию данных
-    # PostgreSQL не поддерживает weighted PERCENTILE_CONT напрямую,
-    # поэтому используем трюк: реплицируем строки пропорционально весам
+    # P1-22: Efficient weighted median without generate_series()
+    # Используем cumulative weights для нахождения weighted percentile
     sql = text("""
         WITH all_variants AS (
             SELECT pm.canonical_variant_id AS vid FROM product_matches pm
@@ -39,7 +38,7 @@ def get_historical_metrics(conn, variant_ids: list) -> dict:
                 pc.price,
                 pc.started_at,
                 COALESCE(pc.ended_at, NOW()) AS ended_at,
-                EXTRACT(EPOCH FROM (COALESCE(pc.ended_at, NOW()) - pc.started_at)) / 86400 AS days_at_price
+                EXTRACT(EPOCH FROM (COALESCE(pc.ended_at, NOW()) - pc.started_at)) / 86400.0 AS days_at_price
             FROM all_variants av
             JOIN price_changes pc ON pc.variant_id = av.vid
             WHERE pc.price > 0
@@ -50,24 +49,28 @@ def get_historical_metrics(conn, variant_ids: list) -> dict:
                 price,
                 days_at_price,
                 SUM(days_at_price) OVER (PARTITION BY vid) AS total_days,
+                SUM(days_at_price) OVER (PARTITION BY vid ORDER BY price) AS cumulative_weight,
                 MAX(ended_at) OVER (PARTITION BY vid) AS last_observed,
                 FIRST_VALUE(price) OVER (PARTITION BY vid ORDER BY ended_at DESC) AS current_price
             FROM intervals
         ),
-        replicated AS (
-            -- P1-22: Реплицируем строки пропорционально days_at_price (округляем до целых дней)
+        median_calc AS (
             SELECT 
                 vid,
                 price,
+                cumulative_weight,
                 total_days,
                 last_observed,
                 current_price,
-                generate_series(1, GREATEST(1, ROUND(days_at_price)::int)) AS replica
+                ROW_NUMBER() OVER (PARTITION BY vid ORDER BY price) as rn
             FROM weighted
         )
         SELECT 
             vid,
-            PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY price) AS weighted_median,
+            (SELECT price FROM median_calc m2 
+             WHERE m2.vid = median_calc.vid 
+               AND m2.cumulative_weight >= median_calc.total_days / 2.0
+             ORDER BY m2.rn LIMIT 1) AS weighted_median,
             PERCENTILE_CONT(0.1) WITHIN GROUP (ORDER BY price) AS percentile_10,
             PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY price) AS percentile_90,
             MIN(price) AS historical_min,
@@ -75,8 +78,8 @@ def get_historical_metrics(conn, variant_ids: list) -> dict:
             MAX(total_days) AS total_days,
             MAX(current_price) AS current_price,
             EXTRACT(EPOCH FROM (NOW() - MAX(last_observed))) / 86400 AS days_since_last_update,
-            COUNT(*) AS total_intervals
-        FROM replicated
+            COUNT(DISTINCT price) AS total_intervals
+        FROM median_calc
         GROUP BY vid
     """)
     
@@ -258,15 +261,78 @@ def calculate_deal_score_v2(prices_data: list, historical: dict, conn=None) -> d
     }
 
 def find_best_deals(limit: int = 20):
-    """Находит топ-N лучших сделок с использованием Deal Engine v2."""
+    """
+    Находит топ-N лучших сделок с использованием Deal Engine v2.
+    
+    Returns:
+        List[dict]: Top deals with scores and metadata
+    """
     engine = create_engine(DATABASE_URL)
+    deals = []
     
     with engine.connect() as conn:
         # Получаем все canonical варианты с матчами
-
-
-        pass  # Auto-fixed: with block had only comments
-        # Получаем все canonical варианты с матчами
+        variant_ids_result = conn.execute(text("""
+            SELECT DISTINCT canonical_variant_id 
+            FROM product_matches
+        """)).fetchall()
+        
+        if not variant_ids_result:
+            return []
+        
+        variant_ids = [row[0] for row in variant_ids_result]
+        
+        # Получаем исторические метрики
+        historical = get_historical_metrics(conn, variant_ids)
+        
+        # Для каждого варианта получаем текущие цены
+        for variant_id in variant_ids[:100]:  # Ограничиваем для производительности
+            try:
+                prices_result = conn.execute(text("""
+                    SELECT 
+                        o.current_price,
+                        o.in_stock,
+                        s.name as store_name,
+                        s.reliability_score,
+                        o.variant_id
+                    FROM offers o
+                    JOIN stores s ON o.store_id = s.id
+                    JOIN product_matches pm ON pm.matched_variant_id = o.variant_id
+                    WHERE pm.canonical_variant_id = :variant_id
+                      AND o.current_price > 0
+                """), {'variant_id': variant_id}).fetchall()
+                
+                if not prices_result:
+                    continue
+                
+                prices_data = [
+                    {
+                        'price': float(row[0]),
+                        'in_stock': row[1],
+                        'store': row[2],
+                        'reliability': row[3] / 100.0,
+                        'variant_id': row[4],
+                        'canonical_id': variant_id
+                    }
+                    for row in prices_result
+                ]
+                
+                # Рассчитываем Deal Score
+                deal_result = calculate_deal_score_v2(prices_data, historical, conn)
+                
+                if deal_result['deal_score'] > 0:
+                    deals.append({
+                        'variant_id': variant_id,
+                        **deal_result
+                    })
+            
+            except Exception as e:
+                continue
+        
+        # Сортируем по deal_score
+        deals.sort(key=lambda x: x['deal_score'], reverse=True)
+        
+        return deals[:limit]
 
 
 def get_time_at_price(conn, variant_id, store_id, current_price):

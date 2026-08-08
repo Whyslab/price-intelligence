@@ -49,6 +49,10 @@ def update_store_sync_metadata(db, domain: str, status: str, error: str = None, 
 
 
 def batch_import_fast(
+    # snapshot_id будет определён позже
+
+    # snapshot_id будет определён позже
+
     max_products_per_store: int = 50000,  # P0-9: увеличен лимит
     max_pages: int = 10,
     delay: float = 1.0,
@@ -124,9 +128,10 @@ def batch_import_fast(
             
             # Если на первой странице меньше 250 товаров, магазин маленький
             if len(first_page_products) < 250:
-                # Маленький магазин — импортируем всё
+                # Маленький магазин — используем уже полученную первую страницу
                 store = adapter.get_or_create_store(db)
-                products, snapshot_id = adapter.fetch_products(limit=250, db=db, store_id=store.id)
+                products = first_page_products
+                snapshot_id = None  # Для маленьких магазинов snapshot не создаём
             else:
                 # Большой магазин — импортируем только первые N страниц
                 products = []
