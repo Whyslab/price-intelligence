@@ -1,16 +1,19 @@
 import os
+
 """
 Currency Normalizer v2: конвертирует цены в USD с полным аудитом.
 - Reject при неизвестной валюте (вместо auto-USD)
 - Сохранение использованного курса в БД
 - Логирование ошибок в currency_errors
 """
-import requests
-from decimal import Decimal
-from urllib.parse import urlparse
 import json
 from datetime import datetime, timedelta
+from decimal import Decimal
+from urllib.parse import urlparse
+
+import requests
 from sqlalchemy import create_engine, text
+
 from src.config import DATABASE_URL
 
 FIXER_API_KEY = os.getenv("FIXER_API_KEY", "YOUR_API_KEY_HERE")
@@ -182,11 +185,11 @@ if __name__ == "__main__":
     print("🧪 Currency Normalizer v2 Test\n")
     
     test_cases = [
-        (Decimal('590000'), 'https://www.dope-factory.com/p', 'KRW', 'Dope Factory (KRW)'),
-        (Decimal('430'), 'https://www.laferramenta.org/p', 'EUR', 'LaFerramenta (EUR)'),
-        (Decimal('350'), 'https://slamcity.com/p', 'GBP', 'Slam City (GBP)'),
-        (Decimal('150'), 'https://www.footlocker.com/p', 'USD', 'Foot Locker (USD)'),
-        (Decimal('50000'), 'https://unknown-shop.com/p', None, 'Unknown (should reject)'),
+        (Decimal(590000), 'https://www.dope-factory.com/p', 'KRW', 'Dope Factory (KRW)'),
+        (Decimal(430), 'https://www.laferramenta.org/p', 'EUR', 'LaFerramenta (EUR)'),
+        (Decimal(350), 'https://slamcity.com/p', 'GBP', 'Slam City (GBP)'),
+        (Decimal(150), 'https://www.footlocker.com/p', 'USD', 'Foot Locker (USD)'),
+        (Decimal(50000), 'https://unknown-shop.com/p', None, 'Unknown (should reject)'),
     ]
     
     for price, url, api_cur, label in test_cases:

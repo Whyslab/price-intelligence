@@ -4,8 +4,9 @@
 """
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-from src.config import DATABASE_URL
+
 from src.adapters.shopify_adapter import ShopifyAdapter
+from src.config import DATABASE_URL
 
 # Список магазинов для импорта
 STORES = [

@@ -5,12 +5,14 @@ Master Pipeline v2: автоматический запуск всех этап�
 - Pipeline state logging (P1-33): каждая итерация сохраняется в pipeline_runs.
 Запуск: python -m src.master_pipeline
 """
-import subprocess
-import time
-import sys
 import os
+import subprocess
+import sys
+import time
 from datetime import datetime
+
 from sqlalchemy import create_engine, text
+
 from src.config import DATABASE_URL
 
 LOCK_KEY = 0x50524943  # "PRIC" in hex
@@ -115,7 +117,7 @@ def main():
             status = "completed" if completed == len(steps) else "partial" if completed > 0 else "failed"
             
             print(f"\n{'='*80}")
-            print(f"📊 PIPELINE SUMMARY")
+            print("📊 PIPELINE SUMMARY")
             print(f"{'='*80}")
             for name, success in results:
                 status_icon = "✅" if success else "❌"

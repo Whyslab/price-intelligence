@@ -5,10 +5,9 @@ Data Provenance Layer (P0-69/70/72): централизованная работ
 - Версионирование парсеров
 - Привязку цен к конкретным snapshots
 """
-from datetime import datetime, timezone
 from sqlalchemy.orm import Session
+
 from src.models import RawSnapshot
-import json
 
 PARSER_VERSION = "1.0"  # P0-70: версия парсера, обновляем при изменениях логики
 

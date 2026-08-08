@@ -1,8 +1,10 @@
 """Находит новые Shopify магазины, которых ещё нет в БД"""
 import json
-from sqlalchemy import create_engine, text
-from src.config import DATABASE_URL
 from urllib.parse import urlparse
+
+from sqlalchemy import create_engine, text
+
+from src.config import DATABASE_URL
 
 # Загружаем список Shopify сайтов
 with open('shopify_sites.json', 'r') as f:
@@ -44,6 +46,6 @@ if new_stores:
     with open('new_shopify_stores.json', 'w') as f:
         json.dump(new_stores, f, indent=2)
     
-    print(f"\n✅ Список сохранён в new_shopify_stores.json")
+    print("\n✅ Список сохранён в new_shopify_stores.json")
 else:
     print("\n✅ Новых магазинов нет")

@@ -1,5 +1,5 @@
 """Проверяем papinistore.com — реальный ли это Magento API."""
-import requests, json
+import requests
 
 url = "https://www.papinistore.com/en/rest/V1/products"
 params = {'searchCriteria[pageSize]': 2, 'searchCriteria[currentPage]': 1}

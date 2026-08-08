@@ -3,6 +3,7 @@
 """
 import json
 
+
 def filter_shopify_sites(input_file: str, output_file: str):
     with open(input_file, 'r') as f:
         results = json.load(f)
@@ -22,8 +23,7 @@ def filter_shopify_sites(input_file: str, output_file: str):
     
     # Сохраняем в простой текстовый список
     with open(output_file.replace('.json', '.txt'), 'w') as f:
-        for site in shopify_sites:
-            f.write(f"{site['url']}\n")
+        f.writelines(f"{site['url']}\n" for site in shopify_sites)
     
     print(f"✅ Found {len(shopify_sites)} Shopify sites")
     print(f"   Saved to {output_file}")
@@ -32,7 +32,7 @@ def filter_shopify_sites(input_file: str, output_file: str):
     available = sum(1 for s in shopify_sites if 'available' in s['notes'])
     blocked = sum(1 for s in shopify_sites if 'blocked' in s['notes'])
     
-    print(f"\n📊 products.json availability:")
+    print("\n📊 products.json availability:")
     print(f"   Available: {available}")
     print(f"   Blocked: {blocked}")
 

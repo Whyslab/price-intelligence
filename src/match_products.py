@@ -12,6 +12,7 @@ Product Matching v3: связи одинаковых товаров в разн�
 - Ребилд идемпотентен и атомен (одна транзакция).
 """
 from sqlalchemy import create_engine, text
+
 from src.config import DATABASE_URL
 
 INSERT_V2_SQL = """

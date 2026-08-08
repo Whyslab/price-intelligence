@@ -2,12 +2,12 @@
 Market Price Engine: рассчитывает реальную рыночную цену и Deal Score
 на основе сматченных товаров из разных магазинов.
 """
-from sqlalchemy import create_engine, text
-from sqlalchemy.orm import sessionmaker
-from src.config import DATABASE_URL
-from decimal import Decimal
 import statistics
-from src.robust_statistics import robust_market_metrics, calculate_confidence
+
+from sqlalchemy import create_engine, text
+
+from src.config import DATABASE_URL
+
 
 def get_matched_prices(db, canonical_variant_id: int) -> list:
     """
@@ -163,7 +163,7 @@ def analyze_top_products():
             
             deal_class = classify_deal(deal_score)
             
-            print(f"\n   📈 Market Metrics:")
+            print("\n   📈 Market Metrics:")
             print(f"      Median Price: ${metrics['market_median']:.2f}")
             print(f"      Average Price: ${metrics['market_average']:.2f}")
             print(f"      Min Price: ${metrics['market_min']:.2f}")
@@ -178,7 +178,7 @@ def analyze_top_products():
             print(f"\n   🎯 Deal Score: {deal_score:.0f}/100")
             print(f"      {deal_class}")
             
-            print(f"\n   🛒 Price by Store:")
+            print("\n   🛒 Price by Store:")
             for p in sorted(prices_data, key=lambda x: x['price']):
                 stock_icon = "✅" if p['in_stock'] else "❌"
                 print(f"      {stock_icon} {p['store']}: ${p['price']:.2f}")

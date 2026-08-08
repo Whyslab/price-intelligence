@@ -7,12 +7,11 @@ Robust Statistics Module (P1-22, P1-30, P1-31): продвинутые стат�
 - IQR (Interquartile Range) для outlier detection
 - Confidence scoring на основе наблюдений и variance
 """
-from typing import List, Tuple, Optional
+
 import numpy as np
-from decimal import Decimal
 
 
-def weighted_percentile(values: List[float], weights: List[float], percentile: float) -> float:
+def weighted_percentile(values: list[float], weights: list[float], percentile: float) -> float:
     """
     P1-22: Настоящий weighted percentile.
     
@@ -57,7 +56,7 @@ def weighted_percentile(values: List[float], weights: List[float], percentile: f
     return float(sorted_values[-1])
 
 
-def calculate_mad(values: List[float]) -> float:
+def calculate_mad(values: list[float]) -> float:
     """
     P1-30: Median Absolute Deviation.
     
@@ -80,7 +79,7 @@ def calculate_mad(values: List[float]) -> float:
     return float(np.median(abs_deviations))
 
 
-def remove_outliers_mad(values: List[float], threshold: float = 3.5) -> List[float]:
+def remove_outliers_mad(values: list[float], threshold: float = 3.5) -> list[float]:
     """
     P1-30: Удаление outliers через MAD.
     
@@ -110,7 +109,7 @@ def remove_outliers_mad(values: List[float], threshold: float = 3.5) -> List[flo
     return [v for v, z in zip(values, modified_z_scores) if z <= threshold]
 
 
-def calculate_iqr(values: List[float]) -> Tuple[float, float, float]:
+def calculate_iqr(values: list[float]) -> tuple[float, float, float]:
     """
     P1-31: Interquartile Range.
     
@@ -133,7 +132,7 @@ def calculate_iqr(values: List[float]) -> Tuple[float, float, float]:
     return (q1, q3, iqr)
 
 
-def remove_outliers_iqr(values: List[float], multiplier: float = 1.5) -> List[float]:
+def remove_outliers_iqr(values: list[float], multiplier: float = 1.5) -> list[float]:
     """
     P1-31: Удаление outliers через IQR.
     
@@ -199,7 +198,7 @@ def calculate_confidence(
     return float(confidence)
 
 
-def robust_market_metrics(prices: List[float], weights: Optional[List[float]] = None) -> dict:
+def robust_market_metrics(prices: list[float], weights: list[float] | None = None) -> dict:
     """
     Полная замена для calculate_market_metrics.
     

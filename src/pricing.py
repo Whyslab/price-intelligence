@@ -2,7 +2,8 @@
 Price Sanity Layer + исторические метрики + объяснимость.
 """
 import statistics
-from src.robust_statistics import remove_outliers_mad, remove_outliers_iqr
+
+from src.robust_statistics import remove_outliers_mad
 
 MAX_PRICE = 20000.0
 OUTLIER_RATIO = 3.0

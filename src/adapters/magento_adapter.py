@@ -2,15 +2,25 @@
 Magento Adapter: импорт товаров через REST API (Magento 2.x).
 Поддерживает сайты с открытым API (без авторизации).
 """
-import requests
-from sqlalchemy.orm import Session
-from src.models import Brand, Store, Product, ProductVariant, Offer, PriceHistory, PriceChange
-from src.config import DATABASE_URL
-from src.pricing import MAX_PRICE
-from sqlalchemy import create_engine
-from datetime import datetime, timezone
 from decimal import Decimal
 from urllib.parse import urlparse
+
+import requests
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session
+
+from src.config import DATABASE_URL
+from src.models import (
+    Brand,
+    Offer,
+    PriceChange,
+    PriceHistory,
+    Product,
+    ProductVariant,
+    Store,
+)
+from src.pricing import MAX_PRICE
+
 
 class MagentoAdapter:
     def __init__(self, store_name: str, base_url: str):

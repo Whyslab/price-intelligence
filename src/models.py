@@ -1,8 +1,19 @@
-from sqlalchemy import Column, Integer, String, DateTime, Date, UniqueConstraint, ForeignKey, Text, Numeric, Boolean, Index, Float
+from sqlalchemy import (
+    Boolean,
+    Column,
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    Numeric,
+    String,
+    Text,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import declarative_base
-from sqlalchemy.sql import func
 from sqlalchemy.schema import PrimaryKeyConstraint
+from sqlalchemy.sql import func
 
 Base = declarative_base()
 
@@ -187,7 +198,7 @@ class DealAlert(Base):
     sent_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     
     __table_args__ = (
-        Index('idx_deal_alerts_sku_store_date', 'sku', 'store_id', 'sent_date', unique=True),
+        Index('idx_deal_alerts_sku_store_at', 'sku', 'store_id', 'sent_at', unique=True),
     )
 
 
