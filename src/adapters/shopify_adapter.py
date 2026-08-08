@@ -71,7 +71,8 @@ class ShopifyAdapter:
             try:
                 response = self.session.get(url, timeout=30)
             except requests.RequestException as e:
-                print(f"   ⚠️  Request failed at page {page_count}: {e}")
+                print(f"   ⚠️  Request failed at page {page_count}: {type(e).__name__}: {e}")
+                print(f"       URL: {url}")
                 break
             
             if response is None or response.status_code != 200:
