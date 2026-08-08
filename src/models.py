@@ -1,5 +1,6 @@
 from sqlalchemy import (
     Boolean,
+    UniqueConstraint,
     Column,
     DateTime,
     Float,
