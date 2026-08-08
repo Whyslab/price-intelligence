@@ -62,7 +62,9 @@ def calculate_market_metrics(prices: list) -> dict:
     if not prices:
         return {}
     
-    current_prices = [p['price'] for p in prices]
+    current_prices = [p['price'] for p in prices if p['in_stock']]
+    if not current_prices:
+        current_prices = [p['price'] for p in prices]
     
     return {
         'market_median': statistics.median(current_prices),

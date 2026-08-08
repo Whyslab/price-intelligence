@@ -1,3 +1,5 @@
+import logging
+logger = logging.getLogger(__name__)
 """
 Deal Engine v2: находит лучшие сделки с учётом истории цен и weighted statistics.
 
@@ -155,8 +157,9 @@ def analyze_discount_duration(variant_id: int, store_id: int, current_price: flo
             ORDER BY pc.started_at DESC
             LIMIT 1
         """), {'variant_id': variant_id, 'store_id': store_id, 'current_price': current_price}).fetchone()
-    except Exception:
-        return {'duration_days': None, 'is_fake': False, 'is_real': False, 'discount_pct': 0.0}
+    except Exception as e:
+        logger.exception('[DealEngine] DB failure')
+        raise
         
     if not result:
         return {'duration_days': None, 'is_fake': False, 'is_real': False, 'discount_pct': 0.0}
@@ -195,7 +198,7 @@ def calculate_deal_score_v2(prices_data: list, historical: dict, conn=None) -> d
         try:
             rows = conn.execute(text("SELECT name, reliability_score FROM stores WHERE name = ANY(:store_names)"), {'store_names': store_names}).fetchall()
             reliability_map = {r[0]: float(r[1]) for r in rows}
-        except Exception as e: import sys; print(f'[DealEngine] error: {e}', file=sys.stderr)
+        except Exception as e: logger.exception('[DealEngine] Non-recoverable DB error')
 
     valid_prices, valid_weights = [], []
     all_prices_float = [float(x) for x in all_prices]
@@ -269,7 +272,7 @@ def calculate_deal_score_v2(prices_data: list, historical: dict, conn=None) -> d
                 elif discount_info['is_real']:
                     confidence = min(100, int(confidence * 1.1))
                     reason += f" 🔥 REAL SALE ({discount_info['duration_days']:.0f} days)"
-        except Exception as e: import sys; print(f'[DealEngine] error: {e}', file=sys.stderr)
+        except Exception as e: logger.exception('[DealEngine] Non-recoverable DB error')
 
     return {
         'discount_analysis': discount_info, 'deal_score': int(deal_score), 'confidence': confidence,
@@ -382,8 +385,9 @@ def get_time_at_price(conn, variant_id, store_id, current_price):
         now = datetime.now(timezone.utc)
         hours = (now - started_at).total_seconds() / 3600
         return round(hours, 1)
-    except Exception:
-        return None
+    except Exception as e:
+        logger.exception('[DealEngine] DB failure time_at_price')
+        raise
 
 
 
@@ -493,8 +497,9 @@ def analyze_discount_duration_v2(conn, variant_id, store_id, current_price):
             'price_change_frequency': price_change_frequency
         }
         
-    except Exception:
-        return {'is_fake': False, 'discount_tag': '💰 DEAL', 'old_price_duration_days': None, 'price_change_frequency': 0}
+    except Exception as e:
+        logger.exception('[DealEngine] DB failure v2')
+        raise
 
 
 def calculate_enhanced_deal_score(prices_data: list, conn=None) -> dict:

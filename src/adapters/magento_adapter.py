@@ -1,3 +1,5 @@
+import logging
+logger = logging.getLogger(__name__)
 """
 Magento Adapter: импорт товаров через REST API (Magento 2.x).
 Поддерживает сайты с открытым API (без авторизации).

@@ -66,8 +66,8 @@ class ProductVariant(Base):
     attributes = Column(JSON)
     __table_args__ = (
         # P0-3: Scoped identity — объединено в один __table_args__ (P0-1 fix)
-        UniqueConstraint('store_id', 'external_variant_id', name='uq_store_external_variant'),
-        UniqueConstraint('store_id', 'external_product_id', name='uq_store_external_product'),
+        Index('uq_store_external_variant', 'store_id', 'external_variant_id', unique=True, postgresql_where=text("external_variant_id IS NOT NULL AND external_variant_id != ''")),
+        Index('uq_store_external_product', 'store_id', 'external_product_id', unique=True, postgresql_where=text("external_product_id IS NOT NULL AND external_product_id != ''")),
         Index('ix_variant_ean', 'ean'),
         Index('ix_variant_sku', 'sku'),
     )
@@ -148,7 +148,7 @@ class ProductMatch(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     __table_args__ = (
         CheckConstraint('confidence_score >= 0 AND confidence_score <= 1', name='check_confidence_range'),
-        CheckConstraint('canonical_variant_id != matched_variant_id', name='check_no_self_match'),
+        CheckConstraint('canonical_variant_id < matched_variant_id', name='check_no_self_match_and_cycles'),
         UniqueConstraint('canonical_variant_id', 'matched_variant_id', name='uq_product_match_direct'),
         UniqueConstraint('matched_variant_id', name='uq_product_match_reverse'),  # P0-10: no duplicate mappings
         Index('idx_matches_canonical', 'canonical_variant_id'),
