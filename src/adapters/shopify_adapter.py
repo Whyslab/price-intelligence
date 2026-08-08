@@ -43,7 +43,7 @@ class ShopifyAdapter:
         self.store_currency = detect_currency(self.base_url)
         if not self.store_currency:
             print(f"⚠️ Unknown currency: {self.base_url}")
-            self.store_currency = None
+            self.store_currency = "USD"  # Fallback to USD instead of NULL
     
     def fetch_products(self, limit: int = 250, max_pages: int = 50, db: Session = None, store_id: int = None) -> tuple:
         """
