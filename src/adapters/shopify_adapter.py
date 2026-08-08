@@ -41,7 +41,11 @@ class ShopifyAdapter:
         })
         # Определяем валюту магазина ОДИН РАЗ (v2: None если неизвестна)
         try:
-            self.store_currency = detect_currency(self.base_url)
+            try:
+                self.store_currency = detect_currency(self.base_url)
+            except Exception as e:
+                print(f"⚠️ Currency detection failed: {e}")
+                self.store_currency = "USD"
         except Exception as e:
             print(f"   ⚠️  Currency detection failed: {e}")
             self.store_currency = "USD"  # Fallback
@@ -150,7 +154,21 @@ class ShopifyAdapter:
         """P0-12: Использует with_for_update() для предотвращения race conditions."""
         from urllib.parse import urlparse
         domain = urlparse(self.base_url).netloc
+        
+        # Сначала проверяем по domain
         store = db.query(Store).filter(Store.domain == domain).with_for_update().first()
+        
+        # Если не нашли по domain, проверяем по name (для дубликатов)
+        if not store:
+            store = db.query(Store).filter(Store.name == self.store_name).first()
+            if store:
+                # Магазин с таким именем уже существует, обновляем domain
+                store.domain = domain
+                store.currency = self.store_currency
+                db.flush()
+                return store
+        
+        # Создаём новый магазин
         if not store:
             store = Store(name=self.store_name, domain=domain, 
                          currency=self.store_currency, region=self._detect_region())

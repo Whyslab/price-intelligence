@@ -1,3 +1,4 @@
+import traceback
 """
 Быстрый batch importer с лимитами и умной стратегией.
 """
@@ -113,7 +114,7 @@ def batch_import_fast(
             first_page_data = {'products': products}
             first_page_products = products
             
-            if first_page.status_code != 200:
+            if first_page is None or first_page.status_code != 200:
                 print("   ⚠️  Cannot access products.json")
                 update_store_sync_metadata(db, domain, 'error', 'Cannot access products.json')
                 results.append({
@@ -140,7 +141,7 @@ def batch_import_fast(
                     page_url = f"{adapter.products_url}?limit=250&page={page}"
                     try:
                         resp = adapter.session.get(page_url, timeout=10)
-                        if resp.status_code != 200:
+                        if resp is None or resp.status_code != 200:
                             break
                         
                         page_data = resp.json()
