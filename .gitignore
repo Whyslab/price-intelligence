@@ -40,3 +40,9 @@ shopify_sites.json
 # DB dumps
 *.dump
 *.backup
+
+# Database backups
+*.sql
+*.sql.gz
+*.dump
+*.backup
