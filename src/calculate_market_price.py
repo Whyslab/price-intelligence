@@ -72,6 +72,7 @@ def calculate_market_metrics(prices: list) -> dict:
         'market_min': min(current_prices),
         'market_max': max(current_prices),
         'store_count': len(set(p['store'] for p in prices)),
+        'in_stock_store_count': len(set(p['store'] for p in prices if p.get('in_stock', True))),
         'prices': prices
     }
 

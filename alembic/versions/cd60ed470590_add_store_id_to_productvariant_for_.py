@@ -35,7 +35,7 @@ def upgrade() -> None:
             if not all_stores:
                 session.delete(pv)
                 continue
-            stores_list = list(all_stores)
+            stores_list = sorted(list(all_stores))  # Deterministic ordering
             pv.store_id = stores_list[0]
             for store_id in stores_list[1:]:
                 new_pv = ProductVariant(
@@ -51,14 +51,17 @@ def upgrade() -> None:
                 session.query(PriceChange).filter(PriceChange.variant_id == pv.id, PriceChange.store_id == store_id).update({'variant_id': new_pv.id})
                 session.query(PriceHistory).filter(PriceHistory.variant_id == pv.id, PriceHistory.store_id == store_id).update({'variant_id': new_pv.id})
         session.commit()
-    except Exception:
+    except Exception as e:
         session.rollback()
+        print(f'Migration failed: {e}')
+        raise
         
     try:
         op.alter_column('product_variants', 'store_id', existing_type=sa.Integer(), nullable=False)
         op.create_foreign_key('fk_product_variants_store_id', 'product_variants', 'stores', ['store_id'], ['id'], ondelete='CASCADE')
-    except Exception:
-        pass
+    except Exception as e:
+        print(f'Constraint failed: {e}')
+        raise
 
 def downgrade() -> None:
     pass
