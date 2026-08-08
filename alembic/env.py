@@ -20,7 +20,7 @@ if config.config_file_name is not None:
 target_metadata = Base.metadata
 
 # Override sqlalchemy.url with environment variable
-config.set_main_option('sqlalchemy.url', DATABASE_URL.replace('+psycopg', ''))
+config.set_main_option('sqlalchemy.url', DATABASE_URL.replace('+psycopg', '+psycopg2'))
 
 
 def run_migrations_offline() -> None:

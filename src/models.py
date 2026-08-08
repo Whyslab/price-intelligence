@@ -64,6 +64,7 @@ class ProductVariant(Base):
     __tablename__ = 'product_variants'
     id = Column(Integer, primary_key=True)
     product_id = Column(Integer, ForeignKey('products.id'), nullable=False)
+    store_id = Column(Integer, ForeignKey('stores.id'), nullable=True)  # P0-2: Store isolation
     sku = Column(String, index=True)
     ean = Column(String, index=True)
     external_product_id = Column(String, index=True)  # P0-11: Shopify/Magento product ID
