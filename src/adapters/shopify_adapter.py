@@ -59,6 +59,7 @@ class ShopifyAdapter:
         page_count = 0
         
         while url and page_count < max_pages:
+            response = None
             try:
                 response = self.session.get(url, timeout=30)
             except requests.RequestException as e:
