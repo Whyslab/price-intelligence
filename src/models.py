@@ -49,6 +49,11 @@ class Store(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
+    last_sync = Column(DateTime(timezone=True))
+    last_successful_sync = Column(DateTime(timezone=True))
+    sync_status = Column(String(20), default='unknown')
+    last_error = Column(Text)
+    products_count = Column(Integer, default=0)
 
 class Product(Base):
     __tablename__ = 'products'
@@ -256,3 +261,14 @@ class RawSnapshot(Base):
         Index('ix_raw_snapshot_store_time', 'store_id', 'fetched_at'),
         Index('ix_raw_snapshot_pipeline', 'pipeline_run_id'),
     )
+
+
+class DealValidation(Base):
+    """Human validation of deal alerts"""
+    __tablename__ = 'deal_validation'
+    id = Column(Integer, primary_key=True)
+    alert_id = Column(Integer, ForeignKey('deal_alerts.id', ondelete='CASCADE'))
+    user_id = Column(String(50))
+    label = Column(Integer)  # 1 = real deal, 0 = false positive
+    notes = Column(Text)
+    validated_at = Column(DateTime(timezone=True), server_default=func.now())
