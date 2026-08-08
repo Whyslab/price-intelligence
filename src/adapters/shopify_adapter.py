@@ -1,3 +1,4 @@
+import time
 import logging
 logger = logging.getLogger(__name__)
 import re
@@ -67,15 +68,32 @@ class ShopifyAdapter:
         page_count = 0
         
         while url and page_count < max_pages:
-            try:
-                response = self.session.get(url, timeout=30)
-            except requests.RequestException as e:
-                print(f"   ⚠️  Request failed at page {page_count}: {type(e).__name__}: {e}")
-                print(f"       URL: {url}")
+            retry_count = 0
+            max_retries = 3
+            
+            while retry_count < max_retries:
+                try:
+                    response = self.session.get(url, timeout=30)
+                except requests.RequestException as e:
+                    print(f"   ⚠️  Request failed at page {page_count}: {type(e).__name__}: {e}")
+                    print(f"       URL: {url}")
+                    response = None
+                    break
+                
+                # Обработка 429 Too Many Requests
+                if response.status_code == 429:
+                    retry_count += 1
+                    wait_time = 2 ** retry_count  # Exponential backoff: 2, 4, 8 секунд
+                    print(f"   ⏳ Rate limited (429) at page {page_count}, retry {retry_count}/{max_retries} in {wait_time}s...")
+                    time.sleep(wait_time)
+                    continue
+                
+                # Успешный запрос или другая ошибка
                 break
             
             if response is None or response.status_code != 200:
-                print(f"   ⚠️  HTTP {response.status_code if response else 'N/A'} at page {page_count}")
+                status = response.status_code if response else 'N/A'
+                print(f"   ⚠️  HTTP {status} at page {page_count}")
                 break
             
             try:
