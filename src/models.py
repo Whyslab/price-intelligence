@@ -37,6 +37,19 @@ class Brand(Base):
     products_count = Column(Integer, default=0)
     reliability_score = Column(Integer, default=0)
 
+class Store(Base):
+    __tablename__ = 'stores'
+    id = Column(Integer, primary_key=True)
+    name = Column(String, nullable=False, unique=True)
+    domain = Column(String, nullable=False, unique=True)
+    currency = Column(String(10), nullable=False)
+    region = Column(String(10))
+    timezone = Column(String(50))
+    reliability_score = Column(Numeric(5, 2), default=0.5)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
 class Product(Base):
     __tablename__ = 'products'
     id = Column(Integer, primary_key=True)
