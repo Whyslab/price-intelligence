@@ -26,6 +26,10 @@ class Brand(Base):
 class Store(Base):
     __tablename__ = 'stores'
     id = Column(Integer, primary_key=True)
+    __table_args__ = (
+        # P0-19: CHECK constraint for reliability range
+        CheckConstraint('reliability_score >= 0 AND reliability_score <= 100', name='check_reliability_range'),
+    )
     name = Column(String, unique=True, nullable=False)
     domain = Column(String, nullable=False, unique=True)  # P0-12: UNIQUE constraint
     currency = Column(String(3), nullable=False)
@@ -54,8 +58,12 @@ class ProductVariant(Base):
     sku = Column(String, index=True)
     ean = Column(String, index=True)
     external_product_id = Column(String, index=True)  # P0-11: Shopify/Magento product ID
-    external_variant_id = Column(
-        String, index=True)  # P0-12: UNIQUE constraint
+    external_variant_id = Column(String, index=True)
+    
+    __table_args__ = (
+        # P0-3: Composite unique constraint for scoped identity
+        ('store_id', 'external_variant_id', {'name': 'uq_store_external_variant'}),
+    )
     size = Column(String)
     color = Column(String)
     normalized_size = Column(String(20), index=True)
@@ -70,6 +78,10 @@ class ProductVariant(Base):
 class Offer(Base):
     __tablename__ = 'offers'
     id = Column(Integer, primary_key=True)
+    __table_args__ = (
+        # P0-17: CHECK constraint for positive price
+        CheckConstraint('current_price > 0', name='check_price_positive'),
+    )
     store_id = Column(Integer, ForeignKey('stores.id'), nullable=False)
     variant_id = Column(Integer, ForeignKey('product_variants.id'), nullable=False)
     url = Column(Text, nullable=False)
@@ -91,6 +103,10 @@ class Offer(Base):
 class PriceHistory(Base):
     __tablename__ = 'price_history'
     variant_id = Column(Integer, ForeignKey('product_variants.id'), nullable=False)
+    __table_args__ = (
+        # P0-17: CHECK constraint for positive price
+        CheckConstraint('price > 0', name='check_price_history_positive'),
+    )
     store_id = Column(Integer, ForeignKey('stores.id'), nullable=False)
     timestamp = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     price = Column(Numeric(10, 2), nullable=False)
@@ -105,6 +121,10 @@ class PriceHistory(Base):
 class PriceChange(Base):
     __tablename__ = 'price_changes'
     variant_id = Column(Integer, ForeignKey('product_variants.id'), primary_key=True)
+    __table_args__ = (
+        # P0-17: CHECK constraint for positive price
+        CheckConstraint('price > 0', name='check_price_change_positive'),
+    )
     store_id = Column(Integer, ForeignKey('stores.id'), primary_key=True)
     started_at = Column(DateTime(timezone=True), primary_key=True)
     price = Column(Numeric(10, 2), nullable=False)
@@ -123,6 +143,12 @@ class PriceChange(Base):
 class ProductMatch(Base):
     __tablename__ = 'product_matches'
     id = Column(Integer, primary_key=True)
+    __table_args__ = (
+        # P0-18: CHECK constraint for confidence range
+        CheckConstraint('confidence_score >= 0 AND confidence_score <= 1', name='check_confidence_range'),
+        UniqueConstraint('canonical_variant_id', 'matched_variant_id', name='uq_product_match'),
+        CheckConstraint('canonical_variant_id != matched_variant_id', name='check_no_self_match'),
+    )
     canonical_variant_id = Column(Integer, ForeignKey('product_variants.id', ondelete='CASCADE'), nullable=False)
     matched_variant_id = Column(Integer, ForeignKey('product_variants.id', ondelete='CASCADE'), nullable=False)
     match_method = Column(String(50), nullable=False)

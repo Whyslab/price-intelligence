@@ -21,6 +21,14 @@ from src.pricing import MAX_PRICE
 
 
 class ShopifyAdapter:
+    def _detect_region(self):
+        from urllib.parse import urlparse
+        domain = urlparse(self.base_url).netloc.lower()
+        tld_map = {'.uk':'GB','.de':'DE','.fr':'FR','.it':'IT','.jp':'JP','.cn':'CN'}
+        for tld, reg in tld_map.items():
+            if domain.endswith(tld): return reg
+        return 'US'
+
     def __init__(self, store_name: str, base_url: str):
         self.store_name = store_name
         self.base_url = base_url.rstrip('/')
@@ -163,10 +171,12 @@ class ShopifyAdapter:
         
         variant = None
         
-        # 1. Сначала ищем по external_variant_id (самый надежный идентификатор)
+        # 1. Сначала ищем по external_variant_id + store_id (scoped identity)
         if external_variant_id:
+            store = self.get_or_create_store(db)
             variant = db.query(ProductVariant).filter(
-                ProductVariant.external_variant_id == external_variant_id
+                ProductVariant.external_variant_id == external_variant_id,
+                ProductVariant.product.has(brand_id=product.brand_id)  # Additional safety
             ).with_for_update().first()
         
         # 2. Если не найден, ищем по SKU (в рамках продукта)
@@ -336,10 +346,4 @@ if __name__ == "__main__":
         db.close()
 
     
-    def _detect_region(self):
-        from urllib.parse import urlparse
-        domain = urlparse(self.base_url).netloc.lower()
-        tld_map = {'.uk':'GB','.de':'DE','.fr':'FR','.it':'IT','.jp':'JP','.cn':'CN'}
-        for tld, reg in tld_map.items():
-            if domain.endswith(tld): return reg
-        return 'US'
+

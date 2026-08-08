@@ -19,12 +19,31 @@ def send_telegram_message(msg: str):
         print("⚠️  Telegram credentials not set")
         return
     try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            json={"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML",
-                  "disable_web_page_preview": True},
-            timeout=10
-        )
+        import time
+        max_retries = 3
+        retry_delay = 1
+        
+        for attempt in range(max_retries):
+            r = requests.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                json={"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML",
+                      "disable_web_page_preview": True},
+                timeout=10
+            )
+            
+            if r.status_code == 200:
+                break
+            elif r.status_code == 429:
+                retry_after = r.json().get('parameters', {}).get('retry_after', retry_delay)
+                print(f"⚠️ Rate limit, retry in {retry_after}s (attempt {attempt+1}/{max_retries})")
+                time.sleep(retry_after)
+                retry_delay = min(retry_delay * 2, 60)  # Exponential backoff
+            else:
+                print(f"❌ Telegram API error: {r.status_code}")
+                break
+        else:
+            print("❌ Failed after all retries")
+            return False
         # P1-42: Проверяем JSON response, а не только HTTP 200
         if r.status_code == 200:
             try:
