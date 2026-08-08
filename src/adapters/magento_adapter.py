@@ -142,12 +142,14 @@ class MagentoAdapter:
                 # Создаём вариант (Magento использует SKU как уникальный идентификатор)
                 variant = db.query(ProductVariant).filter(
                     ProductVariant.sku == sku,
-                    ProductVariant.product_id == product.id
+                    ProductVariant.product_id == product.id,
+                    ProductVariant.store_id == store.id
                 ).first()
                 
                 if not variant:
                     variant = ProductVariant(
                         product_id=product.id,
+                        store_id=store.id,
                         sku=sku,
                         ean=None,
                         size='',

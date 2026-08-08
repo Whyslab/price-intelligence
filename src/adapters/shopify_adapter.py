@@ -172,11 +172,11 @@ class ShopifyAdapter:
         variant = None
         
         # 1. Сначала ищем по external_variant_id + store_id (scoped identity)
+        store = self.get_or_create_store(db)
         if external_variant_id:
-            store = self.get_or_create_store(db)
             variant = db.query(ProductVariant).filter(
                 ProductVariant.external_variant_id == external_variant_id,
-                ProductVariant.product.has(brand_id=product.brand_id)  # Additional safety
+                ProductVariant.store_id == store.id  # Additional safety
             ).with_for_update().first()
         
         # 2. Если не найден, ищем по SKU (в рамках продукта)

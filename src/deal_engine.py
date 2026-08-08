@@ -25,7 +25,7 @@ def get_historical_metrics(conn, variant_ids: list) -> dict:
     # P1-22: Efficient weighted median without ()
     # Используем cumulative weights для нахождения weighted percentile
     sql = text("""
-        WITH all_variants AS (
+                WITH all_variants AS (
             SELECT pm.canonical_variant_id AS vid FROM product_matches pm
             WHERE pm.canonical_variant_id = ANY(:ids)
             UNION
@@ -43,6 +43,11 @@ def get_historical_metrics(conn, variant_ids: list) -> dict:
             JOIN price_changes pc ON pc.variant_id = av.vid
             WHERE pc.price > 0
         ),
+        interval_counts AS (
+            SELECT vid, COUNT(*) AS total_intervals
+            FROM intervals
+            GROUP BY vid
+        ),
         weighted AS (
             SELECT 
                 vid,
@@ -51,7 +56,7 @@ def get_historical_metrics(conn, variant_ids: list) -> dict:
                 SUM(days_at_price) OVER (PARTITION BY vid) AS total_days,
                 SUM(days_at_price) OVER (PARTITION BY vid ORDER BY price) AS cumulative_weight,
                 MAX(ended_at) OVER (PARTITION BY vid) AS last_observed,
-                FIRST_VALUE(price) OVER (PARTITION BY vid ORDER BY ended_at DESC) AS current_price
+                FIRST_VALUE(price) OVER (PARTITION BY vid ORDER BY CASE WHEN ended_at IS NULL THEN 0 ELSE 1 END, ended_at DESC) AS current_price
             FROM intervals
         ),
         medians AS (
@@ -61,21 +66,40 @@ def get_historical_metrics(conn, variant_ids: list) -> dict:
             FROM weighted
             WHERE cumulative_weight >= total_days / 2.0
             ORDER BY vid, cumulative_weight
+        ),
+        p10 AS (
+            SELECT DISTINCT ON (vid)
+                vid,
+                price AS weighted_p10
+            FROM weighted
+            WHERE cumulative_weight >= total_days * 0.1
+            ORDER BY vid, cumulative_weight
+        ),
+        p90 AS (
+            SELECT DISTINCT ON (vid)
+                vid,
+                price AS weighted_p90
+            FROM weighted
+            WHERE cumulative_weight >= total_days * 0.9
+            ORDER BY vid, cumulative_weight
         )
         SELECT 
             w.vid,
             m.weighted_median,
-            PERCENTILE_CONT(0.1) WITHIN GROUP (ORDER BY w.price) AS percentile_10,
-            PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY w.price) AS percentile_90,
+            p1.weighted_p10,
+            p9.weighted_p90,
             MIN(w.price) AS historical_min,
             MAX(w.price) AS historical_max,
             MAX(w.total_days) AS total_days,
             MAX(w.current_price) AS current_price,
             EXTRACT(EPOCH FROM (NOW() - MAX(w.last_observed))) / 86400 AS days_since_last_update,
-            COUNT(DISTINCT w.price) AS total_intervals
+            ic.total_intervals
         FROM weighted w
         JOIN medians m ON m.vid = w.vid
-        GROUP BY w.vid, m.weighted_median
+        JOIN p10 p1 ON p1.vid = w.vid
+        JOIN p90 p9 ON p9.vid = w.vid
+        JOIN interval_counts ic ON ic.vid = w.vid
+        GROUP BY w.vid, m.weighted_median, p1.weighted_p10, p9.weighted_p90, ic.total_intervals
     """)
     
     result = conn.execute(sql, {'ids': variant_ids}).fetchall()
@@ -171,7 +195,7 @@ def calculate_deal_score_v2(prices_data: list, historical: dict, conn=None) -> d
         try:
             rows = conn.execute(text("SELECT name, reliability_score FROM stores WHERE name = ANY(:store_names)"), {'store_names': store_names}).fetchall()
             reliability_map = {r[0]: float(r[1]) for r in rows}
-        except Exception: pass
+        except Exception as e: import sys; print(f'[DealEngine] error: {e}', file=sys.stderr)
 
     valid_prices, valid_weights = [], []
     all_prices_float = [float(x) for x in all_prices]
@@ -245,7 +269,7 @@ def calculate_deal_score_v2(prices_data: list, historical: dict, conn=None) -> d
                 elif discount_info['is_real']:
                     confidence = min(100, int(confidence * 1.1))
                     reason += f" 🔥 REAL SALE ({discount_info['duration_days']:.0f} days)"
-        except Exception: pass
+        except Exception as e: import sys; print(f'[DealEngine] error: {e}', file=sys.stderr)
 
     return {
         'discount_analysis': discount_info, 'deal_score': int(deal_score), 'confidence': confidence,
@@ -281,7 +305,7 @@ def find_best_deals(limit: int = 20):
         historical = get_historical_metrics(conn, variant_ids)
         
         # Для каждого варианта получаем текущие цены
-        for variant_id in variant_ids[:100]:  # Ограничиваем для производительности
+        for variant_id in variant_ids:  # Ограничиваем для производительности
             try:
                 prices_result = conn.execute(text("""
                     SELECT 

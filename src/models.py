@@ -1,21 +1,11 @@
 from sqlalchemy import (
-    Boolean,
-    UniqueConstraint,
-    Column,
-    DateTime,
-    Float,
-    ForeignKey,
-    Index,
-    Integer,
-    Numeric,
-    String,
-    Text,
-CheckConstraint,
+    Boolean, UniqueConstraint, Column, DateTime, Float, ForeignKey, Index, Integer,
+    Numeric, String, Text, CheckConstraint
 )
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy import JSON
 from sqlalchemy.orm import declarative_base
 from sqlalchemy.schema import PrimaryKeyConstraint
-from sqlalchemy.sql import func
+from sqlalchemy.sql import func, text
 
 Base = declarative_base()
 
@@ -23,11 +13,8 @@ class Brand(Base):
     __tablename__ = 'brands'
     id = Column(Integer, primary_key=True)
     name = Column(String, nullable=False)
-    normalized_name = Column(String, unique=True, index=True)  # P0-12: UNIQUE на normalized_name
-
-
-    name = Column(String, unique=True, nullable=False)
-    domain = Column(String, nullable=False, unique=True)  # P0-12: UNIQUE constraint
+    normalized_name = Column(String, unique=True, index=True)
+    domain = Column(String, nullable=False, unique=True)
     currency = Column(String(3), nullable=False)
     region = Column(String(2))
     last_sync = Column(DateTime(timezone=True))
@@ -48,7 +35,6 @@ class Store(Base):
     reliability_score = Column(Numeric(5, 2), default=0.5)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
-
     last_sync = Column(DateTime(timezone=True))
     last_successful_sync = Column(DateTime(timezone=True))
     sync_status = Column(String(20), default='unknown')
@@ -61,31 +47,27 @@ class Product(Base):
     brand_id = Column(Integer, ForeignKey('brands.id'))
     canonical_name = Column(String, nullable=False)
     category = Column(String)
-    __table_args__ = (
-        
-        Index('ix_product_category', 'category'),)
+    __table_args__ = (Index('ix_product_category', 'category'),)
 
 class ProductVariant(Base):
     __tablename__ = 'product_variants'
     id = Column(Integer, primary_key=True)
     product_id = Column(Integer, ForeignKey('products.id'), nullable=False)
-    store_id = Column(Integer, ForeignKey('stores.id'), nullable=True)  # P0-2: Store isolation
-    sku = Column(String, index=True)
-    ean = Column(String, index=True)
-    external_product_id = Column(String, index=True)  # P0-11: Shopify/Magento product ID
-    external_variant_id = Column(String, index=True)
-    
-    __table_args__ = (
-        # P0-3: Composite unique constraint for scoped identity
-        ('store_id', 'external_variant_id', {'name': 'uq_store_external_variant'}),
-    )
+    store_id = Column(Integer, ForeignKey('stores.id'), nullable=False)  # P0-2: NOT NULL
+    sku = Column(String)
+    ean = Column(String)
+    external_product_id = Column(String)
+    external_variant_id = Column(String)
     size = Column(String)
     color = Column(String)
     normalized_size = Column(String(20), index=True)
     normalized_color = Column(String(20), index=True)
     normalized_gender_age = Column(String(20), index=True)
-    attributes = Column(JSONB)
+    attributes = Column(JSON)
     __table_args__ = (
+        # P0-3: Scoped identity — объединено в один __table_args__ (P0-1 fix)
+        UniqueConstraint('store_id', 'external_variant_id', name='uq_store_external_variant'),
+        UniqueConstraint('store_id', 'external_product_id', name='uq_store_external_product'),
         Index('ix_variant_ean', 'ean'),
         Index('ix_variant_sku', 'sku'),
     )
@@ -93,10 +75,6 @@ class ProductVariant(Base):
 class Offer(Base):
     __tablename__ = 'offers'
     id = Column(Integer, primary_key=True)
-    __table_args__ = (
-        # P0-17: CHECK constraint for positive price
-        CheckConstraint('current_price > 0', name='check_price_positive'),
-    )
     store_id = Column(Integer, ForeignKey('stores.id'), nullable=False)
     variant_id = Column(Integer, ForeignKey('product_variants.id'), nullable=False)
     url = Column(Text, nullable=False)
@@ -106,22 +84,19 @@ class Offer(Base):
     original_currency = Column(String(3))
     exchange_rate = Column(Numeric(12, 6))
     exchange_rate_timestamp = Column(DateTime(timezone=True))
-    exchange_rate_source = Column(String(50))  # P0-72: 'fixer_io', 'fallback', 'api'
-    currency_source = Column(String(50))  # P0-68: 'api', 'domain', 'manual'
-    parser_version = Column(String(20), default='1.0')  # P0-70
-    raw_snapshot_id = Column(Integer, ForeignKey('raw_snapshots.id'))  # P0-69
+    exchange_rate_source = Column(String(50))
+    currency_source = Column(String(50))
+    parser_version = Column(String(20), default='1.0')
+    raw_snapshot_id = Column(Integer, ForeignKey('raw_snapshots.id'))
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     __table_args__ = (
-          # P0-12: UNIQUE constraint
+        CheckConstraint('current_price > 0', name='check_price_positive'),  # P0-10
+        UniqueConstraint('store_id', 'variant_id', name='uq_store_variant_offer'),
     )
 
 class PriceHistory(Base):
     __tablename__ = 'price_history'
     variant_id = Column(Integer, ForeignKey('product_variants.id'), nullable=False)
-    __table_args__ = (
-        # P0-17: CHECK constraint for positive price
-        CheckConstraint('price > 0', name='check_price_history_positive'),
-    )
     store_id = Column(Integer, ForeignKey('stores.id'), nullable=False)
     timestamp = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     price = Column(Numeric(10, 2), nullable=False)
@@ -129,47 +104,53 @@ class PriceHistory(Base):
     original_currency = Column(String(3))
     exchange_rate = Column(Numeric(12, 6))
     __table_args__ = (
+        CheckConstraint('price > 0', name='check_price_history_positive'),
         PrimaryKeyConstraint('variant_id', 'store_id', 'timestamp'),
         Index('ix_price_history_variant_time', 'variant_id', 'timestamp'),
     )
 
 class PriceChange(Base):
     __tablename__ = 'price_changes'
-    variant_id = Column(Integer, ForeignKey('product_variants.id'), primary_key=True)
-    __table_args__ = (
-        # P0-17: CHECK constraint for positive price
-        CheckConstraint('price > 0', name='check_price_change_positive'),
-    )
-    store_id = Column(Integer, ForeignKey('stores.id'), primary_key=True)
-    started_at = Column(DateTime(timezone=True), primary_key=True)
+    variant_id = Column(Integer, ForeignKey('product_variants.id'), nullable=False)
+    store_id = Column(Integer, ForeignKey('stores.id'), nullable=False)
+    started_at = Column(DateTime(timezone=True), nullable=False)
     price = Column(Numeric(10, 2), nullable=False)
     old_price = Column(Numeric(10, 2))
     ended_at = Column(DateTime(timezone=True))
     original_currency = Column(String(3))
     exchange_rate = Column(Numeric(12, 6))
-    exchange_rate_source = Column(String(50))  # P0-72
-    parser_version = Column(String(20), default='1.0')  # P0-70
-    raw_snapshot_id = Column(Integer, ForeignKey('raw_snapshots.id'))  # P0-69
-    # P1-24/25: Контекстные поля для точной истории
-    normalized_size = Column(String(20))  # P1-24: размер варианта в момент записи
-    in_stock = Column(Boolean, default=True)  # P1-25: был ли товар в наличии
-    region = Column(String(2))  # P1-26: регион магазина (EU/US/UK/...)
+    exchange_rate_source = Column(String(50))
+    parser_version = Column(String(20), default='1.0')
+    raw_snapshot_id = Column(Integer, ForeignKey('raw_snapshots.id'))
+    normalized_size = Column(String(20))
+    in_stock = Column(Boolean, default=True)
+    region = Column(String(2))
+    __table_args__ = (
+        PrimaryKeyConstraint('variant_id', 'store_id', 'started_at'),
+        CheckConstraint('price > 0', name='check_price_change_positive'),
+        # P0-10: Concurrency protection — только ОДИН открытый интервал
+        Index(
+            'uq_price_change_open_interval',
+            'variant_id', 'store_id',
+            unique=True,
+            postgresql_where=text('ended_at IS NULL')
+        ),
+        Index('ix_price_changes_variant_ended', 'variant_id', 'ended_at'),
+    )
 
 class ProductMatch(Base):
     __tablename__ = 'product_matches'
     id = Column(Integer, primary_key=True)
-    __table_args__ = (
-        # P0-18: CHECK constraint for confidence range
-        CheckConstraint('confidence_score >= 0 AND confidence_score <= 1', name='check_confidence_range'),
-        UniqueConstraint('canonical_variant_id', 'matched_variant_id', name='uq_product_match'),
-        CheckConstraint('canonical_variant_id != matched_variant_id', name='check_no_self_match'),
-    )
     canonical_variant_id = Column(Integer, ForeignKey('product_variants.id', ondelete='CASCADE'), nullable=False)
     matched_variant_id = Column(Integer, ForeignKey('product_variants.id', ondelete='CASCADE'), nullable=False)
     match_method = Column(String(50), nullable=False)
     confidence_score = Column(Numeric(3, 2), nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     __table_args__ = (
+        CheckConstraint('confidence_score >= 0 AND confidence_score <= 1', name='check_confidence_range'),
+        CheckConstraint('canonical_variant_id != matched_variant_id', name='check_no_self_match'),
+        UniqueConstraint('canonical_variant_id', 'matched_variant_id', name='uq_product_match_direct'),
+        UniqueConstraint('matched_variant_id', name='uq_product_match_reverse'),  # P0-10: no duplicate mappings
         Index('idx_matches_canonical', 'canonical_variant_id'),
         Index('idx_matches_matched', 'matched_variant_id'),
     )
@@ -222,7 +203,6 @@ class ColorAlias(Base):
     confidence = Column(Float, default=1.0)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
-
 class DealAlert(Base):
     __tablename__ = 'deal_alerts'
     id = Column(Integer, primary_key=True)
@@ -237,23 +217,18 @@ class DealAlert(Base):
     reason = Column(Text)
     sku = Column(String)
     sent_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
-    
-    __table_args__ = (
-        Index('idx_deal_alerts_sku_store_at', 'sku', 'store_id', 'sent_at', unique=True),
-    )
-
+    __table_args__ = (Index('idx_deal_alerts_sku_store_at', 'sku', 'store_id', 'sent_at', unique=True),)
 
 class RawSnapshot(Base):
-    """P0-69: Raw Data Layer — сохраняет оригинальный HTTP response для дебага."""
     __tablename__ = 'raw_snapshots'
     id = Column(Integer, primary_key=True)
     store_id = Column(Integer, ForeignKey('stores.id'), nullable=False)
     pipeline_run_id = Column(Integer, ForeignKey('pipeline_runs.id'), nullable=True)
-    adapter_name = Column(String(50), nullable=False)  # 'shopify', 'magento'
+    adapter_name = Column(String(50), nullable=False)
     url = Column(Text, nullable=False)
     http_status = Column(Integer)
-    raw_payload = Column(JSONB, nullable=False)  # Оригинальный JSON
-    response_headers = Column(JSONB)  # HTTP headers (для debug rate limits)
+    raw_payload = Column(JSON, nullable=False)
+    response_headers = Column(JSON)
     parser_version = Column(String(20), default='1.0')
     products_count = Column(Integer, default=0)
     fetched_at = Column(DateTime(timezone=True), server_default=func.now())
@@ -262,13 +237,11 @@ class RawSnapshot(Base):
         Index('ix_raw_snapshot_pipeline', 'pipeline_run_id'),
     )
 
-
 class DealValidation(Base):
-    """Human validation of deal alerts"""
     __tablename__ = 'deal_validation'
     id = Column(Integer, primary_key=True)
     alert_id = Column(Integer, ForeignKey('deal_alerts.id', ondelete='CASCADE'))
     user_id = Column(String(50))
-    label = Column(Integer)  # 1 = real deal, 0 = false positive
+    label = Column(Integer)
     notes = Column(Text)
     validated_at = Column(DateTime(timezone=True), server_default=func.now())

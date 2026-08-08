@@ -105,12 +105,13 @@ def batch_import_fast(
                 base_url=url
             )
             
-            # Быстрая проверка размера магазина (только первая страница)
+            # P0-5: Single cursor-based fetch via adapter (no double page-1 fetch)
             adapter.products_url = f"{adapter.base_url}/products.json"
-            first_page = adapter.session.get(
-                f"{adapter.products_url}?limit=250",
-                timeout=10
-            )
+            store = adapter.get_or_create_store(db)
+            first_page = None  # placeholder
+            products, snapshot_id = adapter.fetch_products(limit=250, max_pages=max_pages, db=db, store_id=store.id)
+            first_page_data = {'products': products}
+            first_page_products = products
             
             if first_page.status_code != 200:
                 print("   ⚠️  Cannot access products.json")
