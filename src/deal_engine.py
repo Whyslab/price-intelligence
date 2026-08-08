@@ -307,48 +307,47 @@ def find_best_deals(limit: int = 20):
         # Получаем исторические метрики
         historical = get_historical_metrics(conn, variant_ids)
         
-        # Для каждого варианта получаем текущие цены
-        for variant_id in variant_ids:  # Ограничиваем для производительности
+        # Batch query for all prices (FIXES N+1 — single query)
+        from collections import defaultdict
+        prices_result = conn.execute(text("""
+            SELECT 
+                pm.canonical_variant_id,
+                o.current_price,
+                o.in_stock,
+                s.name as store_name,
+                s.reliability_score,
+                o.variant_id
+            FROM offers o
+            JOIN stores s ON o.store_id = s.id
+            JOIN product_matches pm ON pm.matched_variant_id = o.variant_id
+            WHERE pm.canonical_variant_id = ANY(:variant_ids)
+              AND o.current_price > 0
+        """), {'variant_ids': variant_ids}).fetchall()
+        
+        prices_by_variant = defaultdict(list)
+        for row in prices_result:
+            prices_by_variant[row[0]].append({
+                'price': float(row[1]),
+                'in_stock': row[2],
+                'store': row[3],
+                'reliability': float(row[4]) / 100.0 if row[4] else 0.5,
+                'variant_id': row[5],
+                'canonical_id': row[0]
+            })
+        
+        for variant_id in variant_ids:
             try:
-                prices_result = conn.execute(text("""
-                    SELECT 
-                        o.current_price,
-                        o.in_stock,
-                        s.name as store_name,
-                        s.reliability_score,
-                        o.variant_id
-                    FROM offers o
-                    JOIN stores s ON o.store_id = s.id
-                    JOIN product_matches pm ON pm.matched_variant_id = o.variant_id
-                    WHERE pm.canonical_variant_id = :variant_id
-                      AND o.current_price > 0
-                """), {'variant_id': variant_id}).fetchall()
-                
-                if not prices_result:
+                prices_data = prices_by_variant.get(variant_id, [])
+                if not prices_data:
                     continue
-                
-                prices_data = [
-                    {
-                        'price': float(row[0]),
-                        'in_stock': row[1],
-                        'store': row[2],
-                        'reliability': row[3] / 100.0,
-                        'variant_id': row[4],
-                        'canonical_id': variant_id
-                    }
-                    for row in prices_result
-                ]
-                
-                # Рассчитываем Deal Score
                 deal_result = calculate_deal_score_v2(prices_data, historical, conn)
-                
                 if deal_result['deal_score'] > 0:
                     deals.append({
                         'variant_id': variant_id,
                         **deal_result
                     })
-            
             except Exception as e:
+                logger.error(f"Deal score error for variant {variant_id}: {e}")
                 continue
         
         # Сортируем по deal_score

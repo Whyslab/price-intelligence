@@ -32,7 +32,7 @@ class Store(Base):
     currency = Column(String(10), nullable=False)
     region = Column(String(10))
     timezone = Column(String(50))
-    reliability_score = Column(Numeric(5, 2), default=0.5)
+    reliability_score = Column(Numeric(5, 2), default=50.0)  # 0-100 scale
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     last_sync = Column(DateTime(timezone=True))
@@ -67,7 +67,8 @@ class ProductVariant(Base):
     __table_args__ = (
         # P0-3: Scoped identity — объединено в один __table_args__ (P0-1 fix)
         Index('uq_store_external_variant', 'store_id', 'external_variant_id', unique=True, postgresql_where=text("external_variant_id IS NOT NULL AND external_variant_id != ''")),
-        Index('uq_store_external_product', 'store_id', 'external_product_id', unique=True, postgresql_where=text("external_product_id IS NOT NULL AND external_product_id != ''")),
+        # REMOVED: external_product_id NOT unique (multiple variants per product)
+        # Index('uq_store_external_product', 'store_id', 'external_product_id', unique=True, postgresql_where=text("external_product_id IS NOT NULL AND external_product_id != ''")),
         Index('ix_variant_ean', 'ean'),
         Index('ix_variant_sku', 'sku'),
     )
@@ -148,7 +149,7 @@ class ProductMatch(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     __table_args__ = (
         CheckConstraint('confidence_score >= 0 AND confidence_score <= 1', name='check_confidence_range'),
-        CheckConstraint('canonical_variant_id < matched_variant_id', name='check_no_self_match_and_cycles'),
+        CheckConstraint('canonical_variant_id != matched_variant_id', name='check_no_self_match'),
         UniqueConstraint('canonical_variant_id', 'matched_variant_id', name='uq_product_match_direct'),
         UniqueConstraint('matched_variant_id', name='uq_product_match_reverse'),  # P0-10: no duplicate mappings
         Index('idx_matches_canonical', 'canonical_variant_id'),
