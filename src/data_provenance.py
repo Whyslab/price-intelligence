@@ -41,7 +41,7 @@ def save_raw_snapshot(
     """
     products_count = 0
     if isinstance(payload, dict):
-        products_count = len(payload.get('products', []))
+        products_count = payload.get('total_products', len(payload.get('products', [])))
     elif isinstance(payload, list):
         products_count = len(payload)
     

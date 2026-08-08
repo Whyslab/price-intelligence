@@ -1,9 +1,19 @@
-fastapi==0.141.1
-jinja2==3.1.6
-numpy
-psycopg[binary]==3.3.4
-python-dotenv==1.2.2
-python-stdnum
-requests==2.34.2
-sqlalchemy==2.0.51
-uvicorn[standard]==0.52.1
+# Core dependencies
+sqlalchemy>=2.0
+psycopg[binary]>=3.1
+requests>=2.31
+python-dotenv>=1.0
+numpy>=1.24
+python-stdnum>=1.18
+
+# Web
+flask>=2.3
+jinja2>=3.1
+
+# Testing
+pytest>=7.4
+pytest-cov>=4.1
+
+# Linting
+ruff>=0.1
+mypy>=1.5

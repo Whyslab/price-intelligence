@@ -1,3 +1,4 @@
+import os
 """
 Currency Normalizer v2: конвертирует цены в USD с полным аудитом.
 - Reject при неизвестной валюте (вместо auto-USD)
@@ -12,7 +13,7 @@ from datetime import datetime, timedelta
 from sqlalchemy import create_engine, text
 from src.config import DATABASE_URL
 
-FIXER_API_KEY = "YOUR_API_KEY_HERE"
+FIXER_API_KEY = os.getenv("FIXER_API_KEY", "YOUR_API_KEY_HERE")
 CACHE_FILE = "exchange_rates.json"
 CACHE_TTL_HOURS = 24
 
@@ -94,7 +95,7 @@ def get_exchange_rates() -> tuple:
         return rates, datetime.now()
     
     try:
-        url = f"http://data.fixer.io/api/latest?access_key={FIXER_API_KEY}&base=EUR"
+        url = f"https://data.fixer.io/api/latest?access_key={FIXER_API_KEY}&base=EUR"
         response = requests.get(url, timeout=10)
         data = response.json()
         

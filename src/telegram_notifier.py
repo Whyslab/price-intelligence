@@ -34,6 +34,12 @@ def send_telegram_message(msg: str):
             except ValueError:
                 print("❌ Invalid JSON from Telegram")
         elif r.status_code == 429:
+            # P1-76: True retry with backoff
+            import time
+            retry_after = r.json().get('parameters', {}).get('retry_after', 5)
+            print(f"⚠️ Rate limit, retry in {retry_after}s")
+            time.sleep(retry_after)
+            return send_telegram_message(msg)  # Recursive retry
             # P1-43: Rate limit handling
             retry_after = r.json().get('parameters', {}).get('retry_after', 5)
             print(f"⚠️ Telegram rate limit. Retry after {retry_after}s")
@@ -57,7 +63,7 @@ def log_deal_alert(deal_data: dict):
                 SELECT :fingerprint, :canon_id, :match_id, s.id, :price, :score, :conf, :class, :reason, :sku
                 FROM stores s
                 WHERE s.name = :store
-                ON CONFLICT (sku, store_id, sent_date) DO NOTHING
+                ON CONFLICT (sku, store_id, sent_at) DO NOTHING
             """), {
                 'fingerprint': fingerprint,
                 'canon_id': deal_data.get('canonical_id'),

@@ -271,3 +271,16 @@ if __name__ == "__main__":
         print(f"Failed: {e}")
     finally:
         db.close()
+
+    
+    def _detect_currency(self):
+        from src.currency_normalizer import detect_currency
+        return detect_currency(self.base_url) or None
+    
+    def _detect_region(self):
+        from urllib.parse import urlparse
+        domain = urlparse(self.base_url).netloc.lower()
+        tld_map = {'.uk':'GB','.de':'DE','.fr':'FR','.it':'IT','.es':'ES','.jp':'JP'}
+        for tld, reg in tld_map.items():
+            if domain.endswith(tld): return reg
+        return 'US'

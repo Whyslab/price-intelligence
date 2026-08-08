@@ -20,7 +20,10 @@ class ShopifyAdapter:
             'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36'
         })
         # Определяем валюту магазина ОДИН РАЗ (v2: None если неизвестна)
-        self.store_currency = detect_currency(self.base_url) or 'USD'
+        self.store_currency = detect_currency(self.base_url)
+        if not self.store_currency:
+            print(f"⚠️ Unknown currency: {self.base_url}")
+            self.store_currency = None
     
     def fetch_products(self, limit: int = 250, max_pages: int = 50, db: Session = None, store_id: int = None) -> tuple:
         """
@@ -125,7 +128,7 @@ class ShopifyAdapter:
         store = db.query(Store).filter(Store.domain == domain).with_for_update().first()
         if not store:
             store = Store(name=self.store_name, domain=domain, 
-                         currency=self.store_currency, region="US")
+                         currency=self.store_currency, region=self._detect_region())
             db.add(store)
             db.flush()
         return store
@@ -321,3 +324,12 @@ if __name__ == "__main__":
         print(f"Failed: {e}")
     finally:
         db.close()
+
+    
+    def _detect_region(self):
+        from urllib.parse import urlparse
+        domain = urlparse(self.base_url).netloc.lower()
+        tld_map = {'.uk':'GB','.de':'DE','.fr':'FR','.it':'IT','.jp':'JP','.cn':'CN'}
+        for tld, reg in tld_map.items():
+            if domain.endswith(tld): return reg
+        return 'US'

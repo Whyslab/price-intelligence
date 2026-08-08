@@ -1,0 +1,9 @@
+[
+  {
+    "url": "https://example.com",
+    "name": "Example",
+    "currency": "USD",
+    "region": "US",
+    "enabled": true
+  }
+]
