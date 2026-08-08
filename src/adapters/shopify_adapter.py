@@ -27,7 +27,7 @@ class ShopifyAdapter:
         tld_map = {'.uk':'GB','.de':'DE','.fr':'FR','.it':'IT','.jp':'JP','.cn':'CN'}
         for tld, reg in tld_map.items():
             if domain.endswith(tld): return reg
-        return 'US'
+        return None  # Unknown TLD
 
     def __init__(self, store_name: str, base_url: str):
         self.store_name = store_name
