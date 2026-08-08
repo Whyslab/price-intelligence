@@ -23,13 +23,7 @@ class Brand(Base):
     name = Column(String, nullable=False)
     normalized_name = Column(String, unique=True, index=True)  # P0-12: UNIQUE на normalized_name
 
-class Store(Base):
-    __tablename__ = 'stores'
-    id = Column(Integer, primary_key=True)
-    __table_args__ = (
-        # P0-19: CHECK constraint for reliability range
-        CheckConstraint('reliability_score >= 0 AND reliability_score <= 100', name='check_reliability_range'),
-    )
+
     name = Column(String, unique=True, nullable=False)
     domain = Column(String, nullable=False, unique=True)  # P0-12: UNIQUE constraint
     currency = Column(String(3), nullable=False)
