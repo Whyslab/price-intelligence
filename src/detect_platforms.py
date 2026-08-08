@@ -24,8 +24,8 @@ def detect_platform(url: str) -> dict:
         response = requests.get(url, headers=headers, timeout=10)
         result['status'] = response.status_code
         
-        if response.status_code != 200:
-            result['notes'] = f"HTTP {response.status_code}"
+        if response is None or response.status_code != 200:
+            result['notes'] = f"HTTP {response.status_code if response else 'N/A'}"
             return result
         
         html = response.text.lower()

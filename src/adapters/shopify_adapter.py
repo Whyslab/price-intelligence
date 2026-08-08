@@ -40,7 +40,11 @@ class ShopifyAdapter:
             'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36'
         })
         # Определяем валюту магазина ОДИН РАЗ (v2: None если неизвестна)
-        self.store_currency = detect_currency(self.base_url)
+        try:
+            self.store_currency = detect_currency(self.base_url)
+        except Exception as e:
+            print(f"   ⚠️  Currency detection failed: {e}")
+            self.store_currency = "USD"  # Fallback
         if not self.store_currency:
             print(f"⚠️ Unknown currency: {self.base_url}")
             self.store_currency = "USD"  # Fallback to USD instead of NULL
@@ -67,7 +71,7 @@ class ShopifyAdapter:
                 break
             
             if response is None or response.status_code != 200:
-                print(f"   ⚠️  HTTP {response.status_code} at page {page_count}")
+                print(f"   ⚠️  HTTP {response.status_code if response else 'N/A'} at page {page_count}")
                 break
             
             try:

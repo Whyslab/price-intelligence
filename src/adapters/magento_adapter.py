@@ -48,8 +48,8 @@ class MagentoAdapter:
             try:
                 response = self.session.get(url, params=params, timeout=30)
                 
-                if response.status_code != 200:
-                    print(f"   ⚠️  API returned {response.status_code}")
+                if response is None or response.status_code != 200:
+                    print(f"   ⚠️  API returned {response.status_code if response else 'N/A'}")
                     break
                 
                 data = response.json()

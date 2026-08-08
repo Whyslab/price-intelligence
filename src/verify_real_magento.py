@@ -7,7 +7,7 @@ headers = {'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json'}
 
 print(f"🔍 {url}")
 r = requests.get(url, params=params, headers=headers, timeout=20)
-print(f"Status: {r.status_code} | Content-Type: {r.headers.get('Content-Type')}")
+print(f"Status: {r.status_code if r else 'N/A'} | Content-Type: {r.headers.get('Content-Type')}")
 
 if r.headers.get('Content-Type','').startswith('application/json'):
     try:

@@ -31,7 +31,7 @@ def send_telegram_message(msg: str):
                 timeout=10
             )
             
-            if r.status_code == 200:
+            if r is not None and r.status_code == 200:
                 break
             elif r.status_code == 429:
                 retry_after = r.json().get('parameters', {}).get('retry_after', retry_delay)
@@ -39,13 +39,13 @@ def send_telegram_message(msg: str):
                 time.sleep(retry_after)
                 retry_delay = min(retry_delay * 2, 60)  # Exponential backoff
             else:
-                print(f"❌ Telegram API error: {r.status_code}")
+                print(f"❌ Telegram API error: {r.status_code if r else 'N/A'}")
                 break
         else:
             print("❌ Failed after all retries")
             return False
         # P1-42: Проверяем JSON response, а не только HTTP 200
-        if r.status_code == 200:
+        if r is not None and r.status_code == 200:
             try:
                 resp_json = r.json()
                 if resp_json.get("ok"):
@@ -66,7 +66,7 @@ def send_telegram_message(msg: str):
             print(f"⚠️ Telegram rate limit. Retry after {retry_after}s")
             import time; time.sleep(retry_after)
         else:
-            print(f"❌ HTTP {r.status_code}: {r.text[:100]}")
+            print(f"❌ HTTP {r.status_code if r else 'N/A'}: {r.text[:100]}")
     except Exception as e:
         print(f"❌ {e}")
 

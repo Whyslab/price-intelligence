@@ -21,7 +21,7 @@ print(f"   Params: {params}\n")
 
 response = requests.get(url, params=params, headers=headers, timeout=30)
 
-print(f"Status: {response.status_code}")
+print(f"Status: {response.status_code if response else 'N/A'}")
 print(f"Headers: {dict(response.headers)}\n")
 print(f"Content-Type: {response.headers.get('Content-Type')}\n")
 
