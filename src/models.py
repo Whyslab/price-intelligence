@@ -33,8 +33,8 @@ class Product(Base):
     canonical_name = Column(String, nullable=False)
     category = Column(String)
     __table_args__ = (
-        UniqueConstraint('store_id', 'external_product_id', name='uq_store_external_product'),
-        UniqueConstraint('store_id', 'external_variant_id', name='uq_store_external_variant'),Index('ix_product_category', 'category'),)
+        
+        Index('ix_product_category', 'category'),)
 
 class ProductVariant(Base):
     __tablename__ = 'product_variants'
@@ -74,7 +74,7 @@ class Offer(Base):
     raw_snapshot_id = Column(Integer, ForeignKey('raw_snapshots.id'))  # P0-69
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     __table_args__ = (
-        UniqueConstraint('store_id', 'variant_id', name='uq_offer_store_variant'),  # P0-12: UNIQUE constraint
+          # P0-12: UNIQUE constraint
     )
 
 class PriceHistory(Base):
