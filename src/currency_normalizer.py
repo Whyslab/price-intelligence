@@ -39,7 +39,8 @@ DOMAIN_CURRENCY_MAP = {
     '.pl': 'PLN', '.cz': 'CZK', '.hu': 'HUF',
 }
 
-SUPPORTED_CURRENCIES = {'USD', 'EUR', 'GBP', 'JPY', 'KRW', 'CAD', 'AUD', 'CHF', 'SEK', 'NOK', 'DKK', 'PLN', 'CZK', 'HUF'}
+SUPPORTED_CURRENCIES = {'CNY',
+    'USD', 'EUR', 'GBP', 'JPY', 'KRW', 'CAD', 'AUD', 'CHF', 'SEK', 'NOK', 'DKK', 'PLN', 'CZK', 'HUF'}
 
 def detect_currency(url: str) -> str:
     """Определяет валюту по домену. Возвращает None если неизвестна."""
@@ -84,6 +85,7 @@ def get_fallback_rates() -> dict:
         'PLN': Decimal('4.02'),
         'CZK': Decimal('23.1'),
         'HUF': Decimal('355.0'),
+        'CNY': Decimal('7.24'),
     }
 
 def get_exchange_rates() -> tuple:
