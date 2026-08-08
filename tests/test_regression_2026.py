@@ -39,13 +39,16 @@ class TestWeightedMedian:
     """Test weighted median calculation (P0)"""
     
     def test_no_generate_series_in_sql(self):
-        """Weighted median SQL must not use generate_series()"""
+        """Weighted median SQL must not use generate_series() in actual SQL queries"""
+        import re
         from pathlib import Path
         deal_engine = Path(__file__).parent.parent / "src" / "deal_engine.py"
         content = deal_engine.read_text()
-        # Check the historical metrics SQL
-        assert 'generate_series' not in content.lower(), \
-            "generate_series() is inefficient for weighted median"
+        # Check only SQL blocks inside text("""...""") - not docstrings/comments
+        sql_blocks = re.findall(r'text\(\s*"""(.*?)"""\s*\)', content, re.DOTALL)
+        for sql in sql_blocks:
+            assert 'generate_series' not in sql.lower(), \
+                "generate_series() found in SQL - inefficient for weighted median"
     
     def test_weighted_median_correctness(self):
         """Weighted median should favor longer-held prices"""
