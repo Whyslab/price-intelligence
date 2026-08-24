@@ -298,6 +298,7 @@ def test_health_report_names_what_is_wrong(config):
     )
 
     report = pipeline.health_report(conn)
+    assert "UTC" in report, "the summary must date its figures"
     assert "broken.example" in report
     assert "HTTP 500" in report
     assert "закрыты анти-ботом" in report

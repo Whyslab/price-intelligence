@@ -397,8 +397,13 @@ def health_report(conn: sqlite3.Connection) -> str:
 
     lines = ["📊 <b>Price Intelligence — сводка</b>", ""]
     if last:
+        # Say when, because this is the last *finished* run: if one is in
+        # progress, or the timer has not fired for days, the figures below are
+        # older than they look.
+        when = (last["finished_at"] or "")[:16].replace("T", " ")
         lines += [
-            f"Последний обход: {last['stores_ok']} магазинов ок, {last['stores_failed']} с ошибкой",
+            f"Последний обход ({when} UTC): {last['stores_ok']} магазинов ок, "
+            f"{last['stores_failed']} с ошибкой",
             f"Товаров просмотрено: {last['products_seen']:,}",
             f"Изменений цен: {last['points_written']:,}",
         ]
