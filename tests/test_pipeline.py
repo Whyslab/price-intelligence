@@ -439,7 +439,7 @@ async def test_seeding_silences_the_backlog_of_standing_sales(config, shopify_pa
 async def test_a_price_drop_after_seeding_is_still_announced(config, shopify_payload):
     """Seeding must silence the backlog without deafening the bot."""
     _mock_rates()
-    photo, text = _mock_telegram()
+    _mock_telegram()
     respx.get("https://shop.example/products.json?limit=250").mock(
         return_value=httpx.Response(200, json=shopify_payload)
     )
