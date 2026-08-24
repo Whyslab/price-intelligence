@@ -4,7 +4,7 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 SCHEMA_VERSION = 1
@@ -199,3 +199,39 @@ def price_history(conn: sqlite3.Connection, variant_id: int) -> list[sqlite3.Row
         "SELECT * FROM price_points WHERE variant_id = ? ORDER BY ts",
         (variant_id,),
     ).fetchall()
+
+
+def prune_history(conn: sqlite3.Connection, keep_days: int = 180) -> int:
+    """Delete price points older than keep_days, returning how many went.
+
+    The newest point per variant is always kept whatever its age: it is the
+    current price, and losing it would make the variant look unpriced. Only
+    history beyond the window used for the median comparison is dropped.
+    """
+    cutoff = (
+        datetime.now(UTC) - timedelta(days=keep_days)
+    ).isoformat(timespec="seconds")
+    cur = conn.execute(
+        """
+        DELETE FROM price_points
+        WHERE ts < ?
+          AND ts <> (SELECT MAX(ts) FROM price_points p WHERE p.variant_id = price_points.variant_id)
+        """,
+        (cutoff,),
+    )
+    return cur.rowcount
+
+
+def drop_orphans(conn: sqlite3.Connection) -> dict[str, int]:
+    """Remove products and variants that no longer have any recorded price.
+
+    A shop that delists a product stops returning it, so its rows linger with
+    no history behind them. They cost space and can never produce a deal.
+    """
+    variants = conn.execute(
+        "DELETE FROM variants WHERE id NOT IN (SELECT DISTINCT variant_id FROM price_points)"
+    ).rowcount
+    products = conn.execute(
+        "DELETE FROM products WHERE id NOT IN (SELECT DISTINCT product_id FROM variants)"
+    ).rowcount
+    return {"variants": variants, "products": products}

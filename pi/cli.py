@@ -126,6 +126,24 @@ def cmd_health(args, config: Config) -> int:
     return 0 if asyncio.run(go()) else 1
 
 
+def cmd_prune(args, config: Config) -> int:
+    conn = dbm.connect(config.db_path)
+    before = config.db_path.stat().st_size if config.db_path.exists() else 0
+
+    points = dbm.prune_history(conn, args.keep_days)
+    orphans = dbm.drop_orphans(conn)
+    print(
+        f"удалено: {points:,} точек истории старше {args.keep_days} дн, "
+        f"{orphans['variants']:,} вариантов и {orphans['products']:,} товаров без цен"
+    )
+    if not args.no_vacuum:
+        print("VACUUM…", flush=True)
+        conn.execute("VACUUM")
+    after = config.db_path.stat().st_size
+    print(f"размер базы: {before / 1e6:,.0f} MB -> {after / 1e6:,.0f} MB")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="pi", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -155,6 +173,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="product pages to crawl per non-Shopify store per run",
     )
     p.set_defaults(func=cmd_run)
+
+    p = sub.add_parser("prune", help="drop old price history and reclaim disk space")
+    p.add_argument(
+        "--keep-days", type=int, default=180,
+        help="history to keep, in days (default 180; the newest price per "
+             "variant is always kept)",
+    )
+    p.add_argument("--no-vacuum", action="store_true", help="skip VACUUM (faster, frees nothing)")
+    p.set_defaults(func=cmd_prune)
 
     p = sub.add_parser("health", help="collection health summary")
     p.add_argument("--send", action="store_true", help="send it to Telegram")

@@ -354,3 +354,50 @@ async def test_naming_a_store_explicitly_overrides_the_skip(config, shopify_payl
     )
     stats = await pipeline.run(config, conn, domains=("shop.example",))
     assert stats.stores_ok == 1
+
+
+@respx.mock
+async def test_deals_past_the_cap_are_reconsidered_not_lost(config, shopify_payload):
+    """A good deal must not vanish because fifteen better ones arrived with it.
+
+    Over-cap deals are never recorded in `alerts`, and a normal run only scores
+    variants whose price moved — so without a carry-over they would be lost for
+    good rather than merely delayed.
+    """
+    _mock_rates()
+    photo, text = _mock_telegram()
+
+    # Three products on sale, but only one notification allowed per run.
+    product = json.loads(json.dumps(shopify_payload["products"][2]))
+    catalogue = []
+    for n in range(3):
+        copy = json.loads(json.dumps(product))
+        copy["id"] = 700_000 + n
+        copy["handle"] = f"shoe-{n}"
+        copy["variants"] = [copy["variants"][0]]
+        copy["variants"][0]["id"] = 800_000 + n
+        copy["variants"][0]["available"] = True
+        catalogue.append(copy)
+    respx.get("https://shop.example/products.json?limit=250").mock(
+        return_value=httpx.Response(200, json={"products": catalogue})
+    )
+
+    conn = dbm.connect(config.db_path)
+    known_store(conn)
+
+    first = await pipeline.run(config, conn, limit=1)
+    assert first.alerts_sent == 1
+    assert conn.execute("SELECT note FROM runs ORDER BY id DESC LIMIT 1").fetchone()[0] == "capped"
+
+    # Nothing about the catalogue changes, so a run that only looked at moved
+    # prices would send nothing at all.
+    second = await pipeline.run(config, conn, limit=1)
+    assert second.alerts_sent == 1, "the deferred deal goes out next time"
+
+    third = await pipeline.run(config, conn, limit=1)
+    assert third.alerts_sent == 1
+
+    fourth = await pipeline.run(config, conn, limit=1)
+    assert fourth.alerts_sent == 0, "and then it goes quiet"
+    assert conn.execute("SELECT COUNT(*) FROM alerts").fetchone()[0] == 3
+    assert photo.call_count + text.call_count == 3

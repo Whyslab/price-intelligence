@@ -46,6 +46,14 @@ def make_client(timeout: float = 30.0) -> httpx.AsyncClient:
     )
 
 
+def _last_run_was_capped(conn: sqlite3.Connection) -> bool:
+    """Did the previous run leave deals unsent because it hit the cap?"""
+    row = conn.execute(
+        "SELECT note FROM runs WHERE finished_at IS NOT NULL ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    return bool(row and row["note"] == "capped")
+
+
 # A store's own markup is a durable fact about it, unlike a network hiccup.
 HOPELESS_ERRORS = ("no schema.org/Product markup found", "no product URLs in sitemap")
 
@@ -227,6 +235,9 @@ async def run(
     instead, for when the filters changed rather than the prices.
     """
     stats = RunStats()
+    if not rescan and _last_run_was_capped(conn):
+        log.info("the previous run hit its alert cap — scoring everything this time")
+        rescan = True
     stores = dbm.get_stores(conn, platforms=("shopify", "jsonld"), domains=domains)
     if not domains:
         stores, skipped = _drop_hopeless(stores)
@@ -322,7 +333,19 @@ async def run(
         candidates = find_deals(conn, scorable, config)
         cap = limit if limit is not None else config.filters.max_alerts_per_run
         selected = candidates[:cap]
+        overflow = len(candidates) - len(selected)
         log.info("%d deals found, sending %d", len(candidates), len(selected))
+        if overflow:
+            # Deals past the cap are not recorded, and the next run only scores
+            # variants whose price moved — so without this they would be lost
+            # for good rather than merely delayed. Mark the run so the next one
+            # reconsiders everything.
+            log.warning(
+                "%d deal(s) over the cap of %d were not sent; the next run will "
+                "reconsider them (raise max_alerts_per_run to see them sooner)",
+                overflow, cap,
+            )
+            conn.execute("UPDATE runs SET note = 'capped' WHERE id = ?", (run_id,))
 
         if dry_run:
             for deal, row in selected:
