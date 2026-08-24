@@ -401,3 +401,61 @@ async def test_deals_past_the_cap_are_reconsidered_not_lost(config, shopify_payl
     assert fourth.alerts_sent == 0, "and then it goes quiet"
     assert conn.execute("SELECT COUNT(*) FROM alerts").fetchone()[0] == 3
     assert photo.call_count + text.call_count == 3
+
+
+@respx.mock
+async def test_seeding_silences_the_backlog_of_standing_sales(config, shopify_payload):
+    """A shop's existing sales are not news, and there can be tens of thousands.
+
+    Measured on the real database: 29,853 products qualified at once. Draining
+    that at max_alerts_per_run would mean months of notifications about sales
+    that started before the bot existed.
+    """
+    _mock_rates()
+    photo, text = _mock_telegram()
+    respx.get("https://shop.example/products.json?limit=250").mock(
+        return_value=httpx.Response(200, json=shopify_payload)
+    )
+
+    conn = dbm.connect(config.db_path)
+    known_store(conn)
+    await pipeline.run(config, conn, collect_only=True)
+
+    counted = pipeline.seed_alerts(conn, config, dry_run=True)
+    assert counted > 0, "the fixture holds qualifying discounts"
+    assert conn.execute("SELECT COUNT(*) FROM alerts").fetchone()[0] == 0, "dry run writes nothing"
+
+    seeded = pipeline.seed_alerts(conn, config)
+    assert seeded == counted
+    assert conn.execute("SELECT COUNT(*) FROM alerts").fetchone()[0] == seeded
+
+    # Nothing is announced now, because none of it is new.
+    stats = await pipeline.run(config, conn, rescan=True)
+    assert stats.alerts_sent == 0
+    assert not photo.called and not text.called
+
+
+@respx.mock
+async def test_a_price_drop_after_seeding_is_still_announced(config, shopify_payload):
+    """Seeding must silence the backlog without deafening the bot."""
+    _mock_rates()
+    photo, text = _mock_telegram()
+    respx.get("https://shop.example/products.json?limit=250").mock(
+        return_value=httpx.Response(200, json=shopify_payload)
+    )
+    conn = dbm.connect(config.db_path)
+    known_store(conn)
+    await pipeline.run(config, conn, collect_only=True)
+    pipeline.seed_alerts(conn, config)
+
+    cheaper = json.loads(json.dumps(shopify_payload))
+    for product in cheaper["products"]:
+        for variant in product["variants"]:
+            variant["available"] = True
+            variant["price"] = f"{float(variant['price']) / 3:.2f}"
+    respx.get("https://shop.example/products.json?limit=250").mock(
+        return_value=httpx.Response(200, json=cheaper)
+    )
+
+    stats = await pipeline.run(config, conn)
+    assert stats.alerts_sent > 0, "a genuine further drop still gets through"

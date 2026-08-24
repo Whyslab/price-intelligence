@@ -126,6 +126,22 @@ def cmd_health(args, config: Config) -> int:
     return 0 if asyncio.run(go()) else 1
 
 
+def cmd_seed(args, config: Config) -> int:
+    conn = dbm.connect(config.db_path)
+    already = conn.execute("SELECT COUNT(*) FROM alerts").fetchone()[0]
+    n = pipeline.seed_alerts(conn, config, dry_run=args.dry_run)
+    if args.dry_run:
+        print(f"сейчас проходят пороги: {n:,} товаров (ничего не записано)")
+        return 0
+    print(
+        f"помечено как уже виденное: {n:,} товаров "
+        f"(в alerts было {already:,}, стало "
+        f"{conn.execute('SELECT COUNT(*) FROM alerts').fetchone()[0]:,})"
+    )
+    print("дальше приходят только новые падения цены")
+    return 0
+
+
 def cmd_prune(args, config: Config) -> int:
     conn = dbm.connect(config.db_path)
     before = config.db_path.stat().st_size if config.db_path.exists() else 0
@@ -173,6 +189,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="product pages to crawl per non-Shopify store per run",
     )
     p.set_defaults(func=cmd_run)
+
+    p = sub.add_parser(
+        "seed",
+        help="treat every discount that qualifies right now as already seen, so "
+             "only new price drops are announced",
+    )
+    p.add_argument("--dry-run", action="store_true", help="just count them")
+    p.set_defaults(func=cmd_seed)
 
     p = sub.add_parser("prune", help="drop old price history and reclaim disk space")
     p.add_argument(

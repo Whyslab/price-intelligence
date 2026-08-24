@@ -183,6 +183,29 @@ def find_deals(
     return found
 
 
+def seed_alerts(conn: sqlite3.Connection, config: Config, dry_run: bool = False) -> int:
+    """Mark every discount that currently qualifies as already announced.
+
+    A shop's standing sales are not news. The per-store baseline rule handles
+    this for a shop being read for the first time, but a database that has been
+    collected for a while — or rebuilt, or had its thresholds lowered — can hold
+    tens of thousands of qualifying discounts that were never sent. Draining
+    those at max_alerts_per_run would mean months of notifications about sales
+    that started before the bot existed.
+
+    Seeding records them without sending, so only price drops from here on are
+    announced. Returns how many were suppressed.
+    """
+    candidates = find_deals(conn, all_scorable_variants(conn), config)
+    if dry_run:
+        return len(candidates)
+    ts = dbm.utcnow()
+    with dbm.transaction(conn):
+        for deal, _ in candidates:
+            dealm.record_alert(conn, deal, ts)
+    return len(candidates)
+
+
 def caption_for(deal: dealm.Deal, row: sqlite3.Row, conn: sqlite3.Connection) -> str:
     point = dbm.latest_point(conn, deal.variant_id)
     return format_caption(
