@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sqlite3
+from collections import Counter
 from dataclasses import dataclass, field
 
 import httpx
@@ -214,12 +215,22 @@ async def run(
 
     rates = load_rates(config.db_path.parent / "fx_cache.json")
     log.info("exchange rates: %s (%s)", rates.source, rates.fetched_at.date())
+    by_platform = Counter(s["platform"] for s in stores)
     log.info(
-        "sweeping %d stores, concurrency %d, shared Shopify budget %.1f req/s",
-        len(stores), config.concurrency, config.shopify_rate,
+        "sweeping %d stores (%s), shared Shopify budget %.1f req/s",
+        len(stores),
+        ", ".join(f"{n} {p}" for p, n in by_platform.most_common()),
+        config.shopify_rate,
     )
 
-    semaphore = asyncio.Semaphore(config.concurrency)
+    # Separate pools per platform. A jsonld store crawls hundreds of product
+    # pages and holds its slot for a minute or more; sharing one pool let those
+    # crawls occupy every slot and starve the Shopify stores, which are fast and
+    # governed by the rate limiter anyway.
+    pools = {
+        "shopify": asyncio.Semaphore(config.concurrency),
+        "jsonld": asyncio.Semaphore(max(2, config.concurrency // 2)),
+    }
     limiter = RateLimiter(rate=config.shopify_rate)
     changed: list[int] = []
     # A store being read for the first time has every standing sale look brand
@@ -233,7 +244,8 @@ async def run(
     async with make_client() as client:
 
         async def one(store: sqlite3.Row):
-            async with semaphore:
+            pool = pools.get(store["platform"], pools["jsonld"])
+            async with pool:
                 return store, await collect_store(client, store, jsonld_budget, limiter)
 
         for coro in asyncio.as_completed([one(s) for s in stores]):
