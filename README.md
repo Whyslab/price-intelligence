@@ -198,7 +198,7 @@ pi/
 
 ```bash
 pip install -e ".[dev]"
-pytest -q          # 88 тестов, сеть замокана, ~1 с
+pytest -q          # 105 тестов, сеть замокана, ~1 с
 ruff check .
 ```
 
