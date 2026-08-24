@@ -46,6 +46,29 @@ def make_client(timeout: float = 30.0) -> httpx.AsyncClient:
     )
 
 
+# A store's own markup is a durable fact about it, unlike a network hiccup.
+HOPELESS_ERRORS = ("no schema.org/Product markup found", "no product URLs in sitemap")
+
+
+def _drop_hopeless(stores: list[sqlite3.Row]) -> tuple[list[sqlite3.Row], int]:
+    """Set aside stores that have never once yielded a product and said why.
+
+    Crawling 200 product pages every six hours at a shop that publishes no
+    structured data costs thousands of pointless requests and finds nothing.
+    A store is only dropped if it has never succeeded, so one bad sweep cannot
+    retire a working shop; naming it in --stores brings it back.
+    """
+    keep, dropped = [], 0
+    for store in stores:
+        never_worked = not store["last_ok"]
+        hopeless = (store["last_error"] or "") in HOPELESS_ERRORS
+        if never_worked and hopeless:
+            dropped += 1
+        else:
+            keep.append(store)
+    return keep, dropped
+
+
 async def collect_store(
     client: httpx.AsyncClient, store: sqlite3.Row, jsonld_budget: int, limiter: RateLimiter
 ) -> tuple[FetchResult, int | None]:
@@ -205,6 +228,13 @@ async def run(
     """
     stats = RunStats()
     stores = dbm.get_stores(conn, platforms=("shopify", "jsonld"), domains=domains)
+    if not domains:
+        stores, skipped = _drop_hopeless(stores)
+        if skipped:
+            log.info(
+                "skipping %d store(s) that publish no machine-readable prices "
+                "(re-check them with --stores)", skipped
+            )
     if not stores:
         log.warning("no readable stores — run `detect` first")
         return stats

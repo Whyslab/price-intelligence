@@ -32,6 +32,11 @@ log = logging.getLogger(__name__)
 DEFAULT_BUDGET = 200
 PER_HOST_CONCURRENCY = 4
 SITEMAP_CANDIDATES = ("/sitemap.xml", "/sitemap_index.xml", "/sitemap/products.xml")
+# robots.txt is where a site is supposed to declare its sitemap, and plenty put
+# it somewhere none of the guesses above would find: /shop/sitemapindex.xml,
+# /1_index_sitemap.xml, /sitemap/<host>/sitemap.xml. Measured on the live list,
+# five of six stores reporting "no product URLs" had one declared here.
+_ROBOTS_SITEMAP = re.compile(r"^\s*sitemap\s*:\s*(https?://\S+)", re.IGNORECASE | re.MULTILINE)
 
 _LOC = re.compile(r"<loc>\s*([^<\s]+)\s*</loc>", re.IGNORECASE)
 _LD_BLOCK = re.compile(
@@ -203,13 +208,26 @@ async def _get(client: httpx.AsyncClient, url: str) -> httpx.Response | None:
     return resp if resp.status_code == 200 else None
 
 
+async def sitemap_urls(client: httpx.AsyncClient, base: str) -> list[str]:
+    """Where this site's sitemap might be: robots.txt first, then the usual guesses."""
+    found: list[str] = []
+    resp = await _get(client, f"{base}/robots.txt")
+    if resp is not None and len(resp.text) < 500_000:
+        host = urlparse(base).netloc
+        found = [
+            url for url in _ROBOTS_SITEMAP.findall(resp.text)
+            if urlparse(url).netloc == host
+        ]
+    return list(dict.fromkeys(found + [base + c for c in SITEMAP_CANDIDATES]))
+
+
 async def discover_product_urls(
     client: httpx.AsyncClient, base: str, limit: int = 5000
 ) -> list[str]:
-    """Walk sitemap.xml (following one level of sitemap index) for product pages."""
+    """Walk the sitemap (following one level of index) for product pages."""
     host = urlparse(base).netloc
-    for candidate in SITEMAP_CANDIDATES:
-        resp = await _get(client, base + candidate)
+    for candidate in await sitemap_urls(client, base):
+        resp = await _get(client, candidate)
         if resp is None:
             continue
         locs = [html.unescape(loc) for loc in _LOC.findall(resp.text)]

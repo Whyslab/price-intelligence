@@ -60,6 +60,7 @@ def test_price_parsing_across_locales(raw, expected):
 
 @respx.mock
 async def test_sitemap_walk_finds_product_pages_and_skips_the_rest():
+    respx.get("https://shop.example/robots.txt").mock(return_value=httpx.Response(404))
     respx.get("https://shop.example/sitemap.xml").mock(
         return_value=httpx.Response(
             200,
@@ -96,6 +97,7 @@ async def test_clean_product_paths_are_found_without_any_url_marker():
     Requiring a /product/ marker in the URL threw away whole catalogues; the
     slug is the signal, and the JSON-LD parser is the final judge.
     """
+    respx.get("https://shop.example/robots.txt").mock(return_value=httpx.Response(404))
     respx.get("https://shop.example/sitemap.xml").mock(
         return_value=httpx.Response(
             200,
@@ -120,6 +122,7 @@ async def test_clean_product_paths_are_found_without_any_url_marker():
 @respx.mock
 async def test_the_cursor_advances_so_successive_runs_cover_the_catalogue():
     page = (FIXTURES / "product_page.html").read_text(encoding="utf-8")
+    respx.get("https://shop.example/robots.txt").mock(return_value=httpx.Response(404))
     respx.get("https://shop.example/sitemap.xml").mock(
         return_value=httpx.Response(
             200,
@@ -144,6 +147,7 @@ async def test_the_cursor_advances_so_successive_runs_cover_the_catalogue():
 
 @respx.mock
 async def test_a_store_with_no_markup_reports_an_error():
+    respx.get("https://shop.example/robots.txt").mock(return_value=httpx.Response(404))
     respx.get("https://shop.example/sitemap.xml").mock(
         return_value=httpx.Response(
             200, text="<urlset><url><loc>https://shop.example/product/x.html</loc></url></urlset>"
@@ -223,3 +227,47 @@ class TestDetect:
         row = conn.execute("SELECT platform, status FROM stores").fetchone()
         assert row["platform"] == "blocked"
         assert row["status"] == "skipped"
+
+
+@respx.mock
+async def test_the_sitemap_is_found_where_robots_txt_says_it_is():
+    """Many shops put the sitemap somewhere none of the standard guesses reach.
+
+    Measured on the live site list, five of six stores that reported "no product
+    URLs in sitemap" declared a perfectly good one in robots.txt.
+    """
+    respx.get("https://shop.example/robots.txt").mock(
+        return_value=httpx.Response(
+            200,
+            text="User-agent: *\nDisallow: /cart\n"
+                 "Sitemap: https://shop.example/shop/sitemapindex.xml\n"
+                 "Sitemap: https://evil.example/other.xml\n",
+        )
+    )
+    respx.get("https://shop.example/shop/sitemapindex.xml").mock(
+        return_value=httpx.Response(
+            200,
+            text="<urlset><url><loc>https://shop.example/product/one.html</loc></url></urlset>",
+        )
+    )
+    off_site = respx.get("https://evil.example/other.xml")
+
+    async with httpx.AsyncClient() as client:
+        urls = await jsonld.discover_product_urls(client, "https://shop.example")
+
+    assert urls == ["https://shop.example/product/one.html"]
+    assert not off_site.called, "a sitemap on another host is not ours to crawl"
+
+
+@respx.mock
+async def test_the_standard_paths_are_still_tried_without_robots_txt():
+    respx.get("https://shop.example/robots.txt").mock(return_value=httpx.Response(404))
+    respx.get("https://shop.example/sitemap.xml").mock(
+        return_value=httpx.Response(
+            200,
+            text="<urlset><url><loc>https://shop.example/product/one.html</loc></url></urlset>",
+        )
+    )
+    async with httpx.AsyncClient() as client:
+        urls = await jsonld.discover_product_urls(client, "https://shop.example")
+    assert urls == ["https://shop.example/product/one.html"]

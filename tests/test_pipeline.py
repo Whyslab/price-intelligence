@@ -302,3 +302,54 @@ def test_health_report_names_what_is_wrong(config):
     assert "HTTP 500" in report
     assert "закрыты анти-ботом" in report
     assert "1,234" in report
+
+
+@respx.mock
+async def test_a_shop_with_no_machine_readable_prices_is_not_recrawled(config):
+    """Some shops publish no structured data at all — nativeskatestore.co.uk is one.
+
+    Crawling 200 of its product pages every six hours costs thousands of
+    requests and finds nothing, so a store that has never once yielded a
+    product and said why is set aside.
+    """
+    _mock_rates()
+    _mock_telegram()
+    conn = dbm.connect(config.db_path)
+    dbm.upsert_store(
+        conn, "bare.example", platform="jsonld", status="error",
+        last_error="no schema.org/Product markup found",
+    )
+    # Not mocked: any request at all would fail the test.
+    stats = await pipeline.run(config, conn)
+    assert stats.stores_ok == 0 and stats.stores_failed == 0
+
+
+@respx.mock
+async def test_a_store_that_has_worked_before_is_always_retried(config, shopify_payload):
+    """One bad sweep must not retire a shop that is merely having a bad day."""
+    _mock_rates()
+    _mock_telegram()
+    respx.get("https://shop.example/products.json?limit=250").mock(
+        return_value=httpx.Response(200, json=shopify_payload)
+    )
+    conn = dbm.connect(config.db_path)
+    known_store(conn, status="error", last_error="no product URLs in sitemap")
+
+    stats = await pipeline.run(config, conn)
+    assert stats.stores_ok == 1
+
+
+@respx.mock
+async def test_naming_a_store_explicitly_overrides_the_skip(config, shopify_payload):
+    _mock_rates()
+    _mock_telegram()
+    respx.get("https://shop.example/products.json?limit=250").mock(
+        return_value=httpx.Response(200, json=shopify_payload)
+    )
+    conn = dbm.connect(config.db_path)
+    dbm.upsert_store(
+        conn, "shop.example", platform="shopify", currency="GBP", status="error",
+        last_error="no product URLs in sitemap",
+    )
+    stats = await pipeline.run(config, conn, domains=("shop.example",))
+    assert stats.stores_ok == 1
