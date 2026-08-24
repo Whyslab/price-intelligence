@@ -164,6 +164,7 @@ pi/
 ├── config.py            .env для секретов, filters.toml для правил
 ├── db.py, schema.sql    SQLite: 6 таблиц, версия в PRAGMA user_version
 ├── fx.py                курсы валют (frankfurter.dev, без ключа) + суточный кэш
+├── throttle.py          общий лимит запросов к Shopify (он на IP, а не на магазин)
 ├── sources/
 │   ├── shopify.py       /products.json, пагинация ?page=N, валюта с витрины
 │   ├── jsonld.py        schema.org/Product по карточкам из sitemap
