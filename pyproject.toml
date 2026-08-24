@@ -1,0 +1,52 @@
+[project]
+name = "price-intelligence"
+version = "2.0.0"
+description = "Telegram alerts for real discounts across sneaker and streetwear stores"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.27",
+    "selectolax>=0.3.21",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+bot = ["aiogram>=3.7"]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "respx>=0.21",
+    "ruff>=0.6",
+]
+
+[project.scripts]
+price-intelligence = "pi.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["pi", "pi.sources"]
+
+[tool.setuptools.package-data]
+pi = ["schema.sql"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+filterwarnings = ["error::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
+ignore = [
+    "E501",    # long lines are handled by the formatter
+    # The user-facing strings are Russian and use a typographic minus in the
+    # discount line on purpose, so "ambiguous character" is noise here.
+    "RUF001",
+    "RUF002",
+    "RUF003",
+]

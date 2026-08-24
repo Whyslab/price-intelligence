@@ -1,0 +1,21 @@
+[Unit]
+Description=Price Intelligence — collect prices and alert on real discounts
+Documentation=https://github.com/Whyslab/price-intelligence
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/Projects/price-intelligence
+ExecStart=%h/Projects/price-intelligence/.venv/bin/python -m pi run
+# The sweep touches ~200 sites; give it room without letting it run forever.
+TimeoutStartSec=45min
+Nice=10
+IOSchedulingClass=idle
+
+# It only needs its own directory and the network.
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/Projects/price-intelligence/data
+NoNewPrivileges=yes

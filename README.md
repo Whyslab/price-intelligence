@@ -1,82 +1,205 @@
-# Price Intelligence 🛍️💰
+# Price Intelligence
 
-Система мониторинга цен streetwear/sneakers магазинов с автоматическим нахождением лучших сделок.
+Телеграм-уведомления о настоящих скидках в магазинах кроссовок и стритвира.
+Бот обходит список магазинов, запоминает цены и присылает сообщение с фотографией
+товара, когда цена реально падает.
 
-## Возможности
+<pre>
+🔥 <b>−64%</b> · экономия $61
 
-- 📊 **133 Shopify магазина** с автоматическим импортом
-- 🔄 **SKU-матчинг** между магазинами для сравнения цен
-- 📈 **Deal Score** с учётом истории цен и fake discount detection
-- 💱 **Нормализация валют** (KRW/EUR/GBP → USD)
-- 📱 **Telegram-уведомления** о лучших сделках
-- 🌐 **Web Dashboard** с графиками истории цен
-- ⏰ **Автоматизация** через cron (каждые 6 часов)
+<b>New Balance</b>
+991v2 Made in UK
+Размер: UK 8.5 · SKU 003381070
 
-## Архитектура
+💰 <b>$164</b> (было $301)
+📉 Минимум за всё время наблюдения
+🏪 Footpatrol UK (GB) · в магазине £120.00
+🕐 цена упала 4 ч назад
 
-- **Backend:** Python 3.14, FastAPI, SQLAlchemy
-- **Database:** PostgreSQL 18
-- **Scraping:** Shopify products.json API
-- **Notifications:** Telegram Bot API
-- **Scheduling:** cron
+🔗 https://www.footpatrol.com/products/678510
+</pre>
+
+## Что считается скидкой
+
+Зачёркнутая цена в магазине — это маркетинг, а не факт: многие держат завышенное
+«было» месяцами. Поэтому скидка подтверждается тремя независимыми сигналами:
+
+1. **Зачёркнутая цена магазина.** Единственный сигнал, доступный сразу.
+2. **Цена против медианы собственных наблюдений.** Магазин не может это подделать,
+   поэтому при накопленной истории этот сигнал главнее первого.
+3. **Исторический минимум** — дешевле, чем когда-либо видели.
+
+Плюс защита от «вечной распродажи»: если зачёркнутая цена не менялась больше
+21 дня, это обычная цена с украшением, и оценка режется.
+
+Уведомление уходит, только когда сошлось всё сразу: процент скидки, абсолютная
+экономия в долларах (20% от футболки за $30 — не новость) и наличие на складе.
 
 ## Установка
 
-### Требования
-- Python 3.11+
-- PostgreSQL 14+
-- Arch Linux (или любой другой)
+```bash
+git clone https://github.com/Whyslab/price-intelligence
+cd price-intelligence
 
-### Настройка БД
+python -m venv .venv
+source .venv/bin/activate
+pip install -e .
+
+cp .env.example .env              # вписать токен бота и chat id
+cp filters.toml.example filters.toml   # настроить бренды, размеры, пороги
+```
+
+Токен бота даёт [@BotFather](https://t.me/BotFather), свой `chat_id` — 
+[@userinfobot](https://t.me/userinfobot).
+
+Зависимости: Python 3.11+, `httpx`, `python-dotenv`. База — SQLite, ставить
+ничего не нужно.
+
+## Первый запуск
 
 ```bash
-sudo -u postgres initdb -D /var/lib/postgres/data
-sudo systemctl start postgresql
-sudo -u postgres createuser -s $USER
-sudo -u postgres createdb -O $USER price_intelligence
-Установка зависимостей
-python -m venv webenv
-source webenv/bin/activate
-pip install fastapi "uvicorn[standard]" jinja2 sqlalchemy "psycopg[binary]" python-dotenv requests
-Конфигурация
-cp .env.example .env
-# Отредактируй .env с твоими credentials
-Инициализация схемы
-python -m src.init_db
-Использование
-Импорт товаров
-# Быстрый импорт всех Shopify магазинов
-python -m src.batch_import_fast
+python -m pi sites      # загрузить data/sites.txt в базу
+python -m pi detect     # определить, как читается каждый магазин
+python -m pi run        # собрать цены и прислать скидки
+```
 
-# Полный pipeline (импорт + матчинг + анализ + Telegram)
-python -m src.master_pipeline
-Web Dashboard
-python -m src.web_app
-# Открой http://localhost:8000
-Матчинг товаров
-python -m src.match_products
-Анализ сделок
-python -m src.deal_engine
-Структура проекта
-price-intelligence/
-├── src/
-│   ├── adapters/          # Парсеры магазинов (Shopify, Magento)
-│   ├── web_app.py         # FastAPI dashboard
-│   ├── master_pipeline.py # Автоматический pipeline
-│   ├── match_products.py  # SKU-матчинг
-│   ├── deal_engine.py     # Расчёт Deal Score
-│   ├── pricing.py         # Sanity layer + исторические метрики
-│   └── currency_normalizer.py # Конвертация валют
-├── templates/             # HTML шаблоны dashboard
-├── .env.example           # Шаблон конфигурации
-└── README.md
+`detect` обходит все домены и раскладывает их по способам чтения:
 
-Автоматизация (cron)
-# Каждые 6 часов
-0 */6 * * * cd /path/to/price-intelligence && python -m src.master_pipeline >> /tmp/price_bot.log 2>&1
+| Состояние | Что значит |
+|---|---|
+| `shopify` | `/products.json` отдаёт весь каталог: цена, зачёркнутая цена, наличие, размеры, картинки |
+| `jsonld` | обычный магазин с разметкой schema.org — читается по карточкам через sitemap |
+| `blocked` | сайт отвечает, но не нам: Cloudflare, Kasada, 403, JS-челлендж |
+| `tls` | хост жив, но сертификат не проходит проверку |
+| `dead` | домен не резолвится или молчит |
+| `unknown` | открывается, но структурных данных на витрине нет |
 
-# Автозапуск dashboard при reboot
-@reboot cd /path/to/price-intelligence && python -m src.web_app >> /tmp/web_app.log 2>&1 &
-Лицензия
+На списке из 282 магазинов это даёт **138 Shopify + 58 schema.org = 196 читаемых**.
+Список платформ не хранится руками: магазины переезжают, и захардкоженный список
+устаревает молча.
+
+**Первый обход каждого магазина ничего не присылает.** У нового магазина все
+текущие распродажи выглядят свежими, и уведомления похоронили бы вас под
+скидками полугодовой давности. Первый проход записывает цены как базовую линию,
+а со следующего приходит то, что действительно изменилось.
+
+## Обычная работа
+
+```bash
+python -m pi run                 # полный обход, отправка в Telegram
+python -m pi run --dry-run       # то же, но сообщения печатаются в консоль
+python -m pi run --collect-only  # только собрать цены, ничего не оценивать
+python -m pi run --rescan        # переоценить всё после правки filters.toml
+python -m pi health              # сводка: что собралось, что сломалось
+python -m pi health --send       # прислать сводку в Telegram
+```
+
+Полезные ключи: `--stores a.com,b.com` ограничивает обход, `--limit N` — число
+уведомлений за прогон.
+
+## Автозапуск
+
+```bash
+cp systemd/* ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now price-intelligence.timer
+systemctl --user enable --now price-intelligence-health.timer
+
+systemctl --user list-timers 'price-intelligence*'
+journalctl --user -u price-intelligence -f
+```
+
+Сбор идёт каждые 6 часов, сводка о здоровье — раз в сутки. Перед установкой
+поправьте `WorkingDirectory` в юнитах, если проект лежит не в `~/Projects`.
+
+Чтобы таймеры работали при закрытой сессии: `loginctl enable-linger $USER`.
+
+## Настройка
+
+Всё в `filters.toml` (см. `filters.toml.example`):
+
+```toml
+min_discount_pct = 30.0     # процент ниже опорной цены
+min_saving_usd   = 40.0     # и одновременно экономия в долларах
+min_price_usd    = 25.0
+max_price_usd    = 2000.0
+min_score        = 55       # 0-100
+max_alerts_per_run = 15
+fake_sale_days   = 21       # «было» не менялось столько дней → вечная распродажа
+
+brands_allow = ["nike", "jordan", "new balance"]   # пусто = любые бренды
+brands_deny  = []
+sizes        = ["EU44", "US10", "US10.5"]          # пусто = любые размеры
+```
+
+После правки — `python -m pi run --rescan`, иначе изменения подействуют только
+на товары, у которых цена сдвинется.
+
+Размеры нормализуются приблизительно: `US 10.5` → `US10.5`, `EUR 44` → `EU44`,
+голая `44` читается как EU44, голая `10` — как US10. Это верно чаще всего, но не
+всегда, поэтому лучше перечислять несколько написаний своего размера.
+
+## Список магазинов
+
+`data/sites.txt` — по домену на строку, `#` начинает комментарий. Домены,
+которые не отвечали на момент сборки списка, лежат внизу закомментированными.
+После правки: `python -m pi sites && python -m pi detect`.
+
+## Устройство
+
+```
+pi/
+├── config.py            .env для секретов, filters.toml для правил
+├── db.py, schema.sql    SQLite: 6 таблиц, версия в PRAGMA user_version
+├── fx.py                курсы валют (frankfurter.dev, без ключа) + суточный кэш
+├── sources/
+│   ├── shopify.py       /products.json, пагинация ?page=N, валюта с витрины
+│   ├── jsonld.py        schema.org/Product по карточкам из sitemap
+│   └── detect.py        определение платформы
+├── deals.py             три сигнала, оценка, дедупликация
+├── notify.py            sendPhoto с подписью, откат на sendMessage
+├── pipeline.py          собрать → оценить → отправить
+└── cli.py
+```
+
+Заметки о поведении, которое легко нарушить при правках:
+
+- **Валюта берётся с витрины**, а не угадывается по домену: `Shopify.currency.active`
+  из HTML, затем страна из `/meta.json`. Домен `.com` в Берлине торгует в евро.
+  Неизвестная валюта → цена отбрасывается, а не считается долларами.
+- **Публичный `/products.json` листается через `?page=N`** и не отдаёт заголовок
+  `Link` (в отличие от Admin API). Пагинация по `Link` молча обрезает каждый
+  магазин на 250 товарах.
+- **Точка истории пишется только при изменении** цены, зачёркнутой цены или
+  наличия — иначе шестичасовой обход раздувал бы базу впустую.
+- **Дедупликация по товару, а не по варианту.** Худи со скидкой в шести размерах
+  — одна новость. Повторное уведомление только после падения ещё на 5%.
+- **Алерт записывается до отправки** и удаляется, если отправка не удалась:
+  падение посреди отправки не должно приводить к повтору.
+
+## Разработка
+
+```bash
+pip install -e ".[dev]"
+pytest -q          # 88 тестов, сеть замокана, ~1 с
+ruff check .
+```
+
+Тесты проверяют поведение, а не текст исходников. Фикстура
+`tests/fixtures/shopify_products.json` снята с реального магазина и специально
+содержит неудобные случаи: вариант без зачёркнутой цены, вариант с зачёркнутой
+ценой равной обычной, вариант с нулевой ценой и товар вообще без картинки.
+
+## Ограничения
+
+- Сайты за Kasada и Cloudflare (Foot Locker, JD, Snipes, ~25 доменов) не читаются.
+  Они помечаются `blocked` и попадают в сводку — вместо того чтобы молча
+  возвращать ноль товаров.
+- У магазинов на `jsonld` нет зачёркнутой цены: в schema.org её просто нет.
+  Скидки там находятся по накопленной истории, то есть спустя несколько обходов.
+- Каталог `jsonld`-магазина обходится по частям (по умолчанию 200 карточек за
+  прогон, курсор двигается), поэтому большой магазин покрывается за несколько дней.
+
+## Лицензия
+
 MIT
-# price-intelligence

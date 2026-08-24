@@ -1,0 +1,205 @@
+"""Telegram delivery.
+
+Deals go out as sendPhoto with an HTML caption, because a sneaker alert without
+a picture of the sneaker is close to useless. Telegram caps a caption at 1024
+characters (a plain message at 4096), so the caption is built to fit and trimmed
+at a line boundary rather than mid-word. If a product has no image, or Telegram
+refuses to fetch the one it has, the same text is sent as a normal message.
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+from html import escape
+
+import httpx
+
+from .deals import Deal
+
+log = logging.getLogger(__name__)
+
+API = "https://api.telegram.org/bot{token}/{method}"
+CAPTION_LIMIT = 1024
+MESSAGE_LIMIT = 4096
+MAX_RETRIES = 3
+
+_CURRENCY_SYMBOL = {"USD": "$", "EUR": "€", "GBP": "£", "JPY": "¥", "KRW": "₩", "PLN": "zł"}
+
+
+def _money(amount: float, currency: str = "USD") -> str:
+    symbol = _CURRENCY_SYMBOL.get(currency.upper(), "")
+    body = f"{amount:,.0f}" if amount >= 100 else f"{amount:,.2f}"
+    return f"{symbol}{body}" if symbol and currency != "PLN" else f"{body} {currency}".strip()
+
+
+def _age(hours: float | None) -> str | None:
+    if hours is None:
+        return None
+    if hours < 1:
+        return "цена упала только что"
+    if hours < 24:
+        return f"цена упала {hours:.0f} ч назад"
+    days = hours / 24
+    if days < 14:
+        return f"цена держится {days:.0f} дн"
+    return f"цена держится {days / 7:.0f} нед"
+
+
+def _trim(text: str, limit: int) -> str:
+    """Cut to the limit on a line boundary so a message never ends mid-sentence."""
+    if len(text) <= limit:
+        return text
+    kept: list[str] = []
+    used = 0
+    for line in text.split("\n"):
+        cost = len(line) + (1 if kept else 0)  # the separator, only between lines
+        if used + cost > limit:
+            break
+        kept.append(line)
+        used += cost
+    return "\n".join(kept) if kept else text[: limit - 1] + "…"
+
+
+def format_caption(
+    deal: Deal,
+    *,
+    title: str,
+    url: str,
+    brand: str | None = None,
+    size: str | None = None,
+    sku: str | None = None,
+    store: str | None = None,
+    country: str | None = None,
+    native_price: float | None = None,
+    currency: str = "USD",
+    limit: int = CAPTION_LIMIT,
+) -> str:
+    """Build the HTML body of a deal notification."""
+    heat = "🔥" if deal.score >= 80 else ("✅" if deal.score >= 65 else "👍")
+    lines = [
+        f"{heat} <b>−{deal.discount_pct:.0f}%</b> · экономия {_money(deal.saving_usd)}",
+        "",
+    ]
+    if brand:
+        lines.append(f"<b>{escape(brand)}</b>")
+    lines.append(escape(title))
+
+    details = []
+    if size:
+        details.append(f"Размер: {escape(size)}")
+    if sku:
+        details.append(f"SKU <code>{escape(sku)}</code>")
+    if details:
+        lines.append(" · ".join(details))
+    lines.append("")
+
+    was = "было" if deal.reference_source == "tag" else "медиана наблюдений"
+    lines.append(
+        f"💰 <b>{_money(deal.price_usd)}</b> ({was} {_money(deal.reference_usd)})"
+    )
+    if deal.all_time_low:
+        lines.append("📉 Минимум за всё время наблюдения")
+    if deal.fake_sale:
+        lines.append("⚠️ Зачёркнутая цена не менялась неделями — «вечная распродажа»")
+
+    where = escape(store) if store else None
+    if where and country:
+        where = f"{where} ({escape(country)})"
+    if where:
+        native = (
+            f" · в магазине {_money(native_price, currency)}"
+            if native_price is not None and currency.upper() != "USD"
+            else ""
+        )
+        lines.append(f"🏪 {where}{native}")
+
+    age = _age(deal.dropped_hours_ago)
+    if age:
+        lines.append(f"🕐 {age}")
+
+    lines.append("")
+    lines.append(f"🔗 {escape(url)}")
+    return _trim("\n".join(lines), limit)
+
+
+class Telegram:
+    """Thin Telegram client. Every send returns a bool — sent or not sent."""
+
+    def __init__(self, token: str, chat_id: str, client: httpx.AsyncClient | None = None):
+        self.token = token
+        self.chat_id = chat_id
+        self._client = client
+        self._owned = client is None
+
+    async def __aenter__(self) -> Telegram:
+        if self._client is None:
+            self._client = httpx.AsyncClient(timeout=30)
+        return self
+
+    async def __aexit__(self, *exc) -> None:
+        if self._owned and self._client is not None:
+            await self._client.aclose()
+            self._client = None
+
+    async def _call(self, method: str, payload: dict) -> tuple[bool, str]:
+        """POST to the Bot API, obeying retry_after. Returns (ok, description)."""
+        assert self._client is not None, "use Telegram as an async context manager"
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                resp = await self._client.post(
+                    API.format(token=self.token, method=method), json=payload
+                )
+            except httpx.HTTPError as exc:
+                if attempt == MAX_RETRIES:
+                    return False, f"network error: {exc}"
+                await asyncio.sleep(2**attempt)
+                continue
+
+            try:
+                body = resp.json()
+            except ValueError:
+                return False, f"HTTP {resp.status_code}, non-JSON reply"
+
+            if body.get("ok"):
+                return True, "ok"
+
+            description = str(body.get("description", "unknown error"))
+            if resp.status_code == 429 and attempt < MAX_RETRIES:
+                wait = float(body.get("parameters", {}).get("retry_after", 2**attempt))
+                log.info("telegram rate limit, waiting %.0fs", wait)
+                await asyncio.sleep(min(wait, 60))
+                continue
+            return False, description
+        return False, "gave up after retries"
+
+    async def send_text(self, text: str, disable_preview: bool = True) -> bool:
+        ok, why = await self._call(
+            "sendMessage",
+            {
+                "chat_id": self.chat_id,
+                "text": _trim(text, MESSAGE_LIMIT),
+                "parse_mode": "HTML",
+                "disable_web_page_preview": disable_preview,
+            },
+        )
+        if not ok:
+            log.error("sendMessage failed: %s", why)
+        return ok
+
+    async def send_deal(self, caption: str, image_url: str | None) -> bool:
+        """Photo with caption, falling back to text if there is no usable image."""
+        if image_url:
+            ok, why = await self._call(
+                "sendPhoto",
+                {
+                    "chat_id": self.chat_id,
+                    "photo": image_url,
+                    "caption": _trim(caption, CAPTION_LIMIT),
+                    "parse_mode": "HTML",
+                },
+            )
+            if ok:
+                return True
+            # Telegram could not fetch the image — the deal still deserves to be sent.
+            log.warning("sendPhoto failed (%s), falling back to text", why)
+        return await self.send_text(caption, disable_preview=False)

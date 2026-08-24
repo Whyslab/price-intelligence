@@ -1,0 +1,11 @@
+[Unit]
+Description=Send the Price Intelligence health summary once a day
+
+[Timer]
+OnCalendar=*-*-* 09:00:00
+RandomizedDelaySec=15min
+Persistent=yes
+Unit=price-intelligence-health.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,303 @@
+"""End-to-end: a catalogue goes in, a Telegram photo comes out."""
+from __future__ import annotations
+
+import json
+
+import httpx
+import pytest
+import respx
+
+from pi import db as dbm
+from pi import pipeline
+from pi.config import Config, Filters
+
+from .conftest import ts
+
+TOKEN, CHAT = "123:AA", "42"
+
+
+@pytest.fixture
+def config(tmp_path) -> Config:
+    return Config(
+        db_path=tmp_path / "pi.db",
+        sites_file=tmp_path / "sites.txt",
+        bot_token=TOKEN,
+        chat_id=CHAT,
+        concurrency=4,
+        log_level="WARNING",
+        filters=Filters(min_discount_pct=30.0, min_saving_usd=40.0, min_score=50),
+    )
+
+
+def known_store(conn, domain="shop.example", **fields):
+    """A store already collected once, so this run is not its baseline pass."""
+    defaults = {
+        "platform": "shopify", "currency": "GBP", "name": "Shop",
+        "last_ok": ts(1), "status": "ok",
+    }
+    return dbm.upsert_store(conn, domain, **{**defaults, **fields})
+
+
+def _mock_rates():
+    respx.get("https://api.frankfurter.dev/v1/latest").mock(
+        return_value=httpx.Response(200, json={"base": "USD", "rates": {"GBP": 0.73, "EUR": 0.86}})
+    )
+
+
+def _mock_telegram():
+    photo = respx.post(f"https://api.telegram.org/bot{TOKEN}/sendPhoto").mock(
+        return_value=httpx.Response(200, json={"ok": True})
+    )
+    text = respx.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage").mock(
+        return_value=httpx.Response(200, json={"ok": True})
+    )
+    return photo, text
+
+
+@pytest.fixture(autouse=True)
+def no_pacing(monkeypatch):
+    """Skip the polite inter-message pause so the suite stays fast."""
+    async def instant(_seconds):
+        return None
+
+    monkeypatch.setattr(pipeline.asyncio, "sleep", instant)
+
+
+@respx.mock
+async def test_a_discounted_shopify_catalogue_produces_a_photo_alert(config, shopify_payload):
+    _mock_rates()
+    photo, _ = _mock_telegram()
+    respx.get("https://shop.example/products.json?limit=250").mock(
+        return_value=httpx.Response(200, json=shopify_payload)
+    )
+
+    conn = dbm.connect(config.db_path)
+    known_store(conn)
+
+    stats = await pipeline.run(config, conn)
+
+    assert stats.stores_ok == 1
+    assert stats.products_seen == len(shopify_payload["products"])
+    assert stats.points_written > 0
+    assert stats.alerts_sent > 0
+    assert photo.called, "a deal with an image must go out as a photo"
+
+    body = json.loads(photo.calls[0].request.content)
+    assert body["photo"].startswith("http")
+    assert "−" in body["caption"] and "%" in body["caption"]
+    assert body["parse_mode"] == "HTML"
+
+
+@respx.mock
+async def test_a_sold_out_discount_is_never_announced(config, shopify_payload):
+    """The fixture holds a whole product discounted 29% but out of stock in every size."""
+    _mock_rates()
+    photo, _ = _mock_telegram()
+    respx.get("https://shop.example/products.json?limit=250").mock(
+        return_value=httpx.Response(200, json=shopify_payload)
+    )
+
+    conn = dbm.connect(config.db_path)
+    known_store(conn)
+    await pipeline.run(config, conn)
+
+    announced = {
+        json.loads(call.request.content)["caption"] for call in photo.calls
+    }
+    assert announced, "the in-stock deals still go out"
+    assert not any("Vomero" in caption for caption in announced)
+
+
+@respx.mock
+async def test_the_first_pass_over_a_new_store_is_a_baseline_not_news(config, shopify_payload):
+    """Every standing sale looks new the first time a shop is read.
+
+    Announcing them all would bury the user under months-old discounts, so the
+    first collection records prices silently and the next run reports movement.
+    """
+    _mock_rates()
+    photo, text = _mock_telegram()
+    respx.get("https://shop.example/products.json?limit=250").mock(
+        return_value=httpx.Response(200, json=shopify_payload)
+    )
+
+    conn = dbm.connect(config.db_path)
+    dbm.upsert_store(conn, "shop.example", platform="shopify", currency="GBP")  # never collected
+
+    first = await pipeline.run(config, conn)
+    assert first.points_written > 0, "prices are still recorded"
+    assert first.alerts_sent == 0, "but nothing is announced"
+    assert not photo.called and not text.called
+
+    # Now the shop cuts a price further; that is real news.
+    cheaper = json.loads(json.dumps(shopify_payload))
+    for product in cheaper["products"]:
+        for variant in product["variants"]:
+            variant["available"] = True
+            variant["price"] = f"{float(variant['price']) / 2:.2f}"
+    respx.get("https://shop.example/products.json?limit=250").mock(
+        return_value=httpx.Response(200, json=cheaper)
+    )
+
+    second = await pipeline.run(config, conn)
+    assert second.alerts_sent > 0
+    assert photo.called or text.called
+
+
+@respx.mock
+async def test_prices_are_converted_from_the_shops_currency(config, shopify_payload):
+    _mock_rates()
+    _mock_telegram()
+    respx.get("https://shop.example/products.json?limit=250").mock(
+        return_value=httpx.Response(200, json=shopify_payload)
+    )
+
+    conn = dbm.connect(config.db_path)
+    known_store(conn)
+    await pipeline.run(config, conn, collect_only=True)
+
+    row = conn.execute(
+        "SELECT price_usd, price_native, currency, fx_rate FROM price_points LIMIT 1"
+    ).fetchone()
+    assert row["currency"] == "GBP"
+    assert row["fx_rate"] == 0.73
+    assert row["price_usd"] == pytest.approx(row["price_native"] / 0.73, abs=0.02)
+
+
+@respx.mock
+async def test_the_same_deal_is_not_sent_twice(config, shopify_payload):
+    _mock_rates()
+    photo, _ = _mock_telegram()
+    respx.get("https://shop.example/products.json?limit=250").mock(
+        return_value=httpx.Response(200, json=shopify_payload)
+    )
+
+    conn = dbm.connect(config.db_path)
+    known_store(conn)
+
+    first = await pipeline.run(config, conn)
+    assert first.alerts_sent > 0
+    sent_first_time = photo.call_count
+
+    second = await pipeline.run(config, conn)
+    assert second.alerts_sent == 0
+    assert photo.call_count == sent_first_time
+
+
+@respx.mock
+async def test_one_product_discounted_in_many_sizes_is_announced_once(config, shopify_payload):
+    """Eight sizes of the same hoodie on sale is one piece of news, not eight."""
+    _mock_rates()
+    photo, text = _mock_telegram()
+
+    product = json.loads(json.dumps(shopify_payload["products"][2]))  # the ASICS
+    for index, variant in enumerate(product["variants"]):
+        variant["id"] = 900_000 + index
+        variant["available"] = True
+        variant["option1"] = f"{4 + index}"
+    respx.get("https://shop.example/products.json?limit=250").mock(
+        return_value=httpx.Response(200, json={"products": [product]})
+    )
+
+    conn = dbm.connect(config.db_path)
+    known_store(conn)
+    stats = await pipeline.run(config, conn)
+
+    assert conn.execute("SELECT COUNT(*) FROM variants").fetchone()[0] == len(product["variants"])
+    assert stats.alerts_sent == 1
+    assert photo.call_count + text.call_count == 1
+
+
+@respx.mock
+async def test_a_failed_send_is_not_recorded_as_sent(config, shopify_payload):
+    """A rejected message must be retried next run, not silently swallowed."""
+    _mock_rates()
+    respx.post(f"https://api.telegram.org/bot{TOKEN}/sendPhoto").mock(
+        return_value=httpx.Response(400, json={"ok": False, "description": "bad image"})
+    )
+    respx.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage").mock(
+        return_value=httpx.Response(403, json={"ok": False, "description": "blocked"})
+    )
+    respx.get("https://shop.example/products.json?limit=250").mock(
+        return_value=httpx.Response(200, json=shopify_payload)
+    )
+
+    conn = dbm.connect(config.db_path)
+    known_store(conn)
+    stats = await pipeline.run(config, conn)
+
+    assert stats.alerts_sent == 0
+    assert conn.execute("SELECT COUNT(*) FROM alerts").fetchone()[0] == 0
+
+
+@respx.mock
+async def test_a_store_failure_is_reported_not_hidden(config):
+    _mock_rates()
+    _mock_telegram()
+    respx.get("https://broken.example/products.json?limit=250").mock(
+        return_value=httpx.Response(500)
+    )
+
+    conn = dbm.connect(config.db_path)
+    known_store(conn, "broken.example", currency="USD")
+    stats = await pipeline.run(config, conn)
+
+    assert stats.stores_ok == 0
+    assert stats.stores_failed == 1
+    assert stats.failures[0][0] == "broken.example"
+    assert conn.execute("SELECT status FROM stores").fetchone()[0] == "error"
+
+
+@respx.mock
+async def test_dry_run_sends_nothing(config, shopify_payload, capsys):
+    _mock_rates()
+    photo, text = _mock_telegram()
+    respx.get("https://shop.example/products.json?limit=250").mock(
+        return_value=httpx.Response(200, json=shopify_payload)
+    )
+
+    conn = dbm.connect(config.db_path)
+    known_store(conn)
+    await pipeline.run(config, conn, dry_run=True)
+
+    assert not photo.called and not text.called
+    assert conn.execute("SELECT COUNT(*) FROM alerts").fetchone()[0] == 0
+    assert "%" in capsys.readouterr().out
+
+
+@respx.mock
+async def test_brand_filter_keeps_unwanted_deals_quiet(config, shopify_payload):
+    _mock_rates()
+    photo, text = _mock_telegram()
+    respx.get("https://shop.example/products.json?limit=250").mock(
+        return_value=httpx.Response(200, json=shopify_payload)
+    )
+
+    config = Config(**{**config.__dict__, "filters": Filters(brands_allow=("no-such-brand",))})
+    conn = dbm.connect(config.db_path)
+    known_store(conn)
+    stats = await pipeline.run(config, conn)
+
+    assert stats.points_written > 0, "collection still happens"
+    assert stats.alerts_sent == 0, "but nothing matches the brand filter"
+    assert not photo.called and not text.called
+
+
+def test_health_report_names_what_is_wrong(config):
+    conn = dbm.connect(config.db_path)
+    dbm.upsert_store(conn, "good.example", platform="shopify", status="ok")
+    dbm.upsert_store(conn, "walled.example", platform="blocked")
+    dbm.upsert_store(
+        conn, "broken.example", platform="shopify", status="error", last_error="HTTP 500"
+    )
+    conn.execute(
+        "INSERT INTO runs (started_at, finished_at, stores_ok, stores_failed, products_seen)"
+        " VALUES (?, ?, 2, 1, 1234)",
+        (ts(0), ts(0)),
+    )
+
+    report = pipeline.health_report(conn)
+    assert "broken.example" in report
+    assert "HTTP 500" in report
+    assert "закрыты анти-ботом" in report
+    assert "1,234" in report

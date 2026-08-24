@@ -1,48 +1,17 @@
-# Python
 __pycache__/
 *.py[cod]
-*$py.class
-*.so
-webenv/
-venv/
-env/
+.venv/
+*.egg-info/
 
-# Credentials (НИКОГДА не коммитить)
+# Secrets
 .env
-exchange_rates.json
 
-# PostgreSQL
-*.sql.bak
+# Local state
+data/*.db
+data/*.db-wal
+data/*.db-shm
+data/fx_cache.json
+filters.toml
 
-# Logs
-*.log
-/tmp/
-
-# OS
-.DS_Store
-Thumbs.db
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-
-# Project data (слишком большие для GitHub)
-platforms_scan.json
-batch_import_results.json
-batch_import_fast_results.json
-magento_api_check.json
-magento_import_results.json
-shopify_sites.json
-
-# DB dumps
-*.dump
-*.backup
-
-# Database backups
-*.sql
-*.sql.gz
-*.dump
-*.backup
+.pytest_cache/
+.ruff_cache/
