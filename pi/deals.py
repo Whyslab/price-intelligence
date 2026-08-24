@@ -91,7 +91,14 @@ def _is_fake_sale(history: list[sqlite3.Row], fake_sale_days: int) -> bool:
 
 
 def _dropped_hours_ago(history: list[sqlite3.Row], price_usd: float) -> float | None:
-    """How long the current price has been in effect, in hours."""
+    """How long the current price has been in effect, in hours.
+
+    None when there is only one observation: first sight of a product tells us
+    when we looked, not when the shop changed anything, and reporting that as
+    "the price just dropped" would be a claim we cannot support.
+    """
+    if len(history) < 2:
+        return None
     started = None
     for row in reversed(history):
         if abs(row["price_usd"] - price_usd) > 0.005:

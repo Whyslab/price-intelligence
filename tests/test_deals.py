@@ -167,3 +167,10 @@ class TestDeduplication:
 
         real_drop = replace(first, price_usd=99.0)   # a genuine further cut
         assert deals.already_alerted(conn, real_drop) is False
+
+
+def test_first_sighting_makes_no_claim_about_when_the_price_dropped(filters):
+    """One observation says when we looked, not when the shop moved the price."""
+    deal = deals.evaluate(1, 1, 120.0, 300.0, True, make_history([(120.0, 300.0, 0)]), filters)
+    assert deal is not None
+    assert deal.dropped_hours_ago is None

@@ -90,6 +90,34 @@ async def test_sitemap_walk_finds_product_pages_and_skips_the_rest():
 
 
 @respx.mock
+async def test_clean_product_paths_are_found_without_any_url_marker():
+    """Shops that serve products from /mens/footwear/nike-air-max-90/ still work.
+
+    Requiring a /product/ marker in the URL threw away whole catalogues; the
+    slug is the signal, and the JSON-LD parser is the final judge.
+    """
+    respx.get("https://shop.example/sitemap.xml").mock(
+        return_value=httpx.Response(
+            200,
+            text="""<urlset>
+              <url><loc>https://shop.example/</loc></url>
+              <url><loc>https://shop.example/mens/footwear/</loc></url>
+              <url><loc>https://shop.example/mens/footwear/nike-air-max-90/</loc></url>
+              <url><loc>https://shop.example/mens/footwear/adidas-samba-og/</loc></url>
+              <url><loc>https://shop.example/about-us/</loc></url>
+            </urlset>""",
+        )
+    )
+    async with httpx.AsyncClient() as client:
+        urls = await jsonld.discover_product_urls(client, "https://shop.example")
+
+    assert urls == [
+        "https://shop.example/mens/footwear/nike-air-max-90/",
+        "https://shop.example/mens/footwear/adidas-samba-og/",
+    ]  # homepage, section root and the about page all dropped
+
+
+@respx.mock
 async def test_the_cursor_advances_so_successive_runs_cover_the_catalogue():
     page = (FIXTURES / "product_page.html").read_text(encoding="utf-8")
     respx.get("https://shop.example/sitemap.xml").mock(

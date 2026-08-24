@@ -38,11 +38,15 @@ _LD_BLOCK = re.compile(
     r"""<script[^>]*type\s*=\s*["']application/ld\+json["'][^>]*>(.*?)</script>""",
     re.IGNORECASE | re.DOTALL,
 )
+# Positive hints are a preference, not a requirement: plenty of shops serve
+# products from clean paths like /mens/footwear/nike-air-max-90/ with no marker
+# at all, and demanding a marker threw those catalogues away wholesale.
 _PRODUCT_HINTS = ("/product", "/products/", "/p/", "/shop/", "/item", ".html")
 _NON_PRODUCT_HINTS = (
     "/blog", "/news", "/pages/", "/collections/", "/category", "/categories",
     "/brand", "/manufacturer", "/customer", "/account", "/cart", "/checkout",
-    "/search", "/sitemap", "/policies", "/pictures", "/picutres",
+    "/search", "/sitemap", "/policies", "/pictures", "/picutres", "/about",
+    "/contact", "/terms", "/privacy", "/faq", "/login", "/register", "/wishlist",
 )
 
 AVAILABLE = {"instock", "in_stock", "limitedavailability", "onlineonly", "presale", "backorder"}
@@ -178,6 +182,19 @@ def parse_product(page: str, url: str) -> tuple[ScrapedProduct, str] | None:
     return None
 
 
+def _looks_like_a_page(url: str) -> bool:
+    """Drop the homepage and bare section roots; keep anything with a real slug.
+
+    A product slug almost always carries a hyphen ("nike-air-max-90"), while
+    section roots ("/mens/footwear/") do not.
+    """
+    path = urlparse(url).path.strip("/")
+    if not path:
+        return False
+    last = path.rsplit("/", 1)[-1]
+    return "-" in last or "_" in last or len(last) > 24
+
+
 async def _get(client: httpx.AsyncClient, url: str) -> httpx.Response | None:
     try:
         resp = await client.get(url, follow_redirects=True)
@@ -211,15 +228,23 @@ async def discover_product_urls(
             if child_resp is not None:
                 pages.extend(html.unescape(loc) for loc in _LOC.findall(child_resp.text))
 
-        urls = [
+        candidates = [
             u for u in dict.fromkeys(pages)
             if urlparse(u).netloc == host
             and not u.lower().endswith((".xml", ".xml.gz", ".jpg", ".png", ".webp"))
             and not any(bad in u.lower() for bad in _NON_PRODUCT_HINTS)
-            and any(hint in u.lower() for hint in _PRODUCT_HINTS)
         ]
-        if urls:
-            return urls[:limit]
+        # A URL that announces itself as a product is taken at its word.
+        marked = [u for u in candidates if any(h in u.lower() for h in _PRODUCT_HINTS)]
+        if marked:
+            return marked[:limit]
+        # Otherwise fall back to every URL with a real slug and let the JSON-LD
+        # parser be the judge. Crawling is budgeted per run anyway, so a few
+        # pages that turn out not to be products cost little — while demanding
+        # a marker discards whole catalogues that use clean paths.
+        plausible = [u for u in candidates if _looks_like_a_page(u)]
+        if plausible:
+            return plausible[:limit]
     return []
 
 
