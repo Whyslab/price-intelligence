@@ -8,22 +8,26 @@ and no anti-bot to work around.
 The one thing /products.json does NOT carry is the shop's currency, so it is
 read from the storefront instead of guessed from the domain suffix: a .eu or
 .com domain says nothing about whether prices are in EUR, GBP or USD.
+
+Every request here goes through a single shared RateLimiter, because Shopify
+counts requests against our IP across the whole platform rather than per shop.
+See pi.throttle.
 """
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import re
 
 import httpx
 
+from ..throttle import NullLimiter, RateLimiter
 from .base import FetchResult, ScrapedProduct, ScrapedVariant
 
 log = logging.getLogger(__name__)
 
 PAGE_SIZE = 250
-MAX_PAGES = 120   # 30,000 products; larger catalogues are logged, not silently cut
+MAX_PAGES = 60    # 15,000 products; larger catalogues are logged, not silently cut
 MAX_RETRIES = 3
 
 _CURRENCY_JS = re.compile(
@@ -49,9 +53,13 @@ _COUNTRY_CURRENCY = {
 }
 
 
-async def detect_currency(client: httpx.AsyncClient, base: str) -> str | None:
+async def detect_currency(
+    client: httpx.AsyncClient, base: str, limiter: RateLimiter | NullLimiter | None = None
+) -> str | None:
     """Read the shop's real currency from the storefront, then /meta.json."""
+    limiter = limiter or NullLimiter()
     try:
+        await limiter.acquire()
         resp = await client.get(base, follow_redirects=True)
         if resp.status_code == 200:
             html = resp.text
@@ -63,6 +71,7 @@ async def detect_currency(client: httpx.AsyncClient, base: str) -> str | None:
         log.debug("%s: storefront unreadable for currency (%s)", base, exc)
 
     try:
+        await limiter.acquire()
         resp = await client.get(f"{base}/meta.json")
         if resp.status_code == 200:
             country = (resp.json() or {}).get("country")
@@ -73,9 +82,12 @@ async def detect_currency(client: httpx.AsyncClient, base: str) -> str | None:
     return None
 
 
-async def _get_page(client: httpx.AsyncClient, url: str) -> httpx.Response | None:
-    """GET with honest 429 handling: obey Retry-After, give up after MAX_RETRIES."""
+async def _get_page(
+    client: httpx.AsyncClient, url: str, limiter: RateLimiter | NullLimiter
+) -> httpx.Response | None:
+    """GET through the shared limiter, backing the whole sweep off on a 429."""
     for attempt in range(1, MAX_RETRIES + 1):
+        await limiter.acquire()
         try:
             resp = await client.get(url)
         except httpx.HTTPError as exc:
@@ -86,18 +98,18 @@ async def _get_page(client: httpx.AsyncClient, url: str) -> httpx.Response | Non
         if resp.status_code in (429, 503):
             if attempt == MAX_RETRIES:
                 return None
-            delay = _retry_after(resp, fallback=2**attempt)
-            log.debug("%s: %s, waiting %ss", url, resp.status_code, delay)
-            await asyncio.sleep(delay)
+            # Shopify sends no Retry-After and stays angry for minutes, so the
+            # pause is ours to choose and it applies to every store at once.
+            await limiter.penalise(_retry_after(resp, fallback=None))
             continue
         return None
     return None
 
 
-def _retry_after(resp: httpx.Response, fallback: float) -> float:
+def _retry_after(resp: httpx.Response, fallback: float | None) -> float | None:
     raw = resp.headers.get("Retry-After")
     try:
-        return min(float(raw), 60.0) if raw else fallback
+        return min(float(raw), 120.0) if raw else fallback
     except ValueError:
         return fallback
 
@@ -166,12 +178,17 @@ def parse_products(payload: dict, base: str) -> list[ScrapedProduct]:
 
 
 async def fetch(
-    client: httpx.AsyncClient, domain: str, currency: str | None = None, max_pages: int = MAX_PAGES
+    client: httpx.AsyncClient,
+    domain: str,
+    currency: str | None = None,
+    max_pages: int = MAX_PAGES,
+    limiter: RateLimiter | NullLimiter | None = None,
 ) -> FetchResult:
-    """Pull a whole Shopify catalogue, following the Link header for pagination."""
+    """Pull a whole Shopify catalogue, paginating with ?page=N."""
+    limiter = limiter or NullLimiter()
     base = f"https://{domain}".rstrip("/")
     if not currency:
-        currency = await detect_currency(client, base)
+        currency = await detect_currency(client, base, limiter)
         if not currency:
             return FetchResult(domain=domain, error="could not determine shop currency")
 
@@ -182,7 +199,7 @@ async def fetch(
     exhausted = False
 
     for _ in range(max_pages):
-        resp = await _get_page(client, url)
+        resp = await _get_page(client, url, limiter)
         if resp is None:
             if not products:
                 return FetchResult(domain=domain, currency=currency, error="products.json unreachable")

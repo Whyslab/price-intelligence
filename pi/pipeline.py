@@ -15,6 +15,7 @@ from .fx import Rates, load_rates
 from .notify import Telegram, format_caption
 from .sources import jsonld, shopify
 from .sources.base import FetchResult
+from .throttle import RateLimiter
 
 log = logging.getLogger(__name__)
 
@@ -45,12 +46,14 @@ def make_client(timeout: float = 30.0) -> httpx.AsyncClient:
 
 
 async def collect_store(
-    client: httpx.AsyncClient, store: sqlite3.Row, jsonld_budget: int
+    client: httpx.AsyncClient, store: sqlite3.Row, jsonld_budget: int, limiter: RateLimiter
 ) -> tuple[FetchResult, int | None]:
     """Fetch one store with the adapter its platform calls for."""
     platform = store["platform"]
     if platform == "shopify":
-        return await shopify.fetch(client, store["domain"], store["currency"]), None
+        return await shopify.fetch(
+            client, store["domain"], store["currency"], limiter=limiter
+        ), None
     if platform == "jsonld":
         result, cursor = await jsonld.fetch(
             client, store["domain"], store["currency"],
@@ -211,9 +214,13 @@ async def run(
 
     rates = load_rates(config.db_path.parent / "fx_cache.json")
     log.info("exchange rates: %s (%s)", rates.source, rates.fetched_at.date())
-    log.info("sweeping %d stores with concurrency %d", len(stores), config.concurrency)
+    log.info(
+        "sweeping %d stores, concurrency %d, shared Shopify budget %.1f req/s",
+        len(stores), config.concurrency, config.shopify_rate,
+    )
 
     semaphore = asyncio.Semaphore(config.concurrency)
+    limiter = RateLimiter(rate=config.shopify_rate)
     changed: list[int] = []
     # A store being read for the first time has every standing sale look brand
     # new. That first pass is a baseline, not news: record the prices, announce
@@ -227,7 +234,7 @@ async def run(
 
         async def one(store: sqlite3.Row):
             async with semaphore:
-                return store, await collect_store(client, store, jsonld_budget)
+                return store, await collect_store(client, store, jsonld_budget, limiter)
 
         for coro in asyncio.as_completed([one(s) for s in stores]):
             store, (result, cursor) = await coro
@@ -302,6 +309,11 @@ async def run(
                     )
                 await asyncio.sleep(1.0)  # Telegram allows ~30 messages/second; be calm
 
+    if limiter.penalties:
+        log.warning(
+            "hit the Shopify rate limit %d time(s); lower PI_SHOPIFY_RATE if this persists",
+            limiter.penalties,
+        )
     _finish_run(conn, run_id, stats)
     return stats
 

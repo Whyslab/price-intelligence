@@ -189,3 +189,50 @@ def test_size_normalisation(raw, expected):
     from pi.sources.base import normalize_size
 
     assert normalize_size(raw) == expected
+
+
+@respx.mock
+async def test_a_429_backs_off_the_whole_shared_budget(shopify_payload):
+    """One store's 429 must slow every store down — the limit is per IP.
+
+    Shopify sends no Retry-After and stays throttled for minutes, so retrying
+    the one request that failed while fifteen other stores keep hammering is
+    exactly how a sweep loses most of its catalogue.
+    """
+    from pi.throttle import RateLimiter
+
+    limiter = RateLimiter(rate=1000.0, cooldown=0.05)
+    respx.get("https://shop.example/products.json?limit=250").mock(
+        side_effect=[
+            httpx.Response(429),
+            httpx.Response(200, json=shopify_payload),
+        ]
+    )
+    async with httpx.AsyncClient() as client:
+        result = await shopify.fetch(client, "shop.example", currency="USD", limiter=limiter)
+
+    assert result.ok and result.products
+    assert limiter.penalties == 1
+    assert limiter.rate == 500.0
+
+
+@respx.mock
+async def test_every_request_passes_through_the_limiter(shopify_payload):
+    calls: list[str] = []
+
+    class Counting:
+        penalties = 0
+
+        async def acquire(self):
+            calls.append("acquire")
+
+        async def penalise(self, pause=None):
+            calls.append("penalise")
+
+    respx.get("https://shop.example/products.json?limit=250").mock(
+        return_value=httpx.Response(200, json=shopify_payload)
+    )
+    async with httpx.AsyncClient() as client:
+        await shopify.fetch(client, "shop.example", currency="USD", limiter=Counting())
+
+    assert calls == ["acquire"]
