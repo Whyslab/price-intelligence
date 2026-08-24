@@ -13,6 +13,7 @@ from . import pipeline
 from .config import Config, load_config
 from .notify import Telegram
 from .sources import detect, jsonld
+from .throttle import RateLimiter
 
 
 def _log(level: str) -> None:
@@ -73,7 +74,10 @@ def cmd_detect(args, config: Config) -> int:
 
     async def go():
         async with pipeline.make_client(timeout=20) as client:
-            return await detect.detect_all(conn, domains, client, config.concurrency)
+            return await detect.detect_all(
+                conn, domains, client, config.concurrency,
+                limiter=RateLimiter(rate=config.shopify_rate),
+            )
 
     tally = asyncio.run(go())
     print("\nplatform breakdown:")

@@ -25,27 +25,39 @@ import sqlite3
 import httpx
 
 from ..db import upsert_store, utcnow
+from ..throttle import NullLimiter, RateLimiter
 from . import shopify
 
 log = logging.getLogger(__name__)
 
 # 202 from a storefront is almost always a JavaScript bot challenge, not content.
 BLOCKED_CODES = {202, 401, 402, 403, 405, 406, 423, 429, 503}
+# Failures that say "not right now" rather than "not ever". These never replace
+# a platform we have already seen working.
+TRANSIENT_CODES = {429, 503}
+WORKING = ("shopify", "jsonld")
 
 
-async def probe(client: httpx.AsyncClient, domain: str) -> dict:
+async def probe(
+    client: httpx.AsyncClient, domain: str, limiter: RateLimiter | NullLimiter | None = None
+) -> dict:
     """Classify a single domain. Never raises."""
+    limiter = limiter or NullLimiter()
     base = f"https://{domain}".rstrip("/")
     out: dict = {"platform": "unknown", "currency": None, "name": None, "country": None}
 
     # 1. Shopify? The catalogue endpoint is the definitive test.
     try:
+        await limiter.acquire()
         resp = await client.get(f"{base}/products.json?limit=1", follow_redirects=True)
+        if resp.status_code in TRANSIENT_CODES:
+            await limiter.penalise()
+            return {**out, "platform": "throttled", "error": f"HTTP {resp.status_code}"}
         if resp.status_code == 200:
             body = resp.json()
             if isinstance(body, dict) and "products" in body:
                 out["platform"] = "shopify"
-                out["currency"] = await shopify.detect_currency(client, base)
+                out["currency"] = await shopify.detect_currency(client, base, limiter)
                 meta = await _meta(client, base)
                 out["name"] = meta.get("name")
                 out["country"] = meta.get("country")
@@ -64,6 +76,8 @@ async def probe(client: httpx.AsyncClient, domain: str) -> dict:
         out["error"] = f"{type(exc).__name__}: {detail[:120]}"
         return out
 
+    if resp.status_code in TRANSIENT_CODES:
+        return {**out, "platform": "throttled", "error": f"HTTP {resp.status_code}"}
     if resp.status_code in BLOCKED_CODES:
         out["platform"] = "blocked"
         out["error"] = f"HTTP {resp.status_code}"
@@ -96,28 +110,47 @@ async def detect_all(
     conn: sqlite3.Connection,
     domains: list[str],
     client: httpx.AsyncClient,
-    concurrency: int = 16,
+    concurrency: int = 8,
+    limiter: RateLimiter | NullLimiter | None = None,
 ) -> dict[str, int]:
     """Probe every domain and write the verdicts. Returns a platform tally."""
+    limiter = limiter or NullLimiter()
     semaphore = asyncio.Semaphore(concurrency)
+    known = {
+        row["domain"]: row["platform"]
+        for row in conn.execute("SELECT domain, platform FROM stores").fetchall()
+    }
     tally: dict[str, int] = {}
 
     async def one(domain: str) -> tuple[str, dict]:
         async with semaphore:
-            return domain, await probe(client, domain)
+            return domain, await probe(client, domain, limiter)
 
     for coro in asyncio.as_completed([one(d) for d in domains]):
         domain, verdict = await coro
+        platform = verdict["platform"]
+
+        # Never let a momentary throttle erase a platform we have seen working.
+        if platform == "throttled":
+            previous = known.get(domain, "unknown")
+            upsert_store(
+                conn, domain, last_checked=utcnow(),
+                last_error=f"throttled while probing ({verdict.get('error')})",
+            )
+            tally["throttled"] = tally.get("throttled", 0) + 1
+            log.warning("%-40s throttled — keeping %s", domain, previous)
+            continue
+
         fields = {
-            "platform": verdict["platform"],
+            "platform": platform,
             "last_checked": utcnow(),
             "last_error": verdict.get("error"),
-            "status": "ok" if verdict["platform"] in ("shopify", "jsonld") else "skipped",
+            "status": "ok" if platform in WORKING else "skipped",
         }
         for key in ("currency", "name", "country"):
             if verdict.get(key):
                 fields[key] = verdict[key]
         upsert_store(conn, domain, **fields)
-        tally[verdict["platform"]] = tally.get(verdict["platform"], 0) + 1
-        log.info("%-40s %s", domain, verdict["platform"])
+        tally[platform] = tally.get(platform, 0) + 1
+        log.info("%-40s %s", domain, platform)
     return tally

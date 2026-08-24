@@ -156,3 +156,70 @@ async def test_a_store_with_no_markup_reports_an_error():
         result, _ = await jsonld.fetch(client, "shop.example", budget=1)
     assert not result.ok
     assert "schema.org" in result.error
+
+
+class TestDetect:
+    """Classifying how a store can be read, without destroying what we know."""
+
+    @respx.mock
+    async def test_a_shopify_store_is_recognised_by_its_catalogue(self):
+        from pi.sources import detect
+
+        respx.get("https://shop.example/products.json?limit=1").mock(
+            return_value=httpx.Response(200, json={"products": []})
+        )
+        respx.get("https://shop.example/").mock(
+            return_value=httpx.Response(200, text='Shopify.currency = {"active":"EUR"};')
+        )
+        respx.get("https://shop.example/meta.json").mock(
+            return_value=httpx.Response(200, json={"name": "Shop", "country": "DE"})
+        )
+        async with httpx.AsyncClient() as client:
+            verdict = await detect.probe(client, "shop.example")
+
+        assert verdict["platform"] == "shopify"
+        assert verdict["currency"] == "EUR"
+        assert verdict["country"] == "DE"
+
+    @respx.mock
+    async def test_a_throttled_probe_does_not_overwrite_a_working_platform(self, tmp_path):
+        """Shopify throttles our whole IP for minutes.
+
+        A probe that runs during one must not rewrite 138 working shops as
+        'blocked' and stop the collector reading them for good.
+        """
+        from pi import db as dbm
+        from pi.sources import detect
+
+        conn = dbm.connect(tmp_path / "pi.db")
+        dbm.upsert_store(conn, "shop.example", platform="shopify", currency="EUR")
+
+        respx.get("https://shop.example/products.json?limit=1").mock(
+            return_value=httpx.Response(429)
+        )
+        async with httpx.AsyncClient() as client:
+            tally = await detect.detect_all(conn, ["shop.example"], client)
+
+        row = conn.execute("SELECT platform, currency, last_error FROM stores").fetchone()
+        assert row["platform"] == "shopify", "the working platform survives"
+        assert row["currency"] == "EUR"
+        assert "throttled" in row["last_error"]
+        assert tally == {"throttled": 1}
+
+    @respx.mock
+    async def test_a_real_block_is_recorded(self, tmp_path):
+        from pi import db as dbm
+        from pi.sources import detect
+
+        conn = dbm.connect(tmp_path / "pi.db")
+        respx.get("https://walled.example/products.json?limit=1").mock(
+            return_value=httpx.Response(403)
+        )
+        respx.get("https://walled.example/").mock(return_value=httpx.Response(403))
+
+        async with httpx.AsyncClient() as client:
+            await detect.detect_all(conn, ["walled.example"], client)
+
+        row = conn.execute("SELECT platform, status FROM stores").fetchone()
+        assert row["platform"] == "blocked"
+        assert row["status"] == "skipped"
