@@ -57,6 +57,10 @@ class Config:
     # sweep's budget, shopify_host_rate is what any single shop gets. See pi.throttle.
     shopify_rate: float
     shopify_host_rate: float
+    # Shopify's per-IP quota tolerates a few dozen stores at a time, so a sweep
+    # takes a slice per run rather than charging at all of them and being cut
+    # off. With least-recently-collected ordering the slices cover everything.
+    max_shopify_stores: int
     log_level: str
     filters: Filters = field(default_factory=Filters)
 
@@ -100,6 +104,7 @@ def load_config(env_file: Path | None = None) -> Config:
         concurrency=int(os.getenv("PI_CONCURRENCY", "8")),
         shopify_rate=float(os.getenv("PI_SHOPIFY_RATE", "2.0")),
         shopify_host_rate=float(os.getenv("PI_SHOPIFY_HOST_RATE", "0.5")),
+        max_shopify_stores=int(os.getenv("PI_MAX_SHOPIFY_STORES", "45")),
         log_level=os.getenv("PI_LOG_LEVEL", "INFO").upper(),
         filters=load_filters(filters_file),
     )

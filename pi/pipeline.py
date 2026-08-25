@@ -54,6 +54,30 @@ def _last_run_was_capped(conn: sqlite3.Connection) -> bool:
     return bool(row and row["note"] == "capped")
 
 
+def _take_shopify_slice(
+    stores: list[sqlite3.Row], budget: int
+) -> tuple[list[sqlite3.Row], int]:
+    """Keep the first `budget` Shopify stores; jsonld stores are unaffected.
+
+    Shopify's per-IP quota tolerates a few dozen stores at a time — measured at
+    twelve to forty depending on how much the IP has already been used today.
+    Charging at all 138 just means being cut off part-way, so a run takes a
+    slice. Because `get_stores` orders by least-recently-collected, successive
+    runs cover the whole list instead of re-collecting the same shops.
+    """
+    if budget <= 0:
+        return stores, 0
+    kept, seen_shopify = [], 0
+    for store in stores:
+        if store["platform"] != "shopify":
+            kept.append(store)
+            continue
+        seen_shopify += 1
+        if seen_shopify <= budget:
+            kept.append(store)
+    return kept, max(0, seen_shopify - budget)
+
+
 # A store's own markup is a durable fact about it, unlike a network hiccup.
 HOPELESS_ERRORS = ("no schema.org/Product markup found", "no product URLs in sitemap")
 
@@ -268,6 +292,13 @@ async def run(
             log.info(
                 "skipping %d store(s) that publish no machine-readable prices "
                 "(re-check them with --stores)", skipped
+            )
+        stores, deferred = _take_shopify_slice(stores, config.max_shopify_stores)
+        if deferred:
+            log.info(
+                "taking %d Shopify store(s) this run, %d deferred to the next — "
+                "the per-IP quota does not stretch to all of them at once",
+                config.max_shopify_stores, deferred,
             )
     if not stores:
         log.warning("no readable stores — run `detect` first")

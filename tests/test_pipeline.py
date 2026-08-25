@@ -26,6 +26,7 @@ def config(tmp_path) -> Config:
         concurrency=4,
         shopify_rate=10_000.0,      # the limiter is exercised in test_throttle.py
         shopify_host_rate=10_000.0,
+        max_shopify_stores=0,      # no slicing unless a test asks for it
         log_level="WARNING",
         filters=Filters(min_discount_pct=30.0, min_saving_usd=40.0, min_score=50),
     )
@@ -460,3 +461,44 @@ async def test_a_price_drop_after_seeding_is_still_announced(config, shopify_pay
 
     stats = await pipeline.run(config, conn)
     assert stats.alerts_sent > 0, "a genuine further drop still gets through"
+
+
+def test_a_run_takes_a_slice_of_shopify_stores_not_all_of_them(config, conn):
+    """Shopify's per-IP quota tolerates a few dozen stores at a time — measured
+    between twelve and forty depending on how much the IP has been used. Charging
+    at all 138 only means being cut off part-way through."""
+    for n in range(10):
+        dbm.upsert_store(conn, f"shop{n}.example", platform="shopify")
+    for n in range(3):
+        dbm.upsert_store(conn, f"other{n}.example", platform="jsonld")
+
+    stores = dbm.get_stores(conn, platforms=("shopify", "jsonld"))
+    kept, deferred = pipeline._take_shopify_slice(stores, budget=4)
+
+    assert deferred == 6
+    assert sum(1 for s in kept if s["platform"] == "shopify") == 4
+    assert sum(1 for s in kept if s["platform"] == "jsonld") == 3, "jsonld is not sliced"
+
+
+def test_successive_runs_cover_every_shopify_store(config, conn):
+    """The slice is only useful if it moves along; ordering is what makes it."""
+    for n in range(9):
+        dbm.upsert_store(conn, f"shop{n}.example", platform="shopify")
+
+    seen: set[str] = set()
+    for _ in range(3):
+        stores = dbm.get_stores(conn, platforms=("shopify",))
+        kept, _ = pipeline._take_shopify_slice(stores, budget=3)
+        for store in kept:
+            seen.add(store["domain"])
+            dbm.upsert_store(conn, store["domain"], last_ok=dbm.utcnow())
+
+    assert len(seen) == 9, "three runs of three cover all nine"
+
+
+def test_a_budget_of_zero_means_no_slicing(config, conn):
+    for n in range(5):
+        dbm.upsert_store(conn, f"shop{n}.example", platform="shopify")
+    stores = dbm.get_stores(conn, platforms=("shopify",))
+    kept, deferred = pipeline._take_shopify_slice(stores, budget=0)
+    assert deferred == 0 and len(kept) == 5
