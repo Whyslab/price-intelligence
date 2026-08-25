@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 SCHEMA_SQL = Path(__file__).with_name("schema.sql")
 
 
@@ -40,7 +40,28 @@ def migrate(conn: sqlite3.Connection) -> None:
     # Every statement in schema.sql is CREATE ... IF NOT EXISTS, so replaying it
     # is how both "create from scratch" and "add what version N introduced" work.
     conn.executescript(SCHEMA_SQL.read_text(encoding="utf-8"))
+    if current == 1:
+        _migrate_1_to_2(conn)
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+
+
+def _migrate_1_to_2(conn: sqlite3.Connection) -> None:
+    """Add alerts.sent, and mark the rows an earlier `pi seed` wrote.
+
+    Seeding inserts every qualifying deal at one instant, so a timestamp shared
+    by a large batch identifies it. Nothing legitimately notifies about hundreds
+    of products in the same second.
+    """
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(alerts)")}
+    if "sent" not in columns:
+        conn.execute("ALTER TABLE alerts ADD COLUMN sent INTEGER NOT NULL DEFAULT 1")
+    conn.execute(
+        """
+        UPDATE alerts SET sent = 0 WHERE ts IN (
+            SELECT ts FROM alerts GROUP BY ts HAVING COUNT(*) > 100
+        )
+        """
+    )
 
 
 @contextmanager

@@ -71,6 +71,10 @@ CREATE TABLE IF NOT EXISTS alerts (
     price_bucket INTEGER NOT NULL,
     discount_pct REAL    NOT NULL,
     score        INTEGER NOT NULL,
+    -- 0 for rows written by `pi seed`, which suppress a notification rather than
+    -- being one. Without this the summary reports tens of thousands of "alerts"
+    -- that nobody ever received.
+    sent         INTEGER NOT NULL DEFAULT 1,
     UNIQUE (product_id, price_bucket)
 );
 CREATE INDEX IF NOT EXISTS ix_alerts_ts ON alerts(ts DESC);

@@ -226,7 +226,7 @@ def seed_alerts(conn: sqlite3.Connection, config: Config, dry_run: bool = False)
     ts = dbm.utcnow()
     with dbm.transaction(conn):
         for deal, _ in candidates:
-            dealm.record_alert(conn, deal, ts)
+            dealm.record_alert(conn, deal, ts, sent=False)
     return len(candidates)
 
 
@@ -429,6 +429,7 @@ async def run(
                 await asyncio.sleep(1.0)  # Telegram allows ~30 messages/second; be calm
 
     if limiter.blocked:
+        conn.execute("UPDATE runs SET note = 'blocked' WHERE id = ?", (run_id,))
         log.error(
             "Shopify blocked this IP part-way through; %d store(s) were skipped and "
             "will be collected on the next run", stats.stores_failed,
@@ -465,7 +466,17 @@ def health_report(conn: sqlite3.Connection) -> str:
         "SELECT * FROM runs WHERE finished_at IS NOT NULL ORDER BY id DESC LIMIT 1"
     ).fetchone()
     day = conn.execute(
-        "SELECT COUNT(*) FROM alerts WHERE ts > datetime('now', '-1 day')"
+        "SELECT COUNT(*) FROM alerts WHERE sent = 1 AND ts > datetime('now', '-1 day')"
+    ).fetchone()[0]
+    stale = conn.execute(
+        """
+        SELECT COUNT(*) FROM stores
+        WHERE platform = 'shopify'
+          AND (last_ok IS NULL OR last_ok < datetime('now', '-1 day'))
+        """
+    ).fetchone()[0]
+    shopify_total = conn.execute(
+        "SELECT COUNT(*) FROM stores WHERE platform = 'shopify'"
     ).fetchone()[0]
     products = conn.execute("SELECT COUNT(*) FROM products").fetchone()[0]
     points = conn.execute("SELECT COUNT(*) FROM price_points").fetchone()[0]
@@ -489,9 +500,14 @@ def health_report(conn: sqlite3.Connection) -> str:
             f"Товаров просмотрено: {last['products_seen']:,}",
             f"Изменений цен: {last['points_written']:,}",
         ]
+        if last["note"] == "blocked":
+            lines.append("⚠️ Обход прерван: Shopify заблокировал IP. Остальные магазины — в следующий раз.")
+        elif last["note"] == "capped":
+            lines.append("ℹ️ Уведомлений было больше лимита; следующий обход пришлёт остальные.")
     lines += [
-        f"Алертов за сутки: {day}",
+        f"Уведомлений за сутки: {day}",
         "",
+        f"Shopify не обновлялись сутки: {stale} из {shopify_total}",
         f"В базе: {products:,} товаров, {points:,} точек истории",
         "",
         "<b>Магазины по платформам:</b>",

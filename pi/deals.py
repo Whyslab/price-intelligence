@@ -203,17 +203,23 @@ def already_alerted(conn: sqlite3.Connection, deal: Deal) -> bool:
     return deal.price_usd >= best * RE_ALERT_DROP
 
 
-def record_alert(conn: sqlite3.Connection, deal: Deal, ts: str) -> bool:
-    """Persist the alert. Returns False if it was already there (race-safe)."""
+def record_alert(
+    conn: sqlite3.Connection, deal: Deal, ts: str, sent: bool = True
+) -> bool:
+    """Persist the alert. Returns False if it was already there (race-safe).
+
+    `sent=False` is for `pi seed`, which records deals in order to suppress a
+    notification rather than to report one.
+    """
     cur = conn.execute(
         """
         INSERT OR IGNORE INTO alerts
-            (product_id, variant_id, ts, price_usd, price_bucket, discount_pct, score)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+            (product_id, variant_id, ts, price_usd, price_bucket, discount_pct, score, sent)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             deal.product_id, deal.variant_id, ts, deal.price_usd,
-            deal.bucket, deal.discount_pct, deal.score,
+            deal.bucket, deal.discount_pct, deal.score, int(sent),
         ),
     )
     return cur.rowcount > 0

@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 import httpx
 import pytest
 import respx
 
 from pi import db as dbm
+from pi import deals as dealm
 from pi import pipeline
 from pi.config import Config, Filters
 
@@ -502,3 +504,44 @@ def test_a_budget_of_zero_means_no_slicing(config, conn):
     stores = dbm.get_stores(conn, platforms=("shopify",))
     kept, deferred = pipeline._take_shopify_slice(stores, budget=0)
     assert deferred == 0 and len(kept) == 5
+
+
+def test_the_summary_counts_notifications_not_seeded_rows(config, conn):
+    """`pi seed` writes tens of thousands of rows to suppress notifications.
+
+    Counting them as alerts made the daily summary report 29,855 messages that
+    nobody received — the one number the summary exists to convey.
+    """
+    dbm.upsert_store(conn, "shop.example", platform="shopify")
+    product = dbm.upsert_product(conn, 1, "p", "T", "https://u")
+    variant = dbm.upsert_variant(conn, product, "v")
+
+    deal = dealm.Deal(
+        variant_id=variant, product_id=product, price_usd=100.0, reference_usd=200.0,
+        reference_source="tag", discount_pct=50.0, saving_usd=100.0, score=80,
+        all_time_low=False, fake_sale=False, dropped_hours_ago=None, history_points=1,
+    )
+    dealm.record_alert(conn, deal, dbm.utcnow(), sent=False)
+    dealm.record_alert(conn, replace(deal, price_usd=50.0), dbm.utcnow(), sent=True)
+
+    report = pipeline.health_report(conn)
+    assert "Уведомлений за сутки: 1" in report
+
+
+def test_the_summary_says_when_a_run_was_cut_short(config, conn):
+    """Otherwise "21 ok, 18 failed" reads like a bad day rather than a block."""
+    conn.execute(
+        "INSERT INTO runs (started_at, finished_at, stores_ok, stores_failed, note)"
+        " VALUES (?, ?, 21, 18, 'blocked')",
+        (ts(0), ts(0)),
+    )
+    assert "Shopify заблокировал IP" in pipeline.health_report(conn)
+
+
+def test_the_summary_shows_how_much_of_the_list_is_going_stale(config, conn):
+    """Coverage is the thing to watch when runs are sliced."""
+    dbm.upsert_store(conn, "fresh.example", platform="shopify", last_ok=dbm.utcnow())
+    dbm.upsert_store(conn, "old.example", platform="shopify", last_ok=ts(3))
+    dbm.upsert_store(conn, "never.example", platform="shopify")
+
+    assert "Shopify не обновлялись сутки: 2 из 3" in pipeline.health_report(conn)
