@@ -21,10 +21,14 @@ from every shop — the same shape of request that had succeeded twenty minutes
 earlier. The block is platform-wide, outlasts twenty minutes, and cannot be
 negotiated down by going slower. Continuing to probe only feeds it.
 
-So the limiter trips a breaker: when several distinct hosts refuse inside a
-short window, `blocked` goes true and the caller is expected to abandon the
-Shopify part of the run and try again on the next timer, rather than spend
-half an hour collecting 429s.
+So the limiter trips a breaker. Refusals alone are not the signal: a healthy
+sweep of fifteen stores had three different shops rate-limit us within one
+second and still collected all fifteen. What distinguishes a block is that
+*nothing* is getting through — during one, not a single request succeeded. The
+breaker therefore needs both several distinct hosts refusing and a total absence
+of successes over the same window. The caller then abandons the Shopify part of
+the run and retries on the next timer, rather than spending half an hour
+collecting 429s and keeping the block alive.
 
 *Per shop, and overall.* Each host also gets its own bucket so no one shop is
 hit repeatedly in quick succession, and a global bucket paces the sweep.
@@ -101,7 +105,9 @@ class RateLimiter:
         # in flight at once. One is what the measurement supports.
         self._inflight = asyncio.Semaphore(max_inflight)
         self._recent: deque[tuple[float, str]] = deque()
+        self._last_success = 0.0
         self.penalties = 0
+        self.successes = 0
         self.blocked_at: float | None = None
 
     @property
@@ -117,6 +123,12 @@ class RateLimiter:
         Going slower does not lift it and continuing to probe prolongs it.
         """
         return self.blocked_at is not None
+
+    def note_success(self, host: str = "") -> None:
+        """Record that a request got through. Cheap, and it is what keeps the
+        breaker from tripping on a sweep that is merely bumpy."""
+        self._last_success = time.monotonic()
+        self.successes += 1
 
     def _bucket(self, host: str) -> _Bucket:
         bucket = self._hosts.get(host)
@@ -158,7 +170,12 @@ class RateLimiter:
                     self._recent.popleft()
                 self._recent.append((now, host))
                 distinct = {h for _, h in self._recent}
-                if len(distinct) < PLATFORM_HOSTS:
+                # A shop refusing while others succeed is just a strict shop.
+                nothing_working = (
+                    self._last_success == 0.0
+                    or now - self._last_success > PLATFORM_WINDOW
+                )
+                if len(distinct) < PLATFORM_HOSTS or not nothing_working:
                     log.info(
                         "%s is rate limiting us — backing off that shop for %.0fs", host, wait
                     )
@@ -185,6 +202,9 @@ class NullLimiter:
     rate = float("inf")
 
     async def acquire(self, host: str = "") -> None:
+        return
+
+    def note_success(self, host: str = "") -> None:
         return
 
     @asynccontextmanager

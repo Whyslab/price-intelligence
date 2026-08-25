@@ -100,6 +100,7 @@ async def _get_page(
             log.debug("%s: %s", url, exc)
             return None
         if resp.status_code == 200:
+            limiter.note_success(host)
             return resp
         if resp.status_code in (429, 503):
             if attempt == MAX_RETRIES:

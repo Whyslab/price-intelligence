@@ -229,6 +229,9 @@ async def test_the_limiter_holds_its_slot_across_the_request(shopify_payload):
         async def acquire(self, host=""):
             events.append(f"acquire:{host}")
 
+        def note_success(self, host=""):
+            events.append(f"ok:{host}")
+
         @asynccontextmanager
         async def slot(self, host=""):
             events.append(f"enter:{host}")
@@ -246,7 +249,9 @@ async def test_the_limiter_holds_its_slot_across_the_request(shopify_payload):
     async with httpx.AsyncClient() as client:
         await shopify.fetch(client, "shop.example", currency="USD", limiter=Watching())
 
-    assert events == ["enter:shop.example", "exit:shop.example"]
+    # The slot is released as soon as the response arrives; the success is
+    # recorded after, once the status has been looked at.
+    assert events == ["enter:shop.example", "exit:shop.example", "ok:shop.example"]
 
 
 @respx.mock

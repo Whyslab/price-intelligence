@@ -181,3 +181,35 @@ class TestPlatformBreaker:
         for _ in range(50):
             await limiter.penalise(host="strict.example")
         assert not limiter.blocked
+
+
+class TestBreakerNeedsASuccessDrought:
+    """Refusals alone are not a block — a healthy sweep has them too.
+
+    Measured: fifteen stores collected successfully while three different shops
+    rate-limited us inside one second. During a real block, nothing succeeded
+    at all.
+    """
+
+    async def test_refusals_alongside_successes_do_not_trip_it(self):
+        limiter = RateLimiter(rate=1000.0, per_host_rate=1000.0, cooldown=0.001)
+        for n in range(6):
+            limiter.note_success(f"working{n}.example")
+            await limiter.penalise(host=f"strict{n}.example")
+        assert not limiter.blocked
+        assert limiter.rate == 1000.0
+
+    async def test_refusals_with_nothing_getting_through_trip_it(self):
+        limiter = RateLimiter(rate=1000.0, per_host_rate=1000.0, cooldown=0.001)
+        for n in range(4):
+            await limiter.penalise(host=f"shop{n}.example")
+        assert limiter.blocked
+
+    async def test_a_success_before_the_window_does_not_count(self, monkeypatch):
+        limiter = RateLimiter(rate=1000.0, per_host_rate=1000.0, cooldown=0.001)
+        limiter.note_success("long-ago.example")
+        # Pretend that success happened well outside the window.
+        limiter._last_success -= 120.0
+        for n in range(4):
+            await limiter.penalise(host=f"shop{n}.example")
+        assert limiter.blocked
