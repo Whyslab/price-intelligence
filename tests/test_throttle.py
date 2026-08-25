@@ -6,7 +6,14 @@ import time
 
 import pytest
 
-from pi.throttle import RateLimiter
+from pi.throttle import MIN_ATTEMPTS_BEFORE_BLOCK, RateLimiter
+
+
+def give_it_a_sample(limiter):
+    """A sweep must attempt a fair number of requests before the breaker may
+    conclude anything — otherwise its first two seconds decide for it."""
+    for _ in range(MIN_ATTEMPTS_BEFORE_BLOCK):
+        limiter.note_attempt()
 
 
 async def test_requests_to_one_host_are_spaced_by_its_rate():
@@ -51,6 +58,7 @@ class TestPenalties:
         """58 of 138 stores were lost to this in one sweep — the global backstop
         exists for exactly this signal, and nothing shop-specific can see it."""
         limiter = RateLimiter(rate=100.0, per_host_rate=100.0, cooldown=0.01)
+        give_it_a_sample(limiter)
         for n in range(4):
             await limiter.penalise(host=f"shop{n}.example")
 
@@ -59,6 +67,7 @@ class TestPenalties:
 
     async def test_three_strict_shops_are_not_a_platform_block(self):
         limiter = RateLimiter(rate=100.0, per_host_rate=100.0, cooldown=0.01)
+        give_it_a_sample(limiter)
         for n in range(3):
             await limiter.penalise(host=f"shop{n}.example")
         assert limiter.rate == 100.0
@@ -73,6 +82,7 @@ class TestPenalties:
 
     async def test_the_rate_never_falls_below_the_floor(self):
         limiter = RateLimiter(rate=2.0, per_host_rate=2.0, min_rate=0.5, cooldown=0)
+        give_it_a_sample(limiter)
         for n in range(40):
             await limiter.penalise(host=f"shop{n}.example")
         assert limiter.rate == 0.5
@@ -81,6 +91,7 @@ class TestPenalties:
         limiter = RateLimiter(
             rate=100.0, per_host_rate=100.0, cooldown=0, recover_after=0.01
         )
+        give_it_a_sample(limiter)
         for n in range(4):
             await limiter.penalise(host=f"shop{n}.example")
         assert limiter.rate == 50.0
@@ -167,6 +178,7 @@ class TestPlatformBreaker:
 
     async def test_the_breaker_trips_when_many_hosts_refuse(self):
         limiter = RateLimiter(rate=100.0, per_host_rate=100.0, cooldown=0.01)
+        give_it_a_sample(limiter)
         assert not limiter.blocked
 
         for n in range(3):
@@ -178,6 +190,7 @@ class TestPlatformBreaker:
 
     async def test_repeats_from_one_shop_never_trip_the_breaker(self):
         limiter = RateLimiter(rate=100.0, per_host_rate=100.0, cooldown=0.001)
+        give_it_a_sample(limiter)
         for _ in range(50):
             await limiter.penalise(host="strict.example")
         assert not limiter.blocked
@@ -193,6 +206,7 @@ class TestBreakerNeedsASuccessDrought:
 
     async def test_refusals_alongside_successes_do_not_trip_it(self):
         limiter = RateLimiter(rate=1000.0, per_host_rate=1000.0, cooldown=0.001)
+        give_it_a_sample(limiter)
         for n in range(6):
             limiter.note_success(f"working{n}.example")
             await limiter.penalise(host=f"strict{n}.example")
@@ -201,12 +215,14 @@ class TestBreakerNeedsASuccessDrought:
 
     async def test_refusals_with_nothing_getting_through_trip_it(self):
         limiter = RateLimiter(rate=1000.0, per_host_rate=1000.0, cooldown=0.001)
+        give_it_a_sample(limiter)
         for n in range(4):
             await limiter.penalise(host=f"shop{n}.example")
         assert limiter.blocked
 
     async def test_a_success_before_the_window_does_not_count(self, monkeypatch):
         limiter = RateLimiter(rate=1000.0, per_host_rate=1000.0, cooldown=0.001)
+        give_it_a_sample(limiter)
         limiter.note_success("long-ago.example")
         # Pretend that success happened well outside the window.
         limiter._last_success -= 120.0

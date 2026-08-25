@@ -95,6 +95,7 @@ async def _get_page(
             # The slot is held across the request: Shopify objects to parallel
             # requests from one IP, not to their rate.
             async with limiter.slot(host):
+                limiter.note_attempt(host)
                 resp = await client.get(url)
         except httpx.HTTPError as exc:
             log.debug("%s: %s", url, exc)

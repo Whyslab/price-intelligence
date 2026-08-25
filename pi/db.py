@@ -82,7 +82,12 @@ def get_stores(
         params += list(domains)
     if where:
         sql += " WHERE " + " AND ".join(where)
-    return conn.execute(sql + " ORDER BY domain", params).fetchall()
+    # Least-recently-collected first, so a run that cannot finish still makes
+    # progress: the next one picks up where this one stopped instead of starting
+    # at the top of the alphabet and re-collecting the same shops forever.
+    return conn.execute(
+        sql + " ORDER BY last_ok IS NOT NULL, last_ok, domain", params
+    ).fetchall()
 
 
 # --- catalogue --------------------------------------------------------------

@@ -229,6 +229,9 @@ async def test_the_limiter_holds_its_slot_across_the_request(shopify_payload):
         async def acquire(self, host=""):
             events.append(f"acquire:{host}")
 
+        def note_attempt(self, host=""):
+            events.append(f"try:{host}")
+
         def note_success(self, host=""):
             events.append(f"ok:{host}")
 
@@ -251,16 +254,20 @@ async def test_the_limiter_holds_its_slot_across_the_request(shopify_payload):
 
     # The slot is released as soon as the response arrives; the success is
     # recorded after, once the status has been looked at.
-    assert events == ["enter:shop.example", "exit:shop.example", "ok:shop.example"]
+    assert events == [
+        "enter:shop.example", "try:shop.example", "exit:shop.example", "ok:shop.example"
+    ]
 
 
 @respx.mock
 async def test_a_blocked_platform_stops_the_sweep_instead_of_probing_it(shopify_payload):
     """Measured: once blocked, even one request every two seconds returns 429
     from every shop, for over twenty minutes. Continuing only prolongs it."""
-    from pi.throttle import RateLimiter
+    from pi.throttle import MIN_ATTEMPTS_BEFORE_BLOCK, RateLimiter
 
     limiter = RateLimiter(rate=1000.0, per_host_rate=1000.0, cooldown=0.001)
+    for _ in range(MIN_ATTEMPTS_BEFORE_BLOCK):
+        limiter.note_attempt()
     for n in range(4):
         await limiter.penalise(host=f"other{n}.example")
     assert limiter.blocked

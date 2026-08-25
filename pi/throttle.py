@@ -47,6 +47,12 @@ log = logging.getLogger(__name__)
 # as a platform-wide block rather than a few strict shops.
 PLATFORM_HOSTS = 4
 PLATFORM_WINDOW = 30.0
+# A sweep starts with no successes recorded, which is indistinguishable from
+# "nothing is getting through" unless it is given a fair sample first. Observed:
+# three shops (grailssf, extrabutterny, academyandco) refuse the very first
+# request every time, so a sweep whose opening requests land on them would
+# otherwise abandon all 138 stores two seconds in.
+MIN_ATTEMPTS_BEFORE_BLOCK = 12
 
 
 class _Bucket:
@@ -106,6 +112,7 @@ class RateLimiter:
         self._inflight = asyncio.Semaphore(max_inflight)
         self._recent: deque[tuple[float, str]] = deque()
         self._last_success = 0.0
+        self.attempts = 0
         self.penalties = 0
         self.successes = 0
         self.blocked_at: float | None = None
@@ -123,6 +130,10 @@ class RateLimiter:
         Going slower does not lift it and continuing to probe prolongs it.
         """
         return self.blocked_at is not None
+
+    def note_attempt(self, host: str = "") -> None:
+        """Record that a request was made, successful or not."""
+        self.attempts += 1
 
     def note_success(self, host: str = "") -> None:
         """Record that a request got through. Cheap, and it is what keeps the
@@ -172,10 +183,11 @@ class RateLimiter:
                 distinct = {h for _, h in self._recent}
                 # A shop refusing while others succeed is just a strict shop.
                 nothing_working = (
-                    self._last_success == 0.0
+                    self.successes == 0
                     or now - self._last_success > PLATFORM_WINDOW
                 )
-                if len(distinct) < PLATFORM_HOSTS or not nothing_working:
+                too_early = self.attempts < MIN_ATTEMPTS_BEFORE_BLOCK
+                if len(distinct) < PLATFORM_HOSTS or not nothing_working or too_early:
                     log.info(
                         "%s is rate limiting us — backing off that shop for %.0fs", host, wait
                     )
@@ -202,6 +214,9 @@ class NullLimiter:
     rate = float("inf")
 
     async def acquire(self, host: str = "") -> None:
+        return
+
+    def note_attempt(self, host: str = "") -> None:
         return
 
     def note_success(self, host: str = "") -> None:

@@ -142,3 +142,28 @@ class TestPruning:
     def test_pruning_an_empty_database_is_harmless(self, conn):
         assert dbm.prune_history(conn, keep_days=180) == 0
         assert dbm.drop_orphans(conn) == {"variants": 0, "products": 0}
+
+
+class TestSweepOrder:
+    """A run that cannot finish must still make progress across the whole list."""
+
+    def test_never_collected_stores_come_first(self, conn):
+        dbm.upsert_store(conn, "old.example", platform="shopify", last_ok=ts(1))
+        dbm.upsert_store(conn, "fresh.example", platform="shopify", last_ok=ts(0))
+        dbm.upsert_store(conn, "never.example", platform="shopify")
+
+        order = [s["domain"] for s in dbm.get_stores(conn, platforms=("shopify",))]
+        assert order == ["never.example", "old.example", "fresh.example"]
+
+    def test_the_next_run_resumes_where_the_last_one_stopped(self, conn):
+        """Alphabetical order meant the same first shops were collected every
+        run while the tail of the list never was."""
+        for name in "abcdef":
+            dbm.upsert_store(conn, f"{name}.example", platform="shopify")
+
+        first_half = dbm.get_stores(conn, platforms=("shopify",))[:3]
+        for store in first_half:
+            dbm.upsert_store(conn, store["domain"], last_ok=ts(0))
+
+        nxt = [s["domain"] for s in dbm.get_stores(conn, platforms=("shopify",))][:3]
+        assert set(nxt).isdisjoint({s["domain"] for s in first_half})
