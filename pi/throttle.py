@@ -79,18 +79,17 @@ class RateLimiter:
 
     def __init__(
         self,
-        rate: float = 6.0,
+        rate: float = 2.0,
         per_host_rate: float = 0.5,
         min_rate: float = 0.25,
         cooldown: float = 60.0,
         recover_after: float = 30.0,
         max_inflight: int = 1,
     ):
-        # Defaults come from measurement: a single global 2 req/s was gentle in
-        # aggregate yet still hammered individual shops hard enough to earn 429s,
-        # while unrelated shops answered fine throughout. Being slow per shop
-        # (one request every two seconds) and quicker overall fits what the
-        # platform actually enforces, and the backstop below catches the rest.
+        # 2 req/s overall is the one configuration observed to complete a full
+        # 196-store sweep with zero refusals. It was raised to 6 on the strength
+        # of a conclusion that later proved wrong, and is back where the evidence
+        # puts it. Per-shop stays slow so no single shop is hit in bursts.
         self._global = _Bucket(rate, min_rate)
         self._hosts: dict[str, _Bucket] = {}
         self.per_host_rate = per_host_rate
