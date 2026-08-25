@@ -61,8 +61,8 @@ async def detect_currency(
     limiter = limiter or NullLimiter()
     host = urlparse(base).netloc
     try:
-        await limiter.acquire(host)
-        resp = await client.get(base, follow_redirects=True)
+        async with limiter.slot(host):
+            resp = await client.get(base, follow_redirects=True)
         if resp.status_code == 200:
             html = resp.text
             for pattern in (_CURRENCY_JS, _CURRENCY_META):
@@ -73,8 +73,8 @@ async def detect_currency(
         log.debug("%s: storefront unreadable for currency (%s)", base, exc)
 
     try:
-        await limiter.acquire(host)
-        resp = await client.get(f"{base}/meta.json")
+        async with limiter.slot(host):
+            resp = await client.get(f"{base}/meta.json")
         if resp.status_code == 200:
             country = (resp.json() or {}).get("country")
             if country:
@@ -89,9 +89,13 @@ async def _get_page(
 ) -> httpx.Response | None:
     """GET through the shared limiter, backing off this shop — or all of them — on a 429."""
     for attempt in range(1, MAX_RETRIES + 1):
-        await limiter.acquire(host)
+        if getattr(limiter, "blocked", False):
+            return None  # the platform has shut us out; retrying only prolongs it
         try:
-            resp = await client.get(url)
+            # The slot is held across the request: Shopify objects to parallel
+            # requests from one IP, not to their rate.
+            async with limiter.slot(host):
+                resp = await client.get(url)
         except httpx.HTTPError as exc:
             log.debug("%s: %s", url, exc)
             return None
@@ -189,6 +193,8 @@ async def fetch(
 ) -> FetchResult:
     """Pull a whole Shopify catalogue, paginating with ?page=N."""
     limiter = limiter or NullLimiter()
+    if getattr(limiter, "blocked", False):
+        return FetchResult(domain=domain, currency=currency, error="skipped: Shopify blocked this IP")
     base = f"https://{domain}".rstrip("/")
     if not currency:
         currency = await detect_currency(client, base, limiter)

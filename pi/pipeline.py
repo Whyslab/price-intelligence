@@ -397,10 +397,15 @@ async def run(
                     )
                 await asyncio.sleep(1.0)  # Telegram allows ~30 messages/second; be calm
 
-    if limiter.penalties:
+    if limiter.blocked:
+        log.error(
+            "Shopify blocked this IP part-way through; %d store(s) were skipped and "
+            "will be collected on the next run", stats.stores_failed,
+        )
+    elif limiter.penalties:
         log.warning(
-            "hit the Shopify rate limit %d time(s); lower PI_SHOPIFY_RATE if this persists",
-            limiter.penalties,
+            "individual shops rate limited us %d time(s); lower PI_SHOPIFY_HOST_RATE "
+            "if this persists", limiter.penalties,
         )
     _finish_run(conn, run_id, stats)
     return stats

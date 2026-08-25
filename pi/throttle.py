@@ -2,20 +2,32 @@
 
 Shopify enforces two different limits and they need two different answers.
 
-*Per shop.* Individual shops throttle harder than others, and at any aggregate
-rate some of them will answer 429 while the rest are perfectly happy — measured
-directly: during a sweep that was collecting 429s, kith.com and feature.com
-still answered 200 to a single request. Slowing everything down because one shop
-is strict wastes the whole sweep's budget; that shop alone should back off.
+*Concurrency is what it actually objects to.* Measured directly against eight
+live shops, with everything else held constant:
 
-*Per IP, across the whole platform.* Push hard enough and every shop starts
-refusing at once, for minutes, with no Retry-After — measured at 58 of 138
-stores lost in one sweep. Nothing shop-specific can see that coming.
+    sequential, one request per 2s   ->  200 200 200 200
+    eight requests at once           ->  429 429 429 429 429 429 429 429
+    three requests at once           ->  429 429 429
 
-So each host gets its own bucket, and a global bucket sits behind them as the
-platform backstop. The global rate only tightens when 429s arrive from several
-distinct hosts at once, which is what a platform-level block looks like and what
-a single strict shop does not.
+Rate was not the trigger and neither was page size — six requests in a row at
+limit=250 all returned 200 from the same shops that were refusing the sweep at
+that very moment. Parallel requests from one IP are what Shopify refuses, across
+its whole platform. So the limiter allows exactly one Shopify request in flight
+at a time (`slot()`), and paces those in-flight requests with a token bucket.
+
+*Once blocked, nothing helps but stopping.* Measured after a sweep tripped it:
+requests spaced two seconds apart, strictly one at a time, still returned 429
+from every shop — the same shape of request that had succeeded twenty minutes
+earlier. The block is platform-wide, outlasts twenty minutes, and cannot be
+negotiated down by going slower. Continuing to probe only feeds it.
+
+So the limiter trips a breaker: when several distinct hosts refuse inside a
+short window, `blocked` goes true and the caller is expected to abandon the
+Shopify part of the run and try again on the next timer, rather than spend
+half an hour collecting 429s.
+
+*Per shop, and overall.* Each host also gets its own bucket so no one shop is
+hit repeatedly in quick succession, and a global bucket paces the sweep.
 """
 from __future__ import annotations
 
@@ -23,6 +35,7 @@ import asyncio
 import logging
 import time
 from collections import deque
+from contextlib import asynccontextmanager
 
 log = logging.getLogger(__name__)
 
@@ -71,6 +84,7 @@ class RateLimiter:
         min_rate: float = 0.25,
         cooldown: float = 60.0,
         recover_after: float = 30.0,
+        max_inflight: int = 1,
     ):
         # Defaults come from measurement: a single global 2 req/s was gentle in
         # aggregate yet still hammered individual shops hard enough to earn 429s,
@@ -84,13 +98,26 @@ class RateLimiter:
         self.cooldown = cooldown
         self.recover_after = recover_after
         self._lock = asyncio.Lock()
+        # Shopify refuses parallel requests from one IP, so only this many may be
+        # in flight at once. One is what the measurement supports.
+        self._inflight = asyncio.Semaphore(max_inflight)
         self._recent: deque[tuple[float, str]] = deque()
         self.penalties = 0
+        self.blocked_at: float | None = None
 
     @property
     def rate(self) -> float:
         """The current global rate, for logging and tests."""
         return self._global.rate
+
+    @property
+    def blocked(self) -> bool:
+        """True once the platform has started refusing everything.
+
+        The caller should stop making Shopify requests for the rest of the run.
+        Going slower does not lift it and continuing to probe prolongs it.
+        """
+        return self.blocked_at is not None
 
     def _bucket(self, host: str) -> _Bucket:
         bucket = self._hosts.get(host)
@@ -107,6 +134,17 @@ class RateLimiter:
                 delay = max(delay, self._bucket(host).claim(now, self.recover_after))
         if delay > 0:
             await asyncio.sleep(delay)
+
+    @asynccontextmanager
+    async def slot(self, host: str = ""):
+        """Wait for a turn, then hold the only in-flight slot for the request.
+
+        Use this around the HTTP call itself, not just before it: the point is
+        that no second Shopify request overlaps this one.
+        """
+        await self.acquire(host)
+        async with self._inflight:
+            yield
 
     async def penalise(self, pause: float | None = None, host: str = "") -> None:
         """Called on a 429. Slows `host`, and the whole sweep only if many complain."""
@@ -126,10 +164,14 @@ class RateLimiter:
                         "%s is rate limiting us — backing off that shop for %.0fs", host, wait
                     )
                     return
-                log.warning(
-                    "%d shops rate limited us within %.0fs — this looks platform-wide, "
-                    "slowing the whole sweep", len(distinct), PLATFORM_WINDOW,
-                )
+                if self.blocked_at is None:
+                    self.blocked_at = now
+                    log.error(
+                        "%d shops refused us within %.0fs — Shopify has blocked this IP "
+                        "platform-wide. Going slower does not lift it, so the rest of the "
+                        "Shopify sweep is being abandoned; it will retry on the next run.",
+                        len(distinct), PLATFORM_WINDOW,
+                    )
 
             self._global.penalise(now, wait)
             log.warning(
@@ -145,6 +187,10 @@ class NullLimiter:
 
     async def acquire(self, host: str = "") -> None:
         return
+
+    @asynccontextmanager
+    async def slot(self, host: str = ""):
+        yield
 
     async def penalise(self, pause: float | None = None, host: str = "") -> None:
         return

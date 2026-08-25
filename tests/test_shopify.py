@@ -211,23 +211,61 @@ async def test_one_strict_shop_backs_itself_off_not_the_whole_sweep(shopify_payl
 
 
 @respx.mock
-async def test_every_request_passes_through_the_limiter(shopify_payload):
-    calls: list[tuple[str, str]] = []
+async def test_the_limiter_holds_its_slot_across_the_request(shopify_payload):
+    """The slot must wrap the HTTP call, not merely precede it.
 
-    class Counting:
+    Shopify objects to parallel requests from one IP — measured: eight at once
+    all returned 429 while the same shops answered 200 sequentially. Releasing
+    the slot before the response arrives would let requests overlap again.
+    """
+    from contextlib import asynccontextmanager
+
+    events: list[str] = []
+
+    class Watching:
         penalties = 0
         rate = float("inf")
 
         async def acquire(self, host=""):
-            calls.append(("acquire", host))
+            events.append(f"acquire:{host}")
+
+        @asynccontextmanager
+        async def slot(self, host=""):
+            events.append(f"enter:{host}")
+            try:
+                yield
+            finally:
+                events.append(f"exit:{host}")
 
         async def penalise(self, pause=None, host=""):
-            calls.append(("penalise", host))
+            events.append(f"penalise:{host}")
 
     respx.get("https://shop.example/products.json?limit=250").mock(
         return_value=httpx.Response(200, json=shopify_payload)
     )
     async with httpx.AsyncClient() as client:
-        await shopify.fetch(client, "shop.example", currency="USD", limiter=Counting())
+        await shopify.fetch(client, "shop.example", currency="USD", limiter=Watching())
 
-    assert calls == [("acquire", "shop.example")], "the shop is named, so it can be paced alone"
+    assert events == ["enter:shop.example", "exit:shop.example"]
+
+
+@respx.mock
+async def test_a_blocked_platform_stops_the_sweep_instead_of_probing_it(shopify_payload):
+    """Measured: once blocked, even one request every two seconds returns 429
+    from every shop, for over twenty minutes. Continuing only prolongs it."""
+    from pi.throttle import RateLimiter
+
+    limiter = RateLimiter(rate=1000.0, per_host_rate=1000.0, cooldown=0.001)
+    for n in range(4):
+        await limiter.penalise(host=f"other{n}.example")
+    assert limiter.blocked
+
+    route = respx.get("https://shop.example/products.json?limit=250").mock(
+        return_value=httpx.Response(200, json=shopify_payload)
+    )
+    async with httpx.AsyncClient() as client:
+        result = await shopify.fetch(client, "shop.example", currency="USD", limiter=limiter)
+
+    assert not route.called, "no request is made at all"
+    assert not result.ok
+    assert "blocked" in result.error

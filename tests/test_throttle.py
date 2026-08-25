@@ -114,3 +114,70 @@ async def test_any_configured_rate_is_respected(rate):
     await limiter.acquire("a.example")
     await limiter.acquire("b.example")
     assert time.monotonic() - start >= (1.0 / (rate * 100)) * 0.9
+
+
+class TestInFlight:
+    """Shopify refuses parallel requests from one IP; the rate is not the issue."""
+
+    async def test_only_one_request_is_in_flight_at_a_time(self):
+        limiter = RateLimiter(rate=10_000.0, per_host_rate=10_000.0)
+        overlap = 0
+        current = 0
+
+        async def request(host):
+            nonlocal overlap, current
+            async with limiter.slot(host):
+                current += 1
+                overlap = max(overlap, current)
+                await asyncio.sleep(0.01)
+                current -= 1
+
+        await asyncio.gather(*(request(f"shop{n}.example") for n in range(8)))
+        assert overlap == 1, "eight concurrent callers must still go one at a time"
+
+    async def test_the_slot_is_released_even_when_the_request_raises(self):
+        limiter = RateLimiter(rate=10_000.0, per_host_rate=10_000.0)
+        with pytest.raises(RuntimeError):
+            async with limiter.slot("shop.example"):
+                raise RuntimeError("network died")
+        # If the slot leaked, this would hang forever.
+        await asyncio.wait_for(limiter.acquire("shop.example"), timeout=1.0)
+        async with limiter.slot("shop.example"):
+            pass
+
+    async def test_max_inflight_is_configurable(self):
+        limiter = RateLimiter(rate=10_000.0, per_host_rate=10_000.0, max_inflight=3)
+        overlap = 0
+        current = 0
+
+        async def request(host):
+            nonlocal overlap, current
+            async with limiter.slot(host):
+                current += 1
+                overlap = max(overlap, current)
+                await asyncio.sleep(0.02)
+                current -= 1
+
+        await asyncio.gather(*(request(f"shop{n}.example") for n in range(6)))
+        assert overlap == 3
+
+
+class TestPlatformBreaker:
+    """Once Shopify blocks the IP, going slower does not help — only stopping does."""
+
+    async def test_the_breaker_trips_when_many_hosts_refuse(self):
+        limiter = RateLimiter(rate=100.0, per_host_rate=100.0, cooldown=0.01)
+        assert not limiter.blocked
+
+        for n in range(3):
+            await limiter.penalise(host=f"shop{n}.example")
+        assert not limiter.blocked, "three strict shops are not a platform block"
+
+        await limiter.penalise(host="shop3.example")
+        assert limiter.blocked
+
+    async def test_repeats_from_one_shop_never_trip_the_breaker(self):
+        limiter = RateLimiter(rate=100.0, per_host_rate=100.0, cooldown=0.001)
+        for _ in range(50):
+            await limiter.penalise(host="strict.example")
+        assert not limiter.blocked
