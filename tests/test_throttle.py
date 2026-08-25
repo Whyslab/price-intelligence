@@ -1,0 +1,231 @@
+"""Rate limiting: pace each shop, and the whole sweep only when it must."""
+from __future__ import annotations
+
+import asyncio
+import time
+
+import pytest
+
+from pi.throttle import MIN_ATTEMPTS_BEFORE_BLOCK, RateLimiter
+
+
+def give_it_a_sample(limiter):
+    """A sweep must attempt a fair number of requests before the breaker may
+    conclude anything — otherwise its first two seconds decide for it."""
+    for _ in range(MIN_ATTEMPTS_BEFORE_BLOCK):
+        limiter.note_attempt()
+
+
+async def test_requests_to_one_host_are_spaced_by_its_rate():
+    limiter = RateLimiter(rate=10_000.0, per_host_rate=50.0)   # 20ms apart
+    start = time.monotonic()
+    for _ in range(5):
+        await limiter.acquire("shop.example")
+    assert time.monotonic() - start >= 4 * 0.02 * 0.9
+
+
+async def test_different_hosts_do_not_wait_on_each_other():
+    """The per-host bucket is what keeps one slow shop from blocking the rest."""
+    limiter = RateLimiter(rate=10_000.0, per_host_rate=2.0)    # 500ms per host
+    start = time.monotonic()
+    await asyncio.gather(*(limiter.acquire(f"shop{n}.example") for n in range(10)))
+    assert time.monotonic() - start < 0.2, "ten different shops go at once"
+
+
+async def test_the_global_budget_still_paces_the_sweep_as_a_whole():
+    limiter = RateLimiter(rate=50.0, per_host_rate=10_000.0)
+    start = time.monotonic()
+    await asyncio.gather(*(limiter.acquire(f"shop{n}.example") for n in range(10)))
+    assert time.monotonic() - start >= 9 * 0.02 * 0.9
+
+
+class TestPenalties:
+    async def test_one_strict_shop_slows_only_itself(self):
+        limiter = RateLimiter(rate=100.0, per_host_rate=100.0, cooldown=0.05)
+        await limiter.penalise(host="strict.example")
+
+        assert limiter.rate == 100.0, "the global budget is untouched"
+
+        start = time.monotonic()
+        await limiter.acquire("other.example")
+        assert time.monotonic() - start < 0.02, "an unrelated shop is not held back"
+
+        start = time.monotonic()
+        await limiter.acquire("strict.example")
+        assert time.monotonic() - start >= 0.04, "the strict one waits out its cooldown"
+
+    async def test_many_shops_complaining_at_once_reads_as_a_platform_block(self):
+        """58 of 138 stores were lost to this in one sweep — the global backstop
+        exists for exactly this signal, and nothing shop-specific can see it."""
+        limiter = RateLimiter(rate=100.0, per_host_rate=100.0, cooldown=0.01)
+        give_it_a_sample(limiter)
+        for n in range(4):
+            await limiter.penalise(host=f"shop{n}.example")
+
+        assert limiter.rate == 50.0, "the whole sweep slows down"
+        assert limiter.penalties == 4
+
+    async def test_three_strict_shops_are_not_a_platform_block(self):
+        limiter = RateLimiter(rate=100.0, per_host_rate=100.0, cooldown=0.01)
+        give_it_a_sample(limiter)
+        for n in range(3):
+            await limiter.penalise(host=f"shop{n}.example")
+        assert limiter.rate == 100.0
+
+    async def test_one_shop_complaining_repeatedly_is_not_a_platform_block(self):
+        """Otherwise a single aggressive shop drags the whole sweep to the floor,
+        which is what happened live: 64 penalties, global rate pinned at 0.25."""
+        limiter = RateLimiter(rate=100.0, per_host_rate=100.0, cooldown=0.001)
+        for _ in range(20):
+            await limiter.penalise(host="strict.example")
+        assert limiter.rate == 100.0, "distinct hosts are what counts, not repeats"
+
+    async def test_the_rate_never_falls_below_the_floor(self):
+        limiter = RateLimiter(rate=2.0, per_host_rate=2.0, min_rate=0.5, cooldown=0)
+        give_it_a_sample(limiter)
+        for n in range(40):
+            await limiter.penalise(host=f"shop{n}.example")
+        assert limiter.rate == 0.5
+
+    async def test_the_global_rate_recovers_once_complaints_stop(self):
+        limiter = RateLimiter(
+            rate=100.0, per_host_rate=100.0, cooldown=0, recover_after=0.01
+        )
+        give_it_a_sample(limiter)
+        for n in range(4):
+            await limiter.penalise(host=f"shop{n}.example")
+        assert limiter.rate == 50.0
+
+        await asyncio.sleep(0.02)
+        await limiter.acquire("fresh.example")
+        assert limiter.rate > 50.0
+
+    async def test_an_explicit_pause_is_honoured(self):
+        limiter = RateLimiter(rate=1000.0, per_host_rate=1000.0, cooldown=10.0)
+        await limiter.penalise(pause=0.05, host="shop.example")
+        start = time.monotonic()
+        await limiter.acquire("shop.example")
+        assert 0.04 <= time.monotonic() - start < 1.0
+
+
+async def test_the_null_limiter_does_nothing():
+    from pi.throttle import NullLimiter
+
+    limiter = NullLimiter()
+    start = time.monotonic()
+    await limiter.acquire("shop.example")
+    await limiter.penalise(host="shop.example")
+    assert time.monotonic() - start < 0.01
+
+
+@pytest.mark.parametrize("rate", [0.5, 2.0, 10.0])
+async def test_any_configured_rate_is_respected(rate):
+    limiter = RateLimiter(rate=rate * 100, per_host_rate=10_000.0)
+    start = time.monotonic()
+    await limiter.acquire("a.example")
+    await limiter.acquire("b.example")
+    assert time.monotonic() - start >= (1.0 / (rate * 100)) * 0.9
+
+
+class TestInFlight:
+    """Shopify refuses parallel requests from one IP; the rate is not the issue."""
+
+    async def test_only_one_request_is_in_flight_at_a_time(self):
+        limiter = RateLimiter(rate=10_000.0, per_host_rate=10_000.0)
+        overlap = 0
+        current = 0
+
+        async def request(host):
+            nonlocal overlap, current
+            async with limiter.slot(host):
+                current += 1
+                overlap = max(overlap, current)
+                await asyncio.sleep(0.01)
+                current -= 1
+
+        await asyncio.gather(*(request(f"shop{n}.example") for n in range(8)))
+        assert overlap == 1, "eight concurrent callers must still go one at a time"
+
+    async def test_the_slot_is_released_even_when_the_request_raises(self):
+        limiter = RateLimiter(rate=10_000.0, per_host_rate=10_000.0)
+        with pytest.raises(RuntimeError):
+            async with limiter.slot("shop.example"):
+                raise RuntimeError("network died")
+        # If the slot leaked, this would hang forever.
+        await asyncio.wait_for(limiter.acquire("shop.example"), timeout=1.0)
+        async with limiter.slot("shop.example"):
+            pass
+
+    async def test_max_inflight_is_configurable(self):
+        limiter = RateLimiter(rate=10_000.0, per_host_rate=10_000.0, max_inflight=3)
+        overlap = 0
+        current = 0
+
+        async def request(host):
+            nonlocal overlap, current
+            async with limiter.slot(host):
+                current += 1
+                overlap = max(overlap, current)
+                await asyncio.sleep(0.02)
+                current -= 1
+
+        await asyncio.gather(*(request(f"shop{n}.example") for n in range(6)))
+        assert overlap == 3
+
+
+class TestPlatformBreaker:
+    """Once Shopify blocks the IP, going slower does not help — only stopping does."""
+
+    async def test_the_breaker_trips_when_many_hosts_refuse(self):
+        limiter = RateLimiter(rate=100.0, per_host_rate=100.0, cooldown=0.01)
+        give_it_a_sample(limiter)
+        assert not limiter.blocked
+
+        for n in range(3):
+            await limiter.penalise(host=f"shop{n}.example")
+        assert not limiter.blocked, "three strict shops are not a platform block"
+
+        await limiter.penalise(host="shop3.example")
+        assert limiter.blocked
+
+    async def test_repeats_from_one_shop_never_trip_the_breaker(self):
+        limiter = RateLimiter(rate=100.0, per_host_rate=100.0, cooldown=0.001)
+        give_it_a_sample(limiter)
+        for _ in range(50):
+            await limiter.penalise(host="strict.example")
+        assert not limiter.blocked
+
+
+class TestBreakerNeedsASuccessDrought:
+    """Refusals alone are not a block — a healthy sweep has them too.
+
+    Measured: fifteen stores collected successfully while three different shops
+    rate-limited us inside one second. During a real block, nothing succeeded
+    at all.
+    """
+
+    async def test_refusals_alongside_successes_do_not_trip_it(self):
+        limiter = RateLimiter(rate=1000.0, per_host_rate=1000.0, cooldown=0.001)
+        give_it_a_sample(limiter)
+        for n in range(6):
+            limiter.note_success(f"working{n}.example")
+            await limiter.penalise(host=f"strict{n}.example")
+        assert not limiter.blocked
+        assert limiter.rate == 1000.0
+
+    async def test_refusals_with_nothing_getting_through_trip_it(self):
+        limiter = RateLimiter(rate=1000.0, per_host_rate=1000.0, cooldown=0.001)
+        give_it_a_sample(limiter)
+        for n in range(4):
+            await limiter.penalise(host=f"shop{n}.example")
+        assert limiter.blocked
+
+    async def test_a_success_before_the_window_does_not_count(self, monkeypatch):
+        limiter = RateLimiter(rate=1000.0, per_host_rate=1000.0, cooldown=0.001)
+        give_it_a_sample(limiter)
+        limiter.note_success("long-ago.example")
+        # Pretend that success happened well outside the window.
+        limiter._last_success -= 120.0
+        for n in range(4):
+            await limiter.penalise(host=f"shop{n}.example")
+        assert limiter.blocked

@@ -1,0 +1,40 @@
+# Copy to filters.toml and edit. Every key is optional; the defaults are shown.
+# Nothing here is a secret, but filters.toml is gitignored so your personal
+# sizes and brands stay out of the repository.
+
+# --- how big a discount has to be -------------------------------------------
+# Both thresholds must be met. The absolute one matters: 40% off a $30 t-shirt
+# is $12 and not worth a notification.
+min_discount_pct = 30.0     # percent below the reference price
+min_saving_usd   = 40.0     # dollars saved
+
+# Ignore anything outside this range entirely.
+min_price_usd = 25.0
+max_price_usd = 2000.0
+
+# Deal score is 0-100. Roughly: 30% off scores ~48, 50% off ~80, and an
+# all-time low on corroborated history adds 20 on top.
+min_score = 55
+
+# At most this many notifications per run (runs happen every 6 hours).
+max_alerts_per_run = 15
+
+# A struck-through price that has not moved in this many days is not a sale,
+# it is the normal price with decoration. Such deals are scored down heavily.
+fake_sale_days = 21
+
+# --- what you actually want --------------------------------------------------
+# Matched as case-insensitive substrings of the brand name.
+# brands_allow is a whitelist: leave it empty to accept every brand.
+brands_allow = []
+# e.g. brands_allow = ["nike", "jordan", "new balance", "asics", "salomon"]
+
+brands_deny = []
+# e.g. brands_deny = ["crocs"]
+
+# Sizes are normalised to forms like "US10.5", "EU44", "UK9", "M", "XL".
+# Leave empty to accept any size. Normalisation is best effort: a bare "44"
+# is read as EU44 and a bare "10" as US10, which is right most of the time
+# but not always, so prefer listing several forms of your size.
+sizes = []
+# e.g. sizes = ["EU44", "US10", "US10.5", "UK9.5"]

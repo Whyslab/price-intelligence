@@ -1,0 +1,13 @@
+[Unit]
+Description=Run Price Intelligence every 6 hours
+
+[Timer]
+OnCalendar=*-*-* 00,06,12,18:15:00
+# Do not let every install hit the same shops at the same second.
+RandomizedDelaySec=10min
+# If the machine was asleep at the scheduled time, run once it wakes.
+Persistent=yes
+Unit=price-intelligence.service
+
+[Install]
+WantedBy=timers.target

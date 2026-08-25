@@ -1,0 +1,16 @@
+[Unit]
+Description=Price Intelligence — daily collection health summary
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/Projects/price-intelligence
+ExecStart=%h/Projects/price-intelligence/.venv/bin/python -m pi health --send
+TimeoutStartSec=5min
+
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/Projects/price-intelligence/data
+NoNewPrivileges=yes

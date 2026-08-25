@@ -1,0 +1,12 @@
+[Unit]
+Description=Prune Price Intelligence history weekly
+
+[Timer]
+# Sunday, well away from the six-hourly collection slots.
+OnCalendar=Sun *-*-* 04:30:00
+RandomizedDelaySec=30min
+Persistent=yes
+Unit=price-intelligence-prune.service
+
+[Install]
+WantedBy=timers.target
