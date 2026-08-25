@@ -48,10 +48,10 @@ async def probe(
 
     # 1. Shopify? The catalogue endpoint is the definitive test.
     try:
-        await limiter.acquire()
+        await limiter.acquire(domain)
         resp = await client.get(f"{base}/products.json?limit=1", follow_redirects=True)
         if resp.status_code in TRANSIENT_CODES:
-            await limiter.penalise()
+            await limiter.penalise(host=domain)
             return {**out, "platform": "throttled", "error": f"HTTP {resp.status_code}"}
         if resp.status_code == 200:
             body = resp.json()

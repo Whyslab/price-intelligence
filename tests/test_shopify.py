@@ -192,42 +192,37 @@ def test_size_normalisation(raw, expected):
 
 
 @respx.mock
-async def test_a_429_backs_off_the_whole_shared_budget(shopify_payload):
-    """One store's 429 must slow every store down — the limit is per IP.
-
-    Shopify sends no Retry-After and stays throttled for minutes, so retrying
-    the one request that failed while fifteen other stores keep hammering is
-    exactly how a sweep loses most of its catalogue.
-    """
+async def test_one_strict_shop_backs_itself_off_not_the_whole_sweep(shopify_payload):
+    """Measured live: while a sweep was collecting 429s, kith.com and
+    feature.com still answered 200 to a single request. Slowing every store
+    because one shop is strict wastes the whole sweep's budget."""
     from pi.throttle import RateLimiter
 
-    limiter = RateLimiter(rate=1000.0, cooldown=0.05)
+    limiter = RateLimiter(rate=1000.0, per_host_rate=1000.0, cooldown=0.01)
     respx.get("https://shop.example/products.json?limit=250").mock(
-        side_effect=[
-            httpx.Response(429),
-            httpx.Response(200, json=shopify_payload),
-        ]
+        side_effect=[httpx.Response(429), httpx.Response(200, json=shopify_payload)]
     )
     async with httpx.AsyncClient() as client:
         result = await shopify.fetch(client, "shop.example", currency="USD", limiter=limiter)
 
     assert result.ok and result.products
     assert limiter.penalties == 1
-    assert limiter.rate == 500.0
+    assert limiter.rate == 1000.0, "the global budget is untouched by one shop"
 
 
 @respx.mock
 async def test_every_request_passes_through_the_limiter(shopify_payload):
-    calls: list[str] = []
+    calls: list[tuple[str, str]] = []
 
     class Counting:
         penalties = 0
+        rate = float("inf")
 
-        async def acquire(self):
-            calls.append("acquire")
+        async def acquire(self, host=""):
+            calls.append(("acquire", host))
 
-        async def penalise(self, pause=None):
-            calls.append("penalise")
+        async def penalise(self, pause=None, host=""):
+            calls.append(("penalise", host))
 
     respx.get("https://shop.example/products.json?limit=250").mock(
         return_value=httpx.Response(200, json=shopify_payload)
@@ -235,4 +230,4 @@ async def test_every_request_passes_through_the_limiter(shopify_payload):
     async with httpx.AsyncClient() as client:
         await shopify.fetch(client, "shop.example", currency="USD", limiter=Counting())
 
-    assert calls == ["acquire"]
+    assert calls == [("acquire", "shop.example")], "the shop is named, so it can be paced alone"

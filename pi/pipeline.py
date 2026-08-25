@@ -281,10 +281,10 @@ async def run(
     log.info("exchange rates: %s (%s)", rates.source, rates.fetched_at.date())
     by_platform = Counter(s["platform"] for s in stores)
     log.info(
-        "sweeping %d stores (%s), shared Shopify budget %.1f req/s",
+        "sweeping %d stores (%s), Shopify budget %.1f req/s overall, %.2f per shop",
         len(stores),
         ", ".join(f"{n} {p}" for p, n in by_platform.most_common()),
-        config.shopify_rate,
+        config.shopify_rate, config.shopify_host_rate,
     )
 
     # Separate pools per platform. A jsonld store crawls hundreds of product
@@ -295,7 +295,7 @@ async def run(
         "shopify": asyncio.Semaphore(config.concurrency),
         "jsonld": asyncio.Semaphore(max(2, config.concurrency // 2)),
     }
-    limiter = RateLimiter(rate=config.shopify_rate)
+    limiter = RateLimiter(rate=config.shopify_rate, per_host_rate=config.shopify_host_rate)
     changed: list[int] = []
     # A store being read for the first time has every standing sale look brand
     # new. That first pass is a baseline, not news: record the prices, announce

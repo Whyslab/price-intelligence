@@ -53,9 +53,10 @@ class Config:
     bot_token: str | None
     chat_id: str | None
     concurrency: int
-    # Shopify counts requests per IP across the whole platform, so this is one
-    # shared budget for every store, not a per-store rate. See pi.throttle.
+    # Two limits, because Shopify enforces two: shopify_rate is the whole
+    # sweep's budget, shopify_host_rate is what any single shop gets. See pi.throttle.
     shopify_rate: float
+    shopify_host_rate: float
     log_level: str
     filters: Filters = field(default_factory=Filters)
 
@@ -97,7 +98,8 @@ def load_config(env_file: Path | None = None) -> Config:
         bot_token=os.getenv("TELEGRAM_BOT_TOKEN") or None,
         chat_id=os.getenv("TELEGRAM_CHAT_ID") or None,
         concurrency=int(os.getenv("PI_CONCURRENCY", "8")),
-        shopify_rate=float(os.getenv("PI_SHOPIFY_RATE", "2.0")),
+        shopify_rate=float(os.getenv("PI_SHOPIFY_RATE", "6.0")),
+        shopify_host_rate=float(os.getenv("PI_SHOPIFY_HOST_RATE", "0.5")),
         log_level=os.getenv("PI_LOG_LEVEL", "INFO").upper(),
         filters=load_filters(filters_file),
     )

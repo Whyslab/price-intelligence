@@ -76,7 +76,9 @@ def cmd_detect(args, config: Config) -> int:
         async with pipeline.make_client(timeout=20) as client:
             return await detect.detect_all(
                 conn, domains, client, config.concurrency,
-                limiter=RateLimiter(rate=config.shopify_rate),
+                limiter=RateLimiter(
+                    rate=config.shopify_rate, per_host_rate=config.shopify_host_rate
+                ),
             )
 
     tally = asyncio.run(go())

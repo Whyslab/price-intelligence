@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from urllib.parse import urlparse
 
 import httpx
 
@@ -58,8 +59,9 @@ async def detect_currency(
 ) -> str | None:
     """Read the shop's real currency from the storefront, then /meta.json."""
     limiter = limiter or NullLimiter()
+    host = urlparse(base).netloc
     try:
-        await limiter.acquire()
+        await limiter.acquire(host)
         resp = await client.get(base, follow_redirects=True)
         if resp.status_code == 200:
             html = resp.text
@@ -71,7 +73,7 @@ async def detect_currency(
         log.debug("%s: storefront unreadable for currency (%s)", base, exc)
 
     try:
-        await limiter.acquire()
+        await limiter.acquire(host)
         resp = await client.get(f"{base}/meta.json")
         if resp.status_code == 200:
             country = (resp.json() or {}).get("country")
@@ -83,11 +85,11 @@ async def detect_currency(
 
 
 async def _get_page(
-    client: httpx.AsyncClient, url: str, limiter: RateLimiter | NullLimiter
+    client: httpx.AsyncClient, url: str, limiter: RateLimiter | NullLimiter, host: str = ""
 ) -> httpx.Response | None:
-    """GET through the shared limiter, backing the whole sweep off on a 429."""
+    """GET through the shared limiter, backing off this shop — or all of them — on a 429."""
     for attempt in range(1, MAX_RETRIES + 1):
-        await limiter.acquire()
+        await limiter.acquire(host)
         try:
             resp = await client.get(url)
         except httpx.HTTPError as exc:
@@ -99,8 +101,9 @@ async def _get_page(
             if attempt == MAX_RETRIES:
                 return None
             # Shopify sends no Retry-After and stays angry for minutes, so the
-            # pause is ours to choose and it applies to every store at once.
-            await limiter.penalise(_retry_after(resp, fallback=None))
+            # pause is ours to choose. It applies to this shop; the limiter
+            # decides for itself whether the whole sweep should slow down too.
+            await limiter.penalise(_retry_after(resp, fallback=None), host=host)
             continue
         return None
     return None
@@ -199,7 +202,7 @@ async def fetch(
     exhausted = False
 
     for _ in range(max_pages):
-        resp = await _get_page(client, url, limiter)
+        resp = await _get_page(client, url, limiter, domain)
         if resp is None:
             if not products:
                 return FetchResult(domain=domain, currency=currency, error="products.json unreachable")

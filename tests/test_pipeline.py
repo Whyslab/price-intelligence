@@ -24,7 +24,8 @@ def config(tmp_path) -> Config:
         bot_token=TOKEN,
         chat_id=CHAT,
         concurrency=4,
-        shopify_rate=10_000.0,   # the limiter is exercised in test_throttle.py
+        shopify_rate=10_000.0,      # the limiter is exercised in test_throttle.py
+        shopify_host_rate=10_000.0,
         log_level="WARNING",
         filters=Filters(min_discount_pct=30.0, min_saving_usd=40.0, min_score=50),
     )
