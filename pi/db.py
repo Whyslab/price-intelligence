@@ -10,7 +10,7 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 SCHEMA_SQL = Path(__file__).with_name("schema.sql")
 
 
@@ -49,6 +49,8 @@ def migrate(conn: sqlite3.Connection) -> None:
         _migrate_2_to_3(conn)
     if current in (1, 2, 3):
         _migrate_3_to_4(conn)
+    if current in (1, 2, 3, 4):
+        _migrate_4_to_5(conn)
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
 
@@ -106,16 +108,35 @@ def _migrate_2_to_3(conn: sqlite3.Connection) -> None:
         log.info("removed %d history rows that only recorded an exchange rate moving", dropped)
 
 
+# Columns of stores that pi.reference fills in. Kept as a list rather than
+# written into one migration because a later version added to it, and a database
+# already past that version would never have seen the addition.
+TRUST_COLUMNS = ("tag_share", "round_share", "blanket_pct", "blanket_share")
+
+
+def _add_missing_trust_columns(conn: sqlite3.Connection) -> None:
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(stores)")}
+    for column in TRUST_COLUMNS:
+        if column not in existing:
+            conn.execute(f"ALTER TABLE stores ADD COLUMN {column} REAL")
+
+
 def _migrate_3_to_4(conn: sqlite3.Connection) -> None:
     """Add the per-shop discount profile. The keys table comes from schema.sql.
 
     Existing products have no keys yet — `pi reindex` fills them in, and the run
     that follows keeps them current.
     """
-    columns = {row["name"] for row in conn.execute("PRAGMA table_info(stores)")}
-    for column in ("tag_share", "round_share", "blanket_pct", "blanket_share"):
-        if column not in columns:
-            conn.execute(f"ALTER TABLE stores ADD COLUMN {column} REAL")
+    _add_missing_trust_columns(conn)
+
+
+def _migrate_4_to_5(conn: sqlite3.Connection) -> None:
+    """Add stores.round_share, the share of a shop's discounts on a round 5% step.
+
+    Its own step because version 4 shipped without it, and a database already at
+    4 would otherwise never be offered the column.
+    """
+    _add_missing_trust_columns(conn)
 
 
 def drop_fx_noise(conn: sqlite3.Connection) -> int:

@@ -256,8 +256,15 @@ def find_deals(
     config: Config,
     market: reference.MarketIndex | None = None,
     trust: dict[int, reference.Trust] | None = None,
+    cap_per_store: bool = True,
 ) -> list[tuple[dealm.Deal, sqlite3.Row]]:
-    """Score the variants that moved, returning the ones worth announcing."""
+    """Score the variants that moved, returning the ones worth announcing.
+
+    `cap_per_store` is what `seed` turns off: the cap exists so one shop's
+    promotion cannot fill a notification run, but seeding is not a run — it has
+    to account for every qualifying deal, or the ones it trimmed come back as
+    news on the next sweep.
+    """
     if not variant_ids:
         return []
     rows = _candidates(conn, variant_ids, config)
@@ -296,6 +303,8 @@ def find_deals(
 
     found = list(best_per_product.values())
     found.sort(key=lambda pair: pair[0].score, reverse=True)
+    if not cap_per_store:
+        return found
     return _cap_per_store(found, config.filters.max_alerts_per_store)
 
 
@@ -312,7 +321,7 @@ def seed_alerts(conn: sqlite3.Connection, config: Config, dry_run: bool = False)
     Seeding records them without sending, so only price drops from here on are
     announced. Returns how many were suppressed.
     """
-    candidates = find_deals(conn, all_scorable_variants(conn), config)
+    candidates = find_deals(conn, all_scorable_variants(conn), config, cap_per_store=False)
     if dry_run:
         return len(candidates)
     ts = dbm.utcnow()

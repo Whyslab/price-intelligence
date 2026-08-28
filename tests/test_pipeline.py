@@ -528,6 +528,27 @@ def test_the_summary_counts_notifications_not_seeded_rows(config, conn):
     assert "Уведомлений за сутки: 1" in report
 
 
+def test_seeding_is_not_limited_by_the_per_store_cap(config, conn):
+    """The cap stops one shop filling a notification run. Seeding is not a run:
+    anything it trims comes straight back as news on the next sweep."""
+    store = dbm.upsert_store(conn, "sale.example", platform="shopify", currency="USD")
+    for n in range(8):
+        product = dbm.upsert_product(conn, store, f"p{n}", f"Shoe {n}", f"https://u/{n}")
+        variant = dbm.upsert_variant(conn, product, f"v{n}")
+        dbm.record_price(
+            conn, variant, 100.0, 300.0, True, "USD", 100.0, 1.0,
+            ts=dbm.utcnow(), compare_at_native=300.0,
+        )
+    conn.execute("UPDATE stores SET last_ok = ?", (dbm.utcnow(),))
+
+    capped = pipeline.find_deals(conn, pipeline.all_scorable_variants(conn), config)
+    assert len(capped) == config.filters.max_alerts_per_store
+
+    seeded = pipeline.seed_alerts(conn, config)
+    assert seeded == 8, "every qualifying deal is accounted for"
+    assert pipeline.seed_alerts(conn, config, dry_run=True) == 0, "and nothing is left over"
+
+
 def test_the_summary_says_when_a_run_was_cut_short(config, conn):
     """Otherwise "21 ok, 18 failed" reads like a bad day rather than a block."""
     conn.execute(
