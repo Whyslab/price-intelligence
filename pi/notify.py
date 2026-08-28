@@ -133,7 +133,8 @@ def format_caption(
     if deal.fake_sale:
         lines.append("⚠️ Зачёркнутая цена не менялась неделями — «вечная распродажа»")
 
-    where = escape(store) if store else None
+    # Shop names arrive as the shop wrote them, trailing spaces and all.
+    where = escape(store.strip()) if store and store.strip() else None
     if where and country:
         where = f"{where} ({escape(country)})"
     if where:

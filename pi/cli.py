@@ -77,10 +77,17 @@ def cmd_detect(args, config: Config) -> int:
     if args.only:
         domains = [d.strip().lower() for d in args.only.split(",") if d.strip()]
     else:
+        if args.all:
+            where = ""
+        elif args.broken:
+            # Everything not producing data, whatever the reason. Worth a second
+            # look after any change to how shops are read — the verdict recorded
+            # last time was reached by the code as it was then.
+            where = " WHERE platform NOT IN ('shopify', 'jsonld') OR last_error IS NOT NULL"
+        else:
+            where = " WHERE platform = 'unknown' OR platform = 'new'"
         rows = conn.execute(
-            "SELECT domain FROM stores"
-            + ("" if args.all else " WHERE platform = 'unknown' OR platform = 'new'")
-            + " ORDER BY domain"
+            "SELECT domain FROM stores" + where + " ORDER BY domain"
         ).fetchall()
         domains = [r[0] for r in rows]
     if args.limit:
@@ -282,6 +289,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--limit", type=int, help="probe at most N stores")
     p.add_argument("--only", help="comma-separated domains to probe")
     p.add_argument("--all", action="store_true", help="re-probe already classified stores")
+    p.add_argument(
+        "--broken", action="store_true",
+        help="re-probe every store that is not producing data, whatever the reason",
+    )
     p.set_defaults(func=cmd_detect)
 
     p = sub.add_parser("run", help="collect prices, score them, send alerts")
