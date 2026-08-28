@@ -704,8 +704,32 @@ def sizes_in_stock(conn: sqlite3.Connection, product_id: int) -> list[tuple[str,
           JOIN price_points pp ON pp.variant_id = v.id
          WHERE v.product_id = ?
            AND pp.ts = (SELECT MAX(ts) FROM price_points WHERE variant_id = v.id)
-         ORDER BY v.size_norm
         """,
         (product_id,),
     ).fetchall()
-    return [(row["size_norm"] or row["size"] or "—", bool(row["in_stock"])) for row in rows]
+
+    # Collapsed by label, because one label can be several variants: a shop that
+    # sells a jacket in two colourways has "L" twice, and a shop that puts the
+    # colour in the size field has "BIANCO" six times. Listing them as written
+    # produced "Есть: BIANCO, BIANCO", which tells the reader nothing and looks
+    # broken. A label counts as available if any variant behind it is.
+    available: dict[str, bool] = {}
+    for row in rows:
+        label = (row["size_norm"] or row["size"] or "—").strip()
+        available[label] = available.get(label, False) or bool(row["in_stock"])
+    return sorted(available.items(), key=lambda item: _size_order(item[0]))
+
+
+def _size_order(label: str) -> tuple:
+    """Sort sizes the way a person reads them: EU44 before EU44.5 before EU45.
+
+    Plain string order puts US10 before US2 and XL before XS, which makes a list
+    of a dozen sizes hard to scan for the one you take.
+    """
+    clothing = ["XXS", "XS", "S", "M", "L", "XL", "XXL", "XXXL", "OS"]
+    if label in clothing:
+        return (0, clothing.index(label), "")
+    match = re.match(r"^([A-Z]+)(\d+(?:\.5)?)$", label)
+    if match:
+        return (1, 0.0, match.group(1), float(match.group(2)))
+    return (2, 0.0, label)

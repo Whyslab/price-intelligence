@@ -28,6 +28,7 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass
 
+from . import landed
 from .config import Filters
 
 # Added to the discount's own score to order one reader's list.
@@ -109,8 +110,19 @@ def bar_for(row: sqlite3.Row, reader: Reader, base: int) -> int:
     return bar
 
 
-def priority(deal, row: sqlite3.Row, reader: Reader) -> float:
-    """Where this find sits in one reader's queue. Higher is sooner."""
+def priority(
+    deal,
+    row: sqlite3.Row,
+    reader: Reader,
+    shipping: landed.Rules = landed.EMPTY,
+    eur_usd: float | None = None,
+) -> float:
+    """Where this find sits in one reader's queue. Higher is sooner.
+
+    Delivery takes points off but is capped and never disqualifies: the estimate
+    is rough, and something this rough must be able to move a find down the list
+    without being able to remove it.
+    """
     own_size, favourite, wanted_kind = _matches(row, reader)
     value = float(deal.score)
     if own_size:
@@ -119,10 +131,22 @@ def priority(deal, row: sqlite3.Row, reader: Reader) -> float:
         value += FAVOURITE_BRAND_BONUS
     if wanted_kind:
         value += WANTED_KIND_BONUS
+    if shipping.enabled:
+        value -= landed.penalty(
+            landed.landed_all(
+                shipping, deal.price_usd, row["kind"], row["domain"],
+                row["country"], eur_usd,
+            )
+        )
     return value
 
 
-def ranker(reader: Reader, min_score: int):
+def ranker(
+    reader: Reader,
+    min_score: int,
+    shipping: landed.Rules = landed.EMPTY,
+    eur_usd: float | None = None,
+):
     """A (deal, row) -> priority-or-None function for `find_deals` to sort by.
 
     None means below this reader's bar. The wanted gender is the one place that
@@ -136,7 +160,7 @@ def ranker(reader: Reader, min_score: int):
             return None
         if deal.score < bar_for(row, reader, min_score):
             return None
-        return priority(deal, row, reader)
+        return priority(deal, row, reader, shipping, eur_usd)
 
     return rank
 

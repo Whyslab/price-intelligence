@@ -359,3 +359,136 @@ class TestRouting:
         await robot.handle({"message": {"chat": {"id": 42}}})  # no sender at all
         await robot.handle({"callback_query": {"id": "1"}})    # no chat, no sender
         # Reaching here at all is the assertion: handle() swallowed both.
+
+
+class TestTheSizeList:
+    """What is left in stock, read by a person."""
+
+    def test_one_label_appears_once(self, conn):
+        """A shop selling a jacket in two colourways has "L" twice."""
+        variant_id = make_offer(conn, size="L")
+        product_id = conn.execute(
+            "SELECT product_id FROM offers WHERE variant_id = ?", (variant_id,)
+        ).fetchone()[0]
+        second = dbm.upsert_variant(
+            conn, product_id, "v-L-black", sku=None, size="L", size_norm="L", color="black"
+        )
+        dbm.record_price(conn, second, 100.0, 200.0, False, "USD", 100.0, 1.0, ts=ts())
+        assert dbm.sizes_in_stock(conn, product_id) == [("L", True)]
+
+    def test_a_label_counts_as_available_if_any_variant_is(self, conn):
+        variant_id = make_offer(conn, size="XL", in_stock=False)
+        product_id = conn.execute(
+            "SELECT product_id FROM offers WHERE variant_id = ?", (variant_id,)
+        ).fetchone()[0]
+        second = dbm.upsert_variant(
+            conn, product_id, "v-XL-red", sku=None, size="XL", size_norm="XL", color="red"
+        )
+        dbm.record_price(conn, second, 100.0, 200.0, True, "USD", 100.0, 1.0, ts=ts())
+        assert dbm.sizes_in_stock(conn, product_id) == [("XL", True)]
+
+    def test_sizes_are_ordered_the_way_they_are_read(self):
+        from pi.db import _size_order
+
+        labels = ["US10", "US2", "XL", "XS", "EU44.5", "EU44", "L"]
+        assert sorted(labels, key=_size_order) == [
+            "XS", "L", "XL", "EU44", "EU44.5", "US2", "US10",
+        ]
+
+
+class TestLandedPrice:
+    """What it costs delivered, which is what decides whether to buy."""
+
+    @staticmethod
+    def _rules():
+        from pi import landed
+
+        return landed.Rules(
+            destinations={
+                "NO": {"name": "Норвегия", "vat_pct": 25.0,
+                       "duty_pct": {"clothing": 10.7, "shoes": 0.0, "unknown": 10.7},
+                       "duty_free_usd": 0.0, "clearance_fee_usd": 15.0},
+                "UA": {"name": "Украина", "vat_pct": 20.0,
+                       "duty_pct": {"clothing": 10.0, "shoes": 10.0, "unknown": 10.0},
+                       "duty_free_eur": 150.0, "clearance_fee_usd": 0.0},
+            },
+            shipping={"US": {"NO": 35.0, "UA": 35.0}, "EU": {"NO": 20.0, "UA": 18.0}},
+            free_over={"EU": 200.0},
+            per_shop={},
+        )
+
+    def test_norway_charges_vat_from_the_first_dollar(self):
+        from pi import landed
+
+        item = landed.landed_for(self._rules(), "NO", 100.0, "shoes", "s.com", "US")
+        assert item.vat_usd == pytest.approx(25.0)
+        assert item.duty_usd == 0.0, "no duty on shoes"
+        assert item.total_usd == pytest.approx(100 + 35 + 25 + 15)
+
+    def test_norway_charges_duty_on_clothing_but_not_shoes(self):
+        from pi import landed
+
+        shoes = landed.landed_for(self._rules(), "NO", 100.0, "shoes", "s.com", "US")
+        coat = landed.landed_for(self._rules(), "NO", 100.0, "clothing", "s.com", "US")
+        assert coat.duty_usd > shoes.duty_usd == 0.0
+
+    def test_ukraine_charges_nothing_below_the_allowance(self):
+        from pi import landed
+
+        item = landed.landed_for(
+            self._rules(), "UA", 100.0, "shoes", "s.com", "US", eur_usd=1.08
+        )
+        assert (item.duty_usd, item.vat_usd) == (0.0, 0.0)
+        assert item.total_usd == pytest.approx(135.0), "only the postage"
+
+    def test_ukraine_charges_only_on_the_excess(self):
+        """The easy mistake overstates a €160 parcel sixteenfold."""
+        from pi import landed
+
+        item = landed.landed_for(
+            self._rules(), "UA", 200.0, "shoes", "s.com", "US", eur_usd=1.0
+        )
+        assert item.duty_usd == pytest.approx(5.0), "10% of the 50 above 150"
+        assert item.vat_usd == pytest.approx(11.0), "20% of excess plus duty"
+
+    def test_free_shipping_over_a_threshold_is_honoured(self):
+        from pi import landed
+
+        cheap = landed.landed_for(self._rules(), "NO", 100.0, "shoes", "s.com", "DE")
+        dear = landed.landed_for(self._rules(), "NO", 250.0, "shoes", "s.com", "DE")
+        assert cheap.shipping_usd == 20.0
+        assert dear.shipping_usd == 0.0
+
+    def test_a_shop_you_have_ordered_from_overrides_the_guess(self):
+        from pi import landed
+
+        rules = self._rules()
+        rules = landed.Rules(
+            rules.destinations, rules.shipping, rules.free_over,
+            per_shop={"s.com": {"NO": 5.0}},
+        )
+        item = landed.landed_for(rules, "NO", 100.0, "shoes", "S.com", "US")
+        assert item.shipping_usd == 5.0, "matched case-insensitively"
+
+    def test_delivery_can_move_an_offer_down_the_list_but_not_off_it(self):
+        from pi import landed
+
+        ruinous = [landed.Landed("NO", "Норвегия", 20.0, 90.0, 0.0, 0.0, 15.0)]
+        assert landed.penalty(ruinous) == landed.MAX_PENALTY
+
+    def test_the_cheaper_destination_is_the_one_judged(self):
+        """You choose where to send it, so you are not punished for the worse route."""
+        from pi import landed
+
+        items = [
+            landed.Landed("NO", "Норвегия", 100.0, 90.0, 0.0, 0.0, 15.0),
+            landed.Landed("UA", "Украина", 100.0, 5.0, 0.0, 0.0, 0.0),
+        ]
+        assert landed.penalty(items) == landed.penalty([items[1]])
+
+    def test_with_no_shipping_file_nothing_is_claimed(self, tmp_path):
+        from pi import landed
+
+        rules = landed.load_rules(tmp_path / "absent.toml")
+        assert not rules.enabled
+        assert landed.landed_all(rules, 100.0, "shoes", "s.com", "US") == []

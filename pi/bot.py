@@ -28,7 +28,9 @@ from typing import ClassVar
 import httpx
 
 from . import db as dbm
+from . import landed
 from .config import Config
+from .fx import load_rates
 from .notify import _money
 
 log = logging.getLogger(__name__)
@@ -126,7 +128,27 @@ def format_list(rows: list[sqlite3.Row], page: int, total: int, now: str) -> str
     return "\n".join(out)
 
 
-def format_card(row: sqlite3.Row, sizes: list[tuple[str, bool]], now: str) -> str:
+def format_landed(items: list) -> list[str]:
+    """What the thing costs delivered, per destination.
+
+    Both destinations, always. The sum is often what decides where to have
+    something sent, so putting one behind a button means switching back and
+    forth on every offer — and there are only two lines.
+    """
+    if not items:
+        return []
+    lines = ["", "📦 <b>С доставкой</b> <i>(оценка)</i>"]
+    for item in sorted(items, key=lambda i: i.total_usd):
+        extra = item.total_usd - item.price_usd
+        lines.append(
+            f"   {item.name}: <b>{_money(item.total_usd)}</b>"
+            f" <i>(+{_money(extra)})</i>"
+        )
+    return lines
+
+
+def format_card(row: sqlite3.Row, sizes: list[tuple[str, bool]], now: str,
+                landed: list | None = None) -> str:
     """One offer in full. The photo is sent with this as its caption."""
     shop = escape(row["store_name"] or row["domain"])
     country = f" ({row['country']})" if row["country"] else ""
@@ -148,6 +170,7 @@ def format_card(row: sqlite3.Row, sizes: list[tuple[str, bool]], now: str) -> st
         lines.append(f"   Нет: {', '.join(gone[:12])}")
     lines.append(f"🕐 Видим эту цену {_age(row['found_at'], now)}")
     lines.append(f"✅ Проверено {_age(row['checked_at'], now)}")
+    lines.extend(format_landed(landed or []))
     return "\n".join(lines)
 
 
@@ -241,6 +264,12 @@ class Bot:
         self.conn = conn
         self.offset = 0
         self._client: httpx.AsyncClient | None = None
+        self.shipping = landed.load_rules()
+        # Only needed to turn Ukraine's €150 allowance into the dollars
+        # everything else is in. Read from the same cache the sweep writes, so
+        # the bot never fetches a rate of its own.
+        rates = load_rates(config.db_path.parent / "fx_cache.json")
+        self.eur_usd = rates.to_usd(1.0, "EUR")[0] if rates.to_usd(1.0, "EUR") else None
 
     # -- transport --
 
@@ -319,7 +348,7 @@ class Bot:
         row = self.conn.execute(
             """
             SELECT o.*, v.size_norm, v.size, p.title, p.url, p.image_url, p.brand,
-                   p.brand_norm, s.domain, s.name AS store_name, s.country
+                   p.brand_norm, p.kind, s.domain, s.name AS store_name, s.country
               FROM offers o
               JOIN variants v ON v.id = o.variant_id
               JOIN products p ON p.id = o.product_id
@@ -334,7 +363,13 @@ class Bot:
             await self.send(chat_id, "Это предложение уже закончилось.")
             return
         now = dbm.utcnow()
-        caption = format_card(row, dbm.sizes_in_stock(self.conn, row["product_id"]), now)
+        delivered = landed.landed_all(
+            self.shipping, row["price_usd"], row["kind"], row["domain"],
+            row["country"], self.eur_usd,
+        )
+        caption = format_card(
+            row, dbm.sizes_in_stock(self.conn, row["product_id"]), now, delivered
+        )
         keyboard = card_keyboard(row, page)
         if row["image_url"] and await self.send_photo(
             chat_id, row["image_url"], caption, keyboard

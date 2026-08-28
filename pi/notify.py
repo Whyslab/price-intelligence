@@ -89,6 +89,7 @@ def format_caption(
     country: str | None = None,
     native_price: float | None = None,
     currency: str = "USD",
+    landed: list | None = None,
     limit: int = CAPTION_LIMIT,
 ) -> str:
     """Build the HTML body of a deal notification."""
@@ -148,6 +149,16 @@ def format_caption(
     age = _age(deal.dropped_hours_ago)
     if age:
         lines.append(f"🕐 {age}")
+
+    # Cheapest route first, and only the cheapest named in full: a caption is
+    # capped at 1024 characters and this is the last thing that should push the
+    # link out of it.
+    for item in sorted(landed or [], key=lambda i: i.total_usd)[:2]:
+        extra = item.total_usd - item.price_usd
+        lines.append(
+            f"📦 {item.name}: {_money(item.total_usd)} с доставкой "
+            f"(+{_money(extra)}, оценка)"
+        )
 
     lines.append("")
     lines.append(f"🔗 {escape(url)}")

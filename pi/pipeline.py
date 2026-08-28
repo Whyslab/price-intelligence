@@ -16,7 +16,7 @@ import httpx
 
 from . import db as dbm
 from . import deals as dealm
-from . import personal, reference, taxonomy, tls
+from . import landed, personal, reference, taxonomy, tls
 from .config import Config
 from .domains import same_shop
 from .fx import Rates, load_rates
@@ -540,7 +540,13 @@ def seed_alerts(conn: sqlite3.Connection, config: Config, dry_run: bool = False)
     return len(candidates)
 
 
-def caption_for(deal: dealm.Deal, row: sqlite3.Row, conn: sqlite3.Connection) -> str:
+def caption_for(
+    deal: dealm.Deal,
+    row: sqlite3.Row,
+    conn: sqlite3.Connection,
+    shipping: landed.Rules = landed.EMPTY,
+    eur_usd: float | None = None,
+) -> str:
     point = dbm.latest_point(conn, deal.variant_id)
     return format_caption(
         deal,
@@ -553,6 +559,10 @@ def caption_for(deal: dealm.Deal, row: sqlite3.Row, conn: sqlite3.Connection) ->
         country=row["country"],
         native_price=point["price_native"] if point else None,
         currency=point["currency"] if point else "USD",
+        landed=landed.landed_all(
+            shipping, deal.price_usd, row["kind"], row["domain"],
+            row["country"], eur_usd,
+        ),
     )
 
 
@@ -753,9 +763,13 @@ async def run(
         # when it is properly cheap, and a brand nobody named still arrives at
         # all — a hard list fails exactly on what is not in it.
         reader = personal.reader_for(conn, config.chat_id, config.filters)
+        shipping = landed.load_rules()
+        eur = rates.to_usd(1.0, "EUR")
+        eur_usd = eur[0] if eur else None
         candidates = find_deals(
             conn, scorable, shelf_config(config), market=market, trust=trust,
-            watched=watching, rank=personal.ranker(reader, config.filters.min_score),
+            watched=watching,
+            rank=personal.ranker(reader, config.filters.min_score, shipping, eur_usd),
         )
         cap = limit if limit is not None else config.filters.max_alerts_per_run
         selected = candidates[:cap]
@@ -776,7 +790,7 @@ async def run(
         if dry_run:
             for deal, row in selected:
                 print("-" * 60)
-                print(caption_for(deal, row, conn))
+                print(caption_for(deal, row, conn, shipping, eur_usd))
                 print(f"[score {deal.score} · image {'yes' if row['image_url'] else 'no'}]")
             _finish_run(conn, run_id, stats)
             return stats
@@ -791,7 +805,9 @@ async def run(
                 # Claim the alert first: a crash mid-send must not cause a repeat.
                 if not dealm.record_alert(conn, deal, dbm.utcnow()):
                     continue
-                if await telegram.send_deal(caption_for(deal, row, conn), row["image_url"]):
+                if await telegram.send_deal(
+                    caption_for(deal, row, conn, shipping, eur_usd), row["image_url"]
+                ):
                     stats.alerts_sent += 1
                 else:
                     conn.execute(
