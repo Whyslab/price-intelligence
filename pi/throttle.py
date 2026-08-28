@@ -151,6 +151,11 @@ class RateLimiter:
         self.penalties = 0
         self.successes = 0
         self.blocked_at: float | None = None
+        # How many callers gave up after waiting a suspected block out. Sticky,
+        # unlike `blocked_at`, which a later success clears — otherwise a run that
+        # abandoned nineteen stores and then recovered would report no trouble
+        # at all.
+        self.abandoned = 0
 
     @property
     def rate(self) -> float:
@@ -177,6 +182,7 @@ class RateLimiter:
         while (started := self.blocked_at) is not None:
             left = CONFIRM_WINDOW - (time.monotonic() - started)
             if left <= 0:
+                self.abandoned += 1
                 return True
             await asyncio.sleep(min(left, 0.5))
         return False
@@ -275,6 +281,7 @@ class NullLimiter:
     penalties = 0
     rate = float("inf")
     blocked = False
+    abandoned = 0
 
     async def confirm_blocked(self) -> bool:
         return False

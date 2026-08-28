@@ -520,11 +520,14 @@ async def run(
                     )
                 await asyncio.sleep(1.0)  # Telegram allows ~30 messages/second; be calm
 
-    if limiter.blocked:
+    if limiter.abandoned:
+        # Counted, not read off `limiter.blocked`: a success late in the sweep
+        # lifts the block, and a run that had already given up on nineteen stores
+        # would then report a clean sheet.
         conn.execute("UPDATE runs SET blocked = 1 WHERE id = ?", (run_id,))
         log.error(
-            "Shopify blocked this IP part-way through; %d store(s) were skipped and "
-            "will be collected on the next run", stats.stores_failed,
+            "Shopify blocked this IP part-way through; %d store(s) waited it out and "
+            "were skipped, and will be collected on the next run", limiter.abandoned,
         )
     elif limiter.penalties:
         log.warning(

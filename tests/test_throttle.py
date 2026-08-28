@@ -325,6 +325,20 @@ class TestConfirmingABlock:
         assert all(results)
         assert time.monotonic() - start < 0.6, "fifteen waiters, one window"
 
+    async def test_giving_up_is_remembered_even_after_the_block_lifts(self, monkeypatch):
+        """A run that abandoned nineteen stores and then recovered must not
+        report a clean sheet."""
+        monkeypatch.setattr("pi.throttle.CONFIRM_WINDOW", 0.05)
+        limiter = RateLimiter(rate=1000.0, per_host_rate=1000.0, cooldown=0.001)
+        give_it_a_sample(limiter)
+        for n in range(4):
+            await limiter.penalise(host=f"shop{n}.example")
+        assert await limiter.confirm_blocked() is True
+
+        limiter.note_success("late.example")
+        assert not limiter.blocked, "the block itself is lifted"
+        assert limiter.abandoned == 1, "but the store it cost is still counted"
+
     async def test_nothing_to_confirm_when_there_is_no_block(self):
         limiter = RateLimiter(rate=1000.0, per_host_rate=1000.0)
         assert await limiter.confirm_blocked() is False
