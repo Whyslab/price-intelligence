@@ -121,6 +121,15 @@ CREATE TABLE IF NOT EXISTS runs (
     -- reconsider the deals that did not fit.
     capped         INTEGER NOT NULL DEFAULT 0,
     blocked        INTEGER NOT NULL DEFAULT 0,
+    -- How many Shopify shops this run allowed itself. Recorded because the next
+    -- run reads it: the budget adapts to how the last one went, and a number
+    -- that only lived in a log cannot be adapted from.
+    shopify_budget INTEGER,
+    -- 'sweep' for a run that took its own turn from the queue, 'stores' for one
+    -- given a list by hand. Only sweeps are comparable to each other, and the
+    -- degradation check compares runs: a hand-run `--stores one.com` collecting
+    -- one shop is not a collector that has stopped working.
+    scope          TEXT NOT NULL DEFAULT 'sweep',
     note           TEXT
 );
 

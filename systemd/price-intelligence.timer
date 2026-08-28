@@ -1,10 +1,16 @@
 [Unit]
-Description=Run Price Intelligence every 6 hours
+Description=Run Price Intelligence every hour
 
 [Timer]
-OnCalendar=*-*-* 00,06,12,18:15:00
-# Do not let every install hit the same shops at the same second.
-RandomizedDelaySec=10min
+# Hourly, not six-hourly. The limit on collection is Shopify's per-IP quota,
+# which a run of twenty-odd shops fits inside either way — so asking four times
+# as often costs the same traffic and makes every shop's prices four times
+# fresher. Which shops each run takes is decided by the queue, not the clock:
+# shops that have found something recently come round every hour, the rest once
+# a day.
+OnCalendar=*-*-* *:15:00
+# Spread the start so every shop is not asked at the same second past the hour.
+RandomizedDelaySec=5min
 # If the machine was asleep at the scheduled time, run once it wakes.
 Persistent=yes
 Unit=price-intelligence.service

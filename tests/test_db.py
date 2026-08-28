@@ -1,6 +1,8 @@
 """Storage behaviour: idempotent upserts and change-only price history."""
 from __future__ import annotations
 
+import sqlite3
+
 from pi import db as dbm
 
 from .conftest import ts
@@ -192,3 +194,75 @@ class TestSweepOrder:
 
         nxt = [s["domain"] for s in dbm.get_stores(conn, platforms=("shopify",))][:3]
         assert set(nxt).isdisjoint({s["domain"] for s in first_half})
+
+
+class TestMigrationCoverage:
+    """If a column were missing from an old database, would migration restore it?
+
+    Asked this way round on purpose. The obvious test — make a database, stamp
+    an old version on it, migrate — proves nothing: the database was built from
+    schema.sql and already has every column, so it passes whether or not the
+    migration knows about them. This one takes columns *away* and checks they
+    come back, which is the thing that actually happens to a database that has
+    been in use since before they existed.
+
+    Both bugs it guards against were live. A new index was created over a column
+    that did not exist yet, because schema.sql is replayed before the ALTERs
+    run. And a column added to schema.sql was never registered as one an
+    existing database needs, so `runs.scope` never appeared in the live
+    database while every test passed.
+    """
+
+    @staticmethod
+    def _columns(conn, table: str) -> set[str]:
+        return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+
+    @staticmethod
+    def _tables(conn) -> list[str]:
+        return [
+            row["name"]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' "
+                "AND name NOT LIKE 'sqlite_%'"
+            )
+        ]
+
+    def test_a_column_taken_away_is_put_back(self, tmp_path):
+        reference = dbm.connect(tmp_path / "reference.db")
+        wanted = {table: self._columns(reference, table) for table in self._tables(reference)}
+        reference.close()
+
+        checked = 0
+        for table, columns in wanted.items():
+            for column in columns:
+                path = tmp_path / f"{table}_{column}.db"
+                conn = dbm.connect(path)
+                try:
+                    conn.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
+                except sqlite3.OperationalError:
+                    # Primary keys, indexed and UNIQUE columns cannot be dropped.
+                    # They are also the original ones, so no migration adds them.
+                    conn.close()
+                    continue
+                conn.execute("PRAGMA user_version = 1")
+                conn.close()
+                checked += 1
+
+                migrated = dbm.connect(path)
+                assert column in self._columns(migrated, table), (
+                    f"migration did not restore {table}.{column} — a database in "
+                    f"use since before it existed will not have it either"
+                )
+                migrated.close()
+
+        assert checked > 0, "the test dropped nothing, so it proved nothing"
+
+    def test_migrating_leaves_the_data_alone(self, tmp_path):
+        conn = dbm.connect(tmp_path / "old.db")
+        conn.execute("INSERT INTO stores (domain) VALUES ('shop.example')")
+        conn.execute("PRAGMA user_version = 1")
+        conn.close()
+
+        migrated = dbm.connect(tmp_path / "old.db")
+        assert migrated.execute("SELECT COUNT(*) FROM stores").fetchone()[0] == 1
+        assert migrated.execute("PRAGMA user_version").fetchone()[0] == dbm.SCHEMA_VERSION
