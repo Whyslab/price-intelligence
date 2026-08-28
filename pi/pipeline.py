@@ -15,7 +15,7 @@ import httpx
 
 from . import db as dbm
 from . import deals as dealm
-from . import reference, tls
+from . import reference, taxonomy, tls
 from .config import Config
 from .domains import same_shop
 from .fx import Rates, load_rates
@@ -143,10 +143,17 @@ async def collect_store(
 
 def store_result(
     conn: sqlite3.Connection, store_id: int, result: FetchResult, rates: Rates
-) -> tuple[int, list[int]]:
-    """Persist one store's catalogue. Returns (points_written, changed_variant_ids)."""
+) -> tuple[int, list[int], list[int]]:
+    """Persist one store's catalogue.
+
+    Returns (points_written, changed_variant_ids, product_ids). The product ids
+    are what the run classifies afterwards: brand, gender and kind are derived
+    from the title, the category and the sizes, so they can only be worked out
+    once all three are in the database.
+    """
     written = 0
     changed: list[int] = []
+    touched: list[int] = []
     currency = (result.currency or "USD").upper()
     ts = dbm.utcnow()
 
@@ -155,6 +162,7 @@ def store_result(
             conn, store_id, product.external_id, product.title, product.url,
             brand=product.brand, image_url=product.image_url, category=product.category,
         )
+        touched.append(product_id)
         # The handles this product can be recognised by in other shops. Written
         # every time because titles and SKUs get edited, and a stale key would
         # quietly match the wrong shoe.
@@ -185,7 +193,7 @@ def store_result(
             ):
                 written += 1
                 changed.append(variant_id)
-    return written, changed
+    return written, changed, touched
 
 
 CANDIDATES_SQL = """
@@ -523,6 +531,7 @@ async def run(
     }
     limiter = RateLimiter(rate=config.shopify_rate, per_host_rate=config.shopify_host_rate)
     changed: list[int] = []
+    classified: list[int] = []
     # A store being read for the first time has every standing sale look brand
     # new. That first pass is a baseline, not news: record the prices, announce
     # nothing, and let the next run report what actually moved.
@@ -560,7 +569,8 @@ async def run(
                 continue
 
             with dbm.transaction(conn):
-                written, ids = store_result(conn, store["id"], result, rates)
+                written, ids, products = store_result(conn, store["id"], result, rates)
+            classified.extend(products)
             if store["id"] not in first_sight:
                 changed.extend(ids)
             stats.stores_ok += 1
@@ -583,6 +593,11 @@ async def run(
                 store["domain"], len(result.products), written,
                 "" if result.complete else f" (partial, resuming at {result.next_cursor})",
             )
+
+        # Before scoring, so a deal is judged with the product already known to
+        # be a women's shoe rather than an unclassified row.
+        if classified:
+            taxonomy.classify(conn, classified)
 
         if collect_only:
             _finish_run(conn, run_id, stats)

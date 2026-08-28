@@ -39,9 +39,18 @@ CREATE TABLE IF NOT EXISTS products (
     url         TEXT    NOT NULL,
     image_url   TEXT,
     category    TEXT,
+    -- What the shop wrote (brand, category) versus what we made of it. The raw
+    -- columns stay untouched so a better classifier can be re-run against them:
+    -- `pi reclassify` rewrites everything below and nothing above.
+    brand_norm   TEXT,   -- canonical spelling, NULL when no other shop corroborates it
+    brand_family TEXT,   -- Jordan's family is Nike; what a brand filter matches on
+    gender       TEXT,   -- 'men' | 'women' | NULL, and NULL means the shop did not say
+    kind         TEXT,   -- 'shoes' | 'clothing' | 'accessories' | NULL
     UNIQUE (store_id, external_id)
 );
 CREATE INDEX IF NOT EXISTS ix_products_brand ON products(brand);
+CREATE INDEX IF NOT EXISTS ix_products_brand_family ON products(brand_family);
+CREATE INDEX IF NOT EXISTS ix_products_kind ON products(kind, gender);
 
 CREATE TABLE IF NOT EXISTS variants (
     id          INTEGER PRIMARY KEY,
