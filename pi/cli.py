@@ -9,7 +9,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from . import db as dbm
-from . import pipeline
+from . import pipeline, reference
 from .config import Config, load_config
 from .domains import same_host
 from .notify import Telegram
@@ -159,6 +159,43 @@ def cmd_seed(args, config: Config) -> int:
     return 0
 
 
+def cmd_reindex(args, config: Config) -> int:
+    """Rebuild the keys products are matched by between shops.
+
+    A normal run keeps them current for what it collects; this fills them in for
+    a catalogue gathered before the keys existed, and re-derives them all after a
+    change to how they are extracted.
+    """
+    conn = dbm.connect(config.db_path)
+    rows = conn.execute(
+        """
+        SELECT p.id, p.brand, p.title, group_concat(v.sku, char(10)) AS skus
+        FROM products p LEFT JOIN variants v ON v.product_id = p.id
+        GROUP BY p.id
+        """
+    ).fetchall()
+    keyed = 0
+    with dbm.transaction(conn):
+        for row in rows:
+            keys = reference.keys_for(
+                row["brand"], row["title"], (row["skus"] or "").split("\n")
+            )
+            dbm.set_product_keys(conn, row["id"], keys)
+            keyed += bool(keys)
+    shared = conn.execute(
+        """
+        SELECT COUNT(*) FROM (
+            SELECT k.key_type, k.key FROM product_keys k
+            JOIN products p ON p.id = k.product_id
+            GROUP BY k.key_type, k.key HAVING COUNT(DISTINCT p.store_id) > 1
+        )
+        """
+    ).fetchone()[0]
+    print(f"{len(rows):,} товаров, у {keyed:,} есть опознавательные ключи")
+    print(f"{shared:,} ключей встречаются больше чем в одном магазине")
+    return 0
+
+
 def cmd_prune(args, config: Config) -> int:
     conn = dbm.connect(config.db_path)
     before = config.db_path.stat().st_size if config.db_path.exists() else 0
@@ -223,6 +260,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--no-vacuum", action="store_true", help="skip VACUUM (faster, frees nothing)")
     p.set_defaults(func=cmd_prune)
+
+    p = sub.add_parser(
+        "reindex",
+        help="rebuild the article numbers products are matched by between shops",
+    )
+    p.set_defaults(func=cmd_reindex)
 
     p = sub.add_parser("health", help="collection health summary")
     p.add_argument("--send", action="store_true", help="send it to Telegram")

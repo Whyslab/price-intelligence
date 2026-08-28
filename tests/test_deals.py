@@ -7,12 +7,17 @@ import pytest
 
 from pi import deals
 from pi.config import Filters
+from pi.reference import Market, Trust
 
 from .conftest import make_history, ts
 
 
-def test_tagged_discount_alone_is_enough_on_a_fresh_database(filters):
-    """First ever sighting: only the shop's struck-through price exists."""
+def test_tagged_discount_alone_is_the_last_resort_not_the_first(filters):
+    """First ever sighting from a shop nobody else stocks: only the tag exists.
+
+    It still counts — otherwise a new product could never be reported — but it
+    earns no corroboration bonus, so it has to be a large discount on its own.
+    """
     history = make_history([(120.0, 220.0, 0)])
     deal = deals.evaluate(1, 1, 120.0, 220.0, True, history, filters)
 
@@ -23,8 +28,34 @@ def test_tagged_discount_alone_is_enough_on_a_fresh_database(filters):
     assert not deal.all_time_low
 
 
+def test_a_modest_tagged_discount_no_longer_clears_the_bar(filters):
+    """Every one of the 520 notifications ever sent rested on the tag alone.
+
+    An uncorroborated tag earns no bonus, so at the default threshold it now has
+    to be a larger discount to be worth sending. The very same 30% backed by
+    other shops still goes out — the bar moved for the evidence, not the price.
+    """
+    from pi.reference import Market
+
+    history = make_history([(210.0, 300.0, 0)])
+    assert deals.evaluate(1, 1, 210.0, 300.0, True, history, filters) is None
+
+    corroborated = deals.evaluate(
+        1, 1, 210.0, 300.0, True, history, filters,
+        market=Market(median_usd=300.0, low_usd=290.0, shops=5),
+    )
+    assert corroborated is not None
+    assert corroborated.reference_source == "market"
+
+
 def test_recorded_history_outranks_the_shops_claim(filters):
-    """With enough history of our own, the median is the reference, not the tag."""
+    """With history of our own, the shop's own floor is the reference, not the tag.
+
+    The lowest price actually charged in the window, not the median of the
+    recorded points: points are change events, so a price that stood for six
+    months is one row and a week of jitter is five, and a median reads the week
+    as the norm.
+    """
     history = make_history(
         [(210.0, 400.0, 40), (200.0, 400.0, 30), (190.0, 400.0, 20),
          (200.0, 400.0, 10), (120.0, 400.0, 0)]
@@ -33,9 +64,9 @@ def test_recorded_history_outranks_the_shops_claim(filters):
 
     assert deal is not None
     assert deal.reference_source == "history"
-    # 200 is the median of the four earlier prices, not the 400 the shop claims
-    assert deal.reference_usd == pytest.approx(200.0)
-    assert deal.discount_pct == pytest.approx(40.0, abs=0.1)
+    # 190 was really charged inside the window; 400 is what the shop says.
+    assert deal.reference_usd == pytest.approx(190.0)
+    assert deal.discount_pct == pytest.approx(36.8, abs=0.1)
     assert deal.all_time_low
 
 
@@ -174,3 +205,85 @@ def test_first_sighting_makes_no_claim_about_when_the_price_dropped(filters):
     deal = deals.evaluate(1, 1, 120.0, 300.0, True, make_history([(120.0, 300.0, 0)]), filters)
     assert deal is not None
     assert deal.dropped_hours_ago is None
+
+
+class TestAnInflatedReferencePrice:
+    """The shop that raises a price in order to discount it back.
+
+    Every mechanism here answers the same question a different way: what was this
+    actually selling for before the sign went up?
+    """
+
+    def test_a_price_raised_and_dropped_back_is_not_a_discount(self, filters):
+        """200 for two months, 300 for a week, 200 again — and the shop calls the
+        last step a 33% saving. Its own floor says otherwise."""
+        history = make_history(
+            [(200.0, None, 60), (300.0, 300.0, 7), (200.0, 300.0, 0)]
+        )
+        assert deals.evaluate(1, 1, 200.0, 300.0, True, history, filters) is None
+
+    def test_the_same_shop_dropping_below_its_floor_is_a_discount(self, filters):
+        """The mechanism must not simply refuse everything after a price rise."""
+        history = make_history(
+            [(200.0, None, 60), (300.0, 300.0, 7), (130.0, 300.0, 0)]
+        )
+        deal = deals.evaluate(1, 1, 130.0, 300.0, True, history, filters)
+        assert deal is not None
+        assert deal.reference_source == "history"
+        assert deal.reference_usd == pytest.approx(200.0), "not the 300 it invented"
+        assert deal.discount_pct == pytest.approx(35.0, abs=0.1)
+
+    def test_a_price_above_the_market_is_not_a_discount(self, filters):
+        """Whatever it is marked down from, it is not cheap if five other shops
+        are asking less for the same article number."""
+        history = make_history([(200.0, 400.0, 0)])
+        market = Market(median_usd=170.0, low_usd=150.0, shops=5)
+        assert deals.evaluate(1, 1, 200.0, 400.0, True, history, filters, market=market) is None
+
+    def test_the_market_becomes_the_reference_when_there_is_no_history(self, filters):
+        """2.75 million of 2.76 million variants have been seen exactly once, so
+        this is the signal that works on the database as it actually is."""
+        history = make_history([(120.0, None, 0)])
+        market = Market(median_usd=200.0, low_usd=180.0, shops=6)
+        deal = deals.evaluate(1, 1, 120.0, None, True, history, filters, market=market)
+        assert deal is not None
+        assert deal.reference_source == "market"
+        assert deal.reference_usd == pytest.approx(200.0)
+        assert deal.beats_market, "cheaper than every shop we can see"
+
+    def test_a_tag_far_above_the_recommended_price_is_not_used(self, filters):
+        """Six shops strike through 200; this one strikes through 300. The 300 is
+        this shop's invention, so it is not a reference for anything."""
+        history = make_history([(190.0, 300.0, 0)])
+        market = Market(msrp_usd=200.0, msrp_shops=6)
+        deal = deals.evaluate(1, 1, 190.0, 300.0, True, history, filters, market=market)
+        assert deal is None or deal.reference_source != "tag"
+
+    def test_the_recommended_price_is_used_when_the_tag_is_not(self, filters):
+        history = make_history([(120.0, 300.0, 0)])
+        market = Market(msrp_usd=200.0, msrp_shops=6)
+        deal = deals.evaluate(1, 1, 120.0, 300.0, True, history, filters, market=market)
+        assert deal is not None
+        assert deal.reference_source == "msrp"
+        assert deal.reference_usd == pytest.approx(200.0)
+        assert deal.inflated_tag
+
+    def test_a_shop_that_computes_its_discounts_proves_nothing(self, filters):
+        """The last twelve notifications sent were one shop, all at -40%, from a
+        catalogue whose every discount lands on a round 5% step."""
+        history = make_history([(98.0, 163.0, 0)])
+        by_rule = Trust(
+            tag_share=0.64, round_share=1.0, blanket_pct=40.0, blanket_share=0.27,
+            sample=10552, tagged=6763,
+        )
+        assert deals.evaluate(1, 1, 98.0, 163.0, True, history, filters, trust=by_rule) is None
+
+    def test_the_same_numbers_from_a_shop_that_remembers_former_prices(self, filters):
+        history = make_history([(98.0, 163.0, 0)])
+        honest = Trust(
+            tag_share=0.38, round_share=0.21, blanket_pct=29.0, blanket_share=0.08,
+            sample=4346, tagged=1650,
+        )
+        deal = deals.evaluate(1, 1, 98.0, 163.0, True, history, filters, trust=honest)
+        assert deal is not None
+        assert deal.reference_source == "tag"

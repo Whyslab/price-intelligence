@@ -246,11 +246,11 @@ class TestTheConvoy:
 
     async def test_identical_pauses_come_back_at_different_times(self):
         limiter = RateLimiter(rate=10_000.0, per_host_rate=10_000.0, cooldown=0.05)
+        start = time.monotonic()
         for n in range(8):
             await limiter.penalise(host=f"shop{n}.example")
 
         async def when(host):
-            start = time.monotonic()
             await limiter.acquire(host)
             return time.monotonic() - start
 

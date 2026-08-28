@@ -18,6 +18,39 @@ min_score = 55
 
 # At most this many notifications per run (runs happen every 6 hours).
 max_alerts_per_run = 15
+# And at most this many from any one shop. A shop that puts -40% on its whole
+# catalogue otherwise fills the whole run on its own: twelve notifications in a
+# row, every one of them the same shop at the same percentage.
+max_alerts_per_store = 3
+
+# --- what counts as the price it was before ----------------------------------
+# The reference is the lowest price the shop actually charged in this many days
+# before the drop. This is the EU's formula, and it is what a price raised last
+# week to be "discounted" this week cannot survive: 200 put up to 300 for seven
+# days and back to 200 leaves the floor at 200, so the discount is zero.
+reference_window_days = 30
+
+# Products are matched between shops on the manufacturer's article number, so a
+# price can be judged against what everyone else is asking even with no history
+# at all. Both settings are counts of *other* shops that must stock the article.
+market_min_shops = 3   # before their prices are treated as the market price
+msrp_min_shops   = 3   # before their struck-through prices imply an RRP
+
+# A struck-through price this many percent above that RRP is the shop's own
+# invention, and is not used as a reference at all.
+inflated_tag_pct = 15
+
+# A shop whose discounts nearly all land on a round 5% step is applying "-40% to
+# this category", not remembering what things used to cost: a real former price
+# produces 36.4% and 22.8%, and lands on a round step about as often as chance
+# allows. Measured across 78 shops, individual pricing sits near 55% and rule
+# pricing at 100%. Above this share, the shop's struck-through prices stop
+# counting as evidence.
+rule_priced_share = 0.9
+
+# The same conclusion from a different shape: this share of the catalogue sitting
+# at one identical percentage, round or not.
+blanket_sale_share = 0.3
 
 # A struck-through price that has not moved in this many days is not a sale,
 # it is the normal price with decoration. Such deals are scored down heavily.

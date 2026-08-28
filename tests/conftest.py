@@ -36,10 +36,13 @@ def ts(days_ago: float = 0) -> str:
     return moment.isoformat(timespec="seconds")
 
 
-def make_history(points: list[tuple[float, float | None, float]]) -> list[sqlite3.Row]:
+def make_history(
+    points: list[tuple[float, float | None, float]], currency: str = "USD"
+) -> list[sqlite3.Row]:
     """Build price history rows from (price, compare_at, days_ago) tuples.
 
-    Returned oldest-first, the order pi.deals.evaluate expects.
+    Returned oldest-first, the order pi.deals.evaluate expects. A point may carry
+    its own currency as a fourth element, for the cases where a shop switched.
     """
     scratch = sqlite3.connect(":memory:")
     scratch.row_factory = sqlite3.Row
@@ -48,11 +51,13 @@ def make_history(points: list[tuple[float, float | None, float]]) -> list[sqlite
         " in_stock INT, currency TEXT, price_native REAL, compare_at_native REAL,"
         " fx_rate REAL)"
     )
-    for price, compare, days_ago in points:
-        # USD at a rate of 1.0, so the native and dollar columns coincide and a
-        # test can keep talking in the one set of numbers it cares about.
+    for point in points:
+        price, compare, days_ago = point[:3]
+        money = point[3] if len(point) > 3 else currency
+        # A rate of 1.0, so the native and dollar columns coincide and a test can
+        # keep talking in the one set of numbers it cares about.
         scratch.execute(
-            "INSERT INTO p VALUES (1, ?, ?, ?, 1, 'USD', ?, ?, 1.0)",
-            (ts(days_ago), price, compare, price, compare),
+            "INSERT INTO p VALUES (1, ?, ?, ?, 1, ?, ?, ?, 1.0)",
+            (ts(days_ago), price, compare, money, price, compare),
         )
     return scratch.execute("SELECT * FROM p ORDER BY ts").fetchall()

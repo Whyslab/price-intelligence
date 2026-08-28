@@ -21,6 +21,59 @@ def a_deal(**overrides) -> Deal:
     return Deal(**{**base, **overrides})
 
 
+class TestWhereTheWasPriceCameFrom:
+    """"было 300" reads the same whether the 300 is the brand's recommendation,
+    what five other shops charge, or what this shop typed on the label on Tuesday.
+    The caption has to say which."""
+
+    def test_the_shops_own_floor(self):
+        caption = notify.format_caption(
+            a_deal(reference_source="history", reference_usd=200.0),
+            title="T", url="https://u",
+        )
+        assert "минимум за 30 дней" in caption
+
+    def test_what_other_shops_charge(self):
+        caption = notify.format_caption(
+            a_deal(reference_source="market", reference_usd=200.0, market_shops=6),
+            title="T", url="https://u",
+        )
+        assert "в других магазинах" in caption
+        assert "6" in caption
+
+    def test_the_recommended_price(self):
+        caption = notify.format_caption(
+            a_deal(reference_source="msrp", reference_usd=200.0, market_shops=5),
+            title="T", url="https://u",
+        )
+        assert "рекомендованная" in caption
+
+    def test_the_shops_own_label_is_named_as_such(self):
+        caption = notify.format_caption(a_deal(), title="T", url="https://u")
+        assert "зачёркнуто в магазине" in caption
+
+    def test_an_inflated_label_is_called_out(self):
+        caption = notify.format_caption(
+            a_deal(reference_source="msrp", reference_usd=200.0, market_shops=6,
+                   inflated_tag=True, msrp_usd=200.0),
+            title="T", url="https://u",
+        )
+        assert "выше рекомендованной" in caption
+
+    def test_a_shop_that_computes_its_discounts_is_called_out(self):
+        caption = notify.format_caption(
+            a_deal(rule_priced=True), title="T", url="https://u"
+        )
+        assert "по правилу" in caption
+
+    def test_being_cheaper_than_everyone_is_worth_saying(self):
+        caption = notify.format_caption(
+            a_deal(reference_source="history", beats_market=True, market_shops=7),
+            title="T", url="https://u",
+        )
+        assert "Дешевле, чем в других магазинах" in caption
+
+
 class TestCaption:
     def test_carries_everything_the_reader_needs(self):
         caption = notify.format_caption(

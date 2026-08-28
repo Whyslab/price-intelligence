@@ -25,9 +25,31 @@ class Filters:
     max_price_usd: float = 2000.0
     min_score: int = 55
     max_alerts_per_run: int = 15
+    # One shop running "-40% on everything" produced twelve consecutive
+    # notifications, all at the same percentage. That is one fact, not twelve.
+    max_alerts_per_store: int = 3
     # A "sale" whose struck-through price has not moved for this many days is
     # permanent pricing dressed up as a discount.
     fake_sale_days: int = 21
+    # The window for "the lowest price this shop actually charged before the
+    # drop" — the EU's formula, and the one thing a price inflated last week
+    # cannot survive.
+    reference_window_days: int = 30
+    # How many *other* shops must stock the same article before their prices are
+    # treated as a market price, and before their tags imply a recommended one.
+    market_min_shops: int = 3
+    msrp_min_shops: int = 3
+    # A struck-through price this far above the recommended one is the shop's
+    # invention, not the brand's.
+    inflated_tag_pct: float = 15.0
+    # Share of a shop's discounts that land on a round 5% step before its
+    # struck-through prices are read as arithmetic rather than as former prices.
+    # Measured across 78 shops: shops pricing individually sit near 55%, shops
+    # applying "-40% to this category" sit at 100%.
+    rule_priced_share: float = 0.9
+    # Share of a shop's catalogue sitting at one identical discount, round or
+    # not, before the same conclusion is drawn.
+    blanket_sale_share: float = 0.3
     brands_allow: tuple[str, ...] = ()
     brands_deny: tuple[str, ...] = ()
     sizes: tuple[str, ...] = ()

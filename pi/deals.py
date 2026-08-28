@@ -1,29 +1,44 @@
 """Deciding whether a price is actually a good deal.
 
-The struck-through price a shop shows is marketing copy, not evidence — plenty
-of stores keep an inflated "was" price up permanently. So a discount has to be
-corroborated. Three independent signals feed the score:
+The struck-through price a shop shows is marketing copy, not evidence. It is
+also the only reference that costs nothing to produce, which is why it used to
+be the answer: on the live database 520 notifications went out and every single
+one of them rested on it alone, because the checks meant to outrank it needed
+four price points and seven days of history, and 2,749,975 variants out of
+2,762,842 had been seen exactly once.
 
-1. the shop's own struck-through price,
-2. the price against the median of what *we* recorded for that variant,
-3. whether the price is the lowest we have ever seen.
+So the reference price is chosen from `pi.reference`, in descending order of how
+hard it is to fake, and the shop's own tag comes last:
 
-Signal 2 needs no cooperation from the shop and cannot be gamed by it, so it
-outranks signal 1 whenever there is enough history to use it. On a fresh
-database only signal 1 exists, which is why it still counts on its own.
+1. the lowest price this shop actually charged in the 30 days before the drop,
+2. what other shops charge for the same article number right now,
+3. the recommended price, read as the mode of many shops' struck-through prices,
+4. the shop's own tag — and only from a shop that has not disqualified itself.
+
+The first one is decisive when it exists. If a shop's price has not fallen below
+its own recent floor, it has not dropped its price, whatever the tag says: put
+200 up to 300 for a week and back to 200 and the floor is still 200. Falling
+through to the market or the tag there would reinstate exactly the fiction the
+floor exists to catch.
+
+Two vetoes sit in front of all of it. A price above what other shops are asking
+is not a discount, whatever it is marked down from. And a tag more than
+`inflated_tag_pct` above the recommended price — or from a shop running the same
+percentage across its whole catalogue — is not evidence of anything.
 """
 from __future__ import annotations
 
 import math
 import sqlite3
-import statistics
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 from .config import Filters
+from .reference import Market, Trust, prior_floor
 
-# Enough recorded history to trust the median over the shop's own claim.
-MIN_HISTORY_POINTS = 3
+# How much of the reference window has to be covered by observations before the
+# floor it produces is worth believing. A "30-day low" drawn from two days of
+# data is a two-day low wearing the wrong name.
 MIN_HISTORY_DAYS = 7
 BUCKET_RATIO = 1.05   # bucket width, used only for the UNIQUE backstop
 RE_ALERT_DROP = 0.95  # a repeat needs the price at least 5% below the last alert
@@ -45,7 +60,7 @@ class Deal:
     product_id: int
     price_usd: float
     reference_usd: float
-    reference_source: str        # "history" | "tag"
+    reference_source: str        # "history" | "market" | "msrp" | "tag"
     discount_pct: float
     saving_usd: float
     score: int
@@ -53,6 +68,15 @@ class Deal:
     fake_sale: bool
     dropped_hours_ago: float | None
     history_points: int
+    # What the rest of the market said, so the notification can show its working
+    # instead of asking to be taken on faith.
+    market_shops: int = 0
+    market_median_usd: float | None = None
+    beats_market: bool = False
+    msrp_usd: float | None = None
+    inflated_tag: bool = False
+    rule_priced: bool = False
+    blanket_pct: float | None = None
 
     @property
     def bucket(self) -> int:
@@ -128,65 +152,101 @@ def evaluate(
     in_stock: bool,
     history: list[sqlite3.Row],
     filters: Filters,
+    market: Market | None = None,
+    trust: Trust | None = None,
 ) -> Deal | None:
     """Score one variant. Returns None when it is not worth a notification.
 
     `history` is every recorded point for the variant, oldest first, including
-    the current one.
+    the current one. `market` is what other shops charge for the same article
+    number; `trust` is what this shop's catalogue says about how much its own
+    struck-through prices are worth. Both default to knowing nothing, in which
+    case only the shop's history and its tag are available.
     """
     if not in_stock or price_usd <= 0 or not history:
         return None
     if not (filters.min_price_usd <= price_usd <= filters.max_price_usd):
         return None
+    market = market or Market()
+    trust = trust or Trust()
 
     # Everything below is arithmetic in the shop's own currency, converted to
     # dollars only at the end. Comparing dollar figures recorded on different
     # days compares two things at once — the shop's price and the exchange rate —
     # and the rate is not news.
     current = history[-1]
-    currency = current["currency"]
     fx_rate = current["fx_rate"] or 1.0
     price_native = current["price_native"]
     compare_native = _tag_native(current)
 
-    # A shop that switched currency invalidates its own past: 120 GBP and 120 EUR
-    # are not comparable, and pretending otherwise invents a discount.
-    comparable = [r for r in history[:-1] if r["currency"] == currency]
-    past = [r["price_native"] for r in comparable]
-    span_days = (
-        (_parse(current["ts"]) - _parse(comparable[0]["ts"])).total_seconds() / 86400
-        if comparable
-        else 0.0
-    )
-    has_history = len(past) >= MIN_HISTORY_POINTS and span_days >= MIN_HISTORY_DAYS
-    fake_sale = _is_fake_sale(history, filters.fake_sale_days)
+    def to_native(usd: float | None) -> float | None:
+        return None if usd is None else usd * fx_rate
 
-    # Our own median beats the shop's claim; the tag is the fallback.
-    if has_history:
-        reference_native, source = statistics.median(past), "history"
-    elif compare_native and compare_native > price_native:
-        reference_native, source = compare_native, "tag"
-    else:
+    market_native = to_native(market.median_usd) if market.priced(filters.market_min_shops) else None
+    msrp_native = to_native(market.msrp_usd) if market.has_msrp(filters.msrp_min_shops) else None
+    low_native = to_native(market.low_usd)
+
+    # Veto: whatever it is marked down from, a price above what other shops are
+    # asking for the same article is not a discount.
+    if market_native is not None and price_native > market_native + 0.005:
         return None
 
-    if reference_native <= price_native:
+    rule_priced = trust.rule_priced(
+        filters.rule_priced_share, filters.blanket_sale_share
+    )
+    inflated_tag = bool(
+        msrp_native
+        and compare_native
+        and compare_native > msrp_native * (1 + filters.inflated_tag_pct / 100)
+    )
+    tag_native = (
+        compare_native if compare_native and not rule_priced and not inflated_tag else None
+    )
+
+    floor = prior_floor(history, filters.reference_window_days)
+    if floor is not None and floor.covered_days < MIN_HISTORY_DAYS:
+        floor = None
+
+    if floor is not None:
+        # The shop's own recent floor is decisive: if the price is not below it,
+        # the price did not drop, and no tag or market figure may say otherwise.
+        if floor.lowest_native <= price_native + 0.005:
+            return None
+        reference_native, source = floor.lowest_native, "history"
+    elif market_native is not None and market_native > price_native:
+        reference_native, source = market_native, "market"
+    elif msrp_native is not None and msrp_native > price_native:
+        reference_native, source = msrp_native, "msrp"
+    elif tag_native and tag_native > price_native:
+        reference_native, source = tag_native, "tag"
+    else:
         return None
 
     discount_pct = (reference_native - price_native) / reference_native * 100
     saving_usd = round((reference_native - price_native) / fx_rate, 2)
-    reference = round(reference_native / fx_rate, 2)
     if discount_pct < filters.min_discount_pct or saving_usd < filters.min_saving_usd:
         return None
 
+    past = [r["price_native"] for r in history[:-1] if r["currency"] == current["currency"]]
     all_time_low = bool(past) and price_native < min(past) - 0.005
+    beats_market = bool(low_native and price_native <= low_native + 0.005 and market.shops >= 1)
+    fake_sale = _is_fake_sale(history, filters.fake_sale_days)
 
     score = discount_pct * 1.6
     if source == "history":
-        score += 8          # corroborated by data the shop cannot edit
+        score += 10         # the shop's own floor, which it cannot rewrite
+    elif source == "market":
+        score += 12         # priced against shops with no stake in this one
+    elif source == "msrp":
+        score += 6
     if all_time_low:
         score += 12
+    if beats_market:
+        score += 15         # cheaper than every other shop we can see
     if fake_sale:
         score -= 25         # the "was" price is decoration
+    if rule_priced:
+        score -= 20         # so is every other "was" price in this shop
     score = int(max(0, min(100, round(score))))
     if score < filters.min_score:
         return None
@@ -195,7 +255,7 @@ def evaluate(
         variant_id=variant_id,
         product_id=product_id,
         price_usd=round(price_usd, 2),
-        reference_usd=round(reference, 2),
+        reference_usd=round(reference_native / fx_rate, 2),
         reference_source=source,
         discount_pct=round(discount_pct, 1),
         saving_usd=round(saving_usd, 2),
@@ -204,6 +264,13 @@ def evaluate(
         fake_sale=fake_sale,
         dropped_hours_ago=_dropped_hours_ago(history, price_native),
         history_points=len(history),
+        market_shops=market.shops,
+        market_median_usd=market.median_usd,
+        beats_market=beats_market,
+        msrp_usd=market.msrp_usd if market.has_msrp(filters.msrp_min_shops) else None,
+        inflated_tag=inflated_tag,
+        blanket_pct=trust.blanket_pct if rule_priced else None,
+        rule_priced=rule_priced,
     )
 
 

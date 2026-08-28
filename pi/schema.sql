@@ -12,6 +12,14 @@ CREATE TABLE IF NOT EXISTS stores (
     last_checked  TEXT,                                 -- ISO-8601 UTC
     last_ok       TEXT,
     product_count INTEGER NOT NULL DEFAULT 0,
+    -- How much of this shop's catalogue wears a struck-through price, and how
+    -- much of it wears the same one. A shop with half its catalogue at an
+    -- identical -40% is running a promotion, not pricing products, and its tag
+    -- is worth nothing as a reference. Recomputed each run by pi.reference.
+    tag_share     REAL,
+    round_share   REAL,
+    blanket_pct   REAL,
+    blanket_share REAL,
     -- jsonld stores are crawled a page at a time; the cursor walks their sitemap
     -- across runs so a 8,000-product catalogue is covered without hammering it.
     sitemap_cursor INTEGER NOT NULL DEFAULT 0
@@ -101,3 +109,16 @@ CREATE TABLE IF NOT EXISTS runs (
     blocked        INTEGER NOT NULL DEFAULT 0,
     note           TEXT
 );
+
+-- How a product might be recognised in another shop: the manufacturer's article
+-- number above all (CW2288-111 is stocked by fourteen of the shops on the list),
+-- with the shop's own SKU and a normalised title as weaker handles. This is what
+-- makes a market price possible on a database where almost every variant has
+-- been seen exactly once and has no history to compare against.
+CREATE TABLE IF NOT EXISTS product_keys (
+    product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+    key_type   TEXT    NOT NULL,   -- sku | style | title
+    key        TEXT    NOT NULL,
+    PRIMARY KEY (product_id, key_type, key)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS ix_product_keys_key ON product_keys(key_type, key);

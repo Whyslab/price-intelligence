@@ -45,6 +45,23 @@ def _age(hours: float | None) -> str | None:
     return f"цена держится {days / 7:.0f} нед"
 
 
+def _reference_phrase(deal: Deal) -> str:
+    """Say where the "was" price came from, because they are not equally good.
+
+    "было 300" reads the same whether 300 is what the brand recommends, what five
+    other shops charge, or what this shop wrote on the label last Tuesday. Naming
+    the source is what lets the reader tell those apart.
+    """
+    price = _money(deal.reference_usd)
+    if deal.reference_source == "history":
+        return f"минимум за 30 дней {price}"
+    if deal.reference_source == "market":
+        return f"в других магазинах {price}, по {deal.market_shops}"
+    if deal.reference_source == "msrp":
+        return f"рекомендованная {price}, по {deal.market_shops} магазинам"
+    return f"зачёркнуто в магазине {price}"
+
+
 def _trim(text: str, limit: int) -> str:
     """Cut to the limit on a line boundary so a message never ends mid-sentence."""
     if len(text) <= limit:
@@ -93,12 +110,19 @@ def format_caption(
         lines.append(" · ".join(details))
     lines.append("")
 
-    was = "было" if deal.reference_source == "tag" else "медиана наблюдений"
     lines.append(
-        f"💰 <b>{_money(deal.price_usd)}</b> ({was} {_money(deal.reference_usd)})"
+        f"💰 <b>{_money(deal.price_usd)}</b> ({_reference_phrase(deal)})"
     )
     if deal.all_time_low:
         lines.append("📉 Минимум за всё время наблюдения")
+    if deal.beats_market and deal.reference_source != "market":
+        lines.append(f"💎 Дешевле, чем в других магазинах ({deal.market_shops})")
+    if deal.inflated_tag and deal.msrp_usd:
+        lines.append(
+            f"🚩 Магазин зачеркнул цену выше рекомендованной {_money(deal.msrp_usd)}"
+        )
+    if deal.rule_priced:
+        lines.append("⚠️ Магазин считает скидки по правилу, а не от прежней цены")
     if deal.fake_sale:
         lines.append("⚠️ Зачёркнутая цена не менялась неделями — «вечная распродажа»")
 

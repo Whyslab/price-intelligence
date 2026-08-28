@@ -10,7 +10,7 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 SCHEMA_SQL = Path(__file__).with_name("schema.sql")
 
 
@@ -47,6 +47,8 @@ def migrate(conn: sqlite3.Connection) -> None:
         _migrate_1_to_2(conn)
     if current in (1, 2):
         _migrate_2_to_3(conn)
+    if current in (1, 2, 3):
+        _migrate_3_to_4(conn)
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
 
@@ -102,6 +104,18 @@ def _migrate_2_to_3(conn: sqlite3.Connection) -> None:
     dropped = drop_fx_noise(conn)
     if dropped:
         log.info("removed %d history rows that only recorded an exchange rate moving", dropped)
+
+
+def _migrate_3_to_4(conn: sqlite3.Connection) -> None:
+    """Add the per-shop discount profile. The keys table comes from schema.sql.
+
+    Existing products have no keys yet — `pi reindex` fills them in, and the run
+    that follows keeps them current.
+    """
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(stores)")}
+    for column in ("tag_share", "round_share", "blanket_pct", "blanket_share"):
+        if column not in columns:
+            conn.execute(f"ALTER TABLE stores ADD COLUMN {column} REAL")
 
 
 def drop_fx_noise(conn: sqlite3.Connection) -> int:
@@ -307,6 +321,16 @@ def _same_money(a: float | None, b: float | None) -> bool:
     if a is None or b is None:
         return a is None and b is None
     return abs(a - b) < 0.005
+
+
+def set_product_keys(conn: sqlite3.Connection, product_id: int, keys: set[tuple[str, str]]) -> None:
+    """Replace the handles under which this product can be matched elsewhere."""
+    conn.execute("DELETE FROM product_keys WHERE product_id = ?", (product_id,))
+    if keys:
+        conn.executemany(
+            "INSERT OR IGNORE INTO product_keys (product_id, key_type, key) VALUES (?, ?, ?)",
+            [(product_id, key_type, key) for key_type, key in keys],
+        )
 
 
 def price_history(conn: sqlite3.Connection, variant_id: int) -> list[sqlite3.Row]:

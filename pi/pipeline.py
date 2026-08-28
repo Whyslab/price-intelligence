@@ -14,7 +14,9 @@ import httpx
 
 from . import db as dbm
 from . import deals as dealm
+from . import reference
 from .config import Config
+from .domains import same_shop
 from .fx import Rates, load_rates
 from .notify import Telegram, format_caption
 from .sources import jsonld, shopify
@@ -142,6 +144,15 @@ def store_result(
             conn, store_id, product.external_id, product.title, product.url,
             brand=product.brand, image_url=product.image_url, category=product.category,
         )
+        # The handles this product can be recognised by in other shops. Written
+        # every time because titles and SKUs get edited, and a stale key would
+        # quietly match the wrong shoe.
+        dbm.set_product_keys(
+            conn, product_id,
+            reference.keys_for(
+                product.brand, product.title, [v.sku for v in product.variants]
+            ),
+        )
         for variant in product.variants:
             converted = rates.to_usd(variant.price, currency)
             if converted is None:
@@ -168,7 +179,7 @@ def store_result(
 
 CANDIDATES_SQL = """
     SELECT v.id AS variant_id, v.product_id, v.sku, v.size, v.size_norm, v.color,
-           p.title, p.brand, p.url, p.image_url,
+           p.title, p.brand, p.url, p.image_url, p.store_id,
            s.name AS store_name, s.domain, s.country, s.currency
     FROM pi_candidates c
     JOIN variants v ON v.id = c.id
@@ -218,8 +229,33 @@ def _histories(conn: sqlite3.Connection) -> Iterator[tuple[int, list[sqlite3.Row
         yield variant_id, list(points)
 
 
+def _cap_per_store(
+    found: list[tuple[dealm.Deal, sqlite3.Row]], limit: int
+) -> list[tuple[dealm.Deal, sqlite3.Row]]:
+    """Keep at most `limit` deals from any one shop, best first.
+
+    A shop running one promotion across its catalogue otherwise takes the whole
+    run: the last twelve notifications sent were the same shop at the same -40%.
+    """
+    if limit <= 0:
+        return found
+    seen: Counter[str] = Counter()
+    kept = []
+    for deal, row in found:
+        shop = same_shop(row["domain"])
+        if seen[shop] >= limit:
+            continue
+        seen[shop] += 1
+        kept.append((deal, row))
+    return kept
+
+
 def find_deals(
-    conn: sqlite3.Connection, variant_ids: list[int], config: Config
+    conn: sqlite3.Connection,
+    variant_ids: list[int],
+    config: Config,
+    market: reference.MarketIndex | None = None,
+    trust: dict[int, reference.Trust] | None = None,
 ) -> list[tuple[dealm.Deal, sqlite3.Row]]:
     """Score the variants that moved, returning the ones worth announcing."""
     if not variant_ids:
@@ -227,6 +263,11 @@ def find_deals(
     rows = _candidates(conn, variant_ids, config)
     if not rows:
         return []
+    if market is None:
+        market = reference.build_market_index(conn)
+    if trust is None:
+        trust = reference.store_trust(conn)
+        reference.record_trust(conn, trust)
 
     best_per_product: dict[int, tuple[dealm.Deal, sqlite3.Row]] = {}
     for variant_id, history in _histories(conn):
@@ -242,6 +283,8 @@ def find_deals(
             in_stock=bool(current["in_stock"]),
             history=history,
             filters=config.filters,
+            market=market.look_up(row["product_id"], same_shop(row["domain"])),
+            trust=trust.get(row["store_id"]),
         )
         if deal is None or dealm.already_alerted(conn, deal):
             continue
@@ -253,7 +296,7 @@ def find_deals(
 
     found = list(best_per_product.values())
     found.sort(key=lambda pair: pair[0].score, reverse=True)
-    return found
+    return _cap_per_store(found, config.filters.max_alerts_per_store)
 
 
 def seed_alerts(conn: sqlite3.Connection, config: Config, dry_run: bool = False) -> int:
@@ -578,6 +621,20 @@ def health_report(conn: sqlite3.Connection) -> str:
     }
     for platform, count in sorted(counts.items(), key=lambda kv: -kv[1]):
         lines.append(f"  • {labels.get(platform, platform)}: {count}")
+
+    by_rule = conn.execute(
+        """
+        SELECT domain, tag_share, round_share FROM stores
+        WHERE tag_share > 0.15 AND round_share >= 0.9
+        ORDER BY tag_share DESC LIMIT 8
+        """
+    ).fetchall()
+    if by_rule:
+        lines += ["", "<b>Считают скидки по правилу (ярлыкам не верим):</b>"]
+        lines += [
+            f"  • {d}: скидка на {tag:.0%} каталога, {rnd:.0%} из них — круглые"
+            for d, tag, rnd in by_rule
+        ]
 
     if broken:
         lines += ["", "<b>Сломались на последнем обходе:</b>"]
