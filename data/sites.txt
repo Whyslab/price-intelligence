@@ -290,6 +290,43 @@ zalando.pl
 # 0519-store.com
 # five0-shop.com
 # haddoc.shop
+# --- Мужская одежда и дизайнерские марки, добавлено 28.08.2026 -------------
+# Остальной список — магазины кроссовок, и они покрывают Nike, adidas и New
+# Balance отлично. Гардеробная половина была почти не представлена: Stone Island
+# нашёлся в 26 магазинах, C.P. Company в 23, Arc'teryx в двух.
+#
+# Проверено сбором, а не классификацией: из 28 кандидатов товары реально отдают
+# 13. Цифры — сколько из первых 500-750 товаров попадает в размеры EU44-45/L-XL.
+harresoe.com                 # 750 товаров, 424 в твоих размерах — лучший из найденных
+www.antonioli.eu             # 750 / 281
+www.italist.com              # 500 / 174
+www.nugnes1920.com           # 500 / 174
+www.biffi.com                # 500 / 170
+www.suitnegozi.com           # 500 / 113
+www.blacksheepstore.co.uk    # 500 / 79
+www.freshmansarchive.com     # винтаж: размеров почти нет, зато много нужных марок
+# Читаются по карточкам (schema.org), поэтому размеров у них нет вовсе — одна
+# цена на товар. Годятся как источник находок и опорных цен, не для фильтра по
+# размеру.
+www.endclothing.com
+www.luisaviaroma.com
+www.mainlinemenswear.co.uk
+www.ln-cc.com
+
+# Проверено 28.08.2026 и отложено, с причиной:
+# www.ssense.com      — читается, но карта сайта ведёт на саудовскую локаль
+#                       /en-sa/, где указан несуществующий код валюты "USE".
+#                       Цены из-за этого отбрасываются (и правильно). Нужен
+#                       выбор локали при обходе — отдельная работа.
+# www.sevenstore.com  — schema.org-разметки на карточках нет
+# www.hansvoortman.eu — то же
+# www.footshop.eu     — то же
+# www.oki-ni.com, www.hip-store.com, www.tessuti.co.uk, www.psyche.co.uk,
+# www.dropsupply.dk, www.norse-store.com, www.aphrodite1994.com — не отвечают
+# www.hervia.com, www.bstn.com, www.woodhouseclothing.com — платформа не опознана
+# www.wellgosh.com    — проблема с сертификатом
+# www.streetmachine.com — отказал по частоте, не классифицирован
+
 # justkicks.net
 # larrydeadstock.com
 # legendphx.com
