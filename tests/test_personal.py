@@ -113,9 +113,18 @@ class TestWhoTheReaderIs:
         reader = personal.reader_for(conn, "42", Filters(sizes=("EU44",)))
         assert reader.sizes == frozenset({"EU45"})
 
-    def test_an_unfinished_wizard_does_not_count(self, conn):
+    def test_a_preference_counts_even_without_finishing_the_wizard(self, conn):
+        """Setting your sizes and having them ignored is nobody's expectation."""
         from pi import db as dbm
 
         dbm.upsert_bot_user(conn, 7, "42", "u", sizes="EU45", onboarded=0)
+        reader = personal.reader_for(conn, "42", Filters(sizes=("EU44",)))
+        assert reader.sizes == frozenset({"EU45"})
+
+    def test_someone_who_has_said_nothing_still_falls_back_to_the_file(self, conn):
+        """Pressing "show me everything" is not an instruction about sizes."""
+        from pi import db as dbm
+
+        dbm.upsert_bot_user(conn, 7, "42", "u")
         reader = personal.reader_for(conn, "42", Filters(sizes=("EU44",)))
         assert reader.sizes == frozenset({"EU44"})

@@ -174,8 +174,12 @@ def reader_for(conn: sqlite3.Connection, chat_id: str | None, filters: Filters) 
     """
     if chat_id:
         row = conn.execute(
-            "SELECT * FROM bot_users WHERE chat_id = ? AND onboarded = 1", (str(chat_id),)
+            "SELECT * FROM bot_users WHERE chat_id = ?", (str(chat_id),)
         ).fetchone()
-        if row is not None:
+        # Any preference at all counts, rather than a finished wizard. Setting
+        # your sizes in /settings and having them ignored because you skipped
+        # the wizard is not a distinction anybody would expect to matter — and
+        # it silently left the notifications following the file instead.
+        if row is not None and Reader.from_profile(row).has_opinions:
             return Reader.from_profile(row)
     return Reader.from_filters(filters)

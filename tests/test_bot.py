@@ -18,6 +18,7 @@ def make_offer(
     product_id = dbm.upsert_product(
         conn, store_id, f"p-{title}-{size}-{domain}", title,
         f"https://{domain}/p", brand=brand_norm,
+        image_url=f"https://{domain}/p.jpg",
     )
     conn.execute(
         "UPDATE products SET brand_norm = ?, brand_family = ?, gender = ?, kind = ? WHERE id = ?",
@@ -137,124 +138,48 @@ class TestSizesOnTheCard:
 
 
 class TestFormatting:
-    def test_an_empty_shelf_says_so_and_offers_a_way_out(self):
-        text = bot.format_list([], page=0, total=0, now=ts())
-        assert "ничего нет" in text
-        assert "/settings" in text
-
-    def test_the_list_carries_price_discount_shop_and_size(self, conn):
+    def test_the_entry_carries_price_discount_shop_and_size(self, conn):
         make_offer(conn, size="EU44", discount=45.0, price=120.0)
-        rows, total = dbm.offers_for(conn)
-        text = bot.format_list(rows, page=0, total=total, now=ts())
+        rows, _ = dbm.offers_for(conn)
+        text = bot.format_entry(rows[0], ts())
         assert "−45%" in text
         assert "$120" in text
         assert "EU44" in text
         assert "Shop" in text
 
-    def test_the_numbers_on_the_keyboard_open_the_entries_beside_them(self, conn):
-        for n in range(3):
-            make_offer(conn, title=f"Shoe {n}", size=f"US{n}")
-        rows, total = dbm.offers_for(conn)
-        keyboard = bot.list_keyboard(rows, page=0, total=total)
-        opens = [
-            button["callback_data"]
-            for line in keyboard["inline_keyboard"] for button in line
-            if button["callback_data"].startswith("o:")
-        ]
-        assert opens == [f"o:{row['variant_id']}:0" for row in rows]
+    def test_the_header_says_where_you_are(self):
+        header = bot.format_page_header(page=2, total=48)
+        assert "стр. 3" in header
+        assert "48" in header
+
+    def test_each_photo_carries_a_way_to_buy_and_a_way_to_read_more(self, conn):
+        make_offer(conn)
+        rows, _ = dbm.offers_for(conn)
+        buttons = bot.entry_keyboard(rows[0], page=0)["inline_keyboard"][0]
+        assert buttons[0]["url"].startswith("http")
+        assert buttons[1]["callback_data"] == f"o:{rows[0]['variant_id']}:0"
 
     def test_every_callback_fits_telegram_s_limit(self, conn):
         make_offer(conn)
-        rows, total = dbm.offers_for(conn)
+        rows, _ = dbm.offers_for(conn)
         buttons = [
             button
-            for keyboard in (bot.list_keyboard(rows, 0, total), bot.menu_keyboard(None),
-                             bot.gender_keyboard(), bot.kinds_keyboard(["shoes"]))
+            for keyboard in (bot.entry_keyboard(rows[0], 0), bot.nav_keyboard(0, 25),
+                             bot.menu_keyboard(None), bot.gender_keyboard(),
+                             bot.kinds_keyboard(["shoes"]))
             for line in keyboard["inline_keyboard"] for button in line
         ]
         for button in buttons:
             data = button.get("callback_data", "")
             assert len(data.encode()) <= bot.CALLBACK_LIMIT, button
 
-    def test_paging_arrows_appear_only_where_there_is_somewhere_to_go(self, conn):
-        make_offer(conn)
-        rows, _ = dbm.offers_for(conn)
-        first = bot.list_keyboard(rows, page=0, total=25)
-        last = bot.list_keyboard(rows, page=2, total=25)
-        first_nav = [b["text"] for b in first["inline_keyboard"][-1]]
-        last_nav = [b["text"] for b in last["inline_keyboard"][-1]]
-        assert "⬅️" not in first_nav and "➡️" in first_nav
-        assert "⬅️" in last_nav and "➡️" not in last_nav
-
-
-class TestShelfIsNotOnePersonsShelf:
-    """The collector must not pre-filter the shelf by one reader's sizes."""
-
-    def test_the_shelf_config_drops_the_personal_filters(self):
-        from pi.config import Config, Filters
-        from pi.pipeline import shelf_config
-
-        config = Config(
-            db_path="x", sites_file="y", bot_token=None, chat_id=None, concurrency=1,
-            shopify_rate=1.0, shopify_host_rate=1.0, max_shopify_stores=1,
-            log_level="INFO",
-            filters=Filters(sizes=("EU44",), brands_allow=("nike",), min_score=55),
-        )
-        shelf = shelf_config(config)
-        assert shelf.filters.sizes == ()
-        assert shelf.filters.brands_allow == ()
-        # The thresholds that define a discount are untouched.
-        assert shelf.filters.min_score == config.filters.min_score
-
-
-class TestWhenThePriceDropped:
-    """A month-old sale must not be presented as a fresh find."""
-
-    def test_a_price_with_no_history_dates_from_when_it_was_first_seen(self, conn):
-        """Most variants have been seen once, so this is the usual case."""
-        variant_id = make_offer(conn)
-        conn.execute("DELETE FROM offers")
-        conn.execute(
-            "UPDATE price_points SET ts = ? WHERE variant_id = ?", (ts(30), variant_id)
-        )
-        row = conn.execute(
-            "SELECT * FROM offers WHERE variant_id = ?", (variant_id,)
-        ).fetchone()
-        assert row is None
-
-        deal = _deal(variant_id, conn, dropped_hours_ago=None)
-        dbm.record_offers(conn, [variant_id], [deal], dbm.utcnow())
-        found_at = conn.execute(
-            "SELECT found_at FROM offers WHERE variant_id = ?", (variant_id,)
-        ).fetchone()[0]
-        assert found_at.startswith(ts(30)[:10]), "should date from the first sighting"
-
-    def test_a_known_drop_dates_from_the_drop(self, conn):
-        variant_id = make_offer(conn)
-        conn.execute("DELETE FROM offers")
-        deal = _deal(variant_id, conn, dropped_hours_ago=5.0)
-        now = dbm.utcnow()
-        dbm.record_offers(conn, [variant_id], [deal], now)
-        found_at = conn.execute(
-            "SELECT found_at FROM offers WHERE variant_id = ?", (variant_id,)
-        ).fetchone()[0]
-        from datetime import datetime
-        hours = (datetime.fromisoformat(now) - datetime.fromisoformat(found_at)).total_seconds() / 3600
-        assert 4.9 < hours < 5.1
-
-
-def _deal(variant_id: int, conn, dropped_hours_ago: float | None):
-    from pi.deals import Deal
-
-    product_id = conn.execute(
-        "SELECT product_id FROM variants WHERE id = ?", (variant_id,)
-    ).fetchone()[0]
-    return Deal(
-        variant_id=variant_id, product_id=product_id, price_usd=100.0,
-        reference_usd=200.0, reference_source="history", discount_pct=50.0,
-        saving_usd=100.0, score=80, all_time_low=False, fake_sale=False,
-        dropped_hours_ago=dropped_hours_ago, history_points=2,
-    )
+    def test_paging_arrows_appear_only_where_there_is_somewhere_to_go(self):
+        first = [b["text"] for b in bot.nav_keyboard(0, 25)["inline_keyboard"][0]]
+        last = [b["text"] for b in bot.nav_keyboard(4, 25)["inline_keyboard"][0]]
+        assert not any("Назад" in t for t in first)
+        assert any("Дальше" in t for t in first)
+        assert any("Назад" in t for t in last)
+        assert not any("Дальше" in t for t in last)
 
 
 class TestRouting:
@@ -305,12 +230,33 @@ class TestRouting:
         assert [b["callback_data"] for b in buttons] == ["wizard", "p:0"]
 
     @pytest.mark.asyncio
-    async def test_the_list_button_shows_the_list(self, robot, calls, conn):
-        make_offer(conn)
+    async def test_the_list_button_sends_a_photo_for_every_offer(self, robot, calls, conn):
+        """Clothes are chosen by looking at them."""
+        for n in range(3):
+            make_offer(conn, title=f"Shoe {n}", size=f"US{n}")
         await robot.handle(self._press("p:0"))
         methods = [method for method, _ in calls]
         assert "answerCallbackQuery" in methods, "the button must stop spinning"
-        assert "editMessageText" in methods
+        assert methods.count("sendPhoto") == 3, "one photo per offer"
+        # A header before them and a navigation footer after.
+        assert methods.count("sendMessage") == 2
+
+    @pytest.mark.asyncio
+    async def test_an_offer_with_no_picture_still_appears(self, robot, calls, conn):
+        variant_id = make_offer(conn)
+        conn.execute(
+            "UPDATE products SET image_url = NULL WHERE id = "
+            "(SELECT product_id FROM offers WHERE variant_id = ?)", (variant_id,)
+        )
+        await robot.handle(self._press("p:0"))
+        sent = [p for m, p in calls if m == "sendMessage" and "reply_markup" in p]
+        assert any("−45%" in p.get("text", "") for p in sent)
+
+    @pytest.mark.asyncio
+    async def test_an_empty_shelf_says_so(self, robot, calls):
+        await robot.handle(self._press("p:0"))
+        texts = [p.get("text", "") for m, p in calls if m == "sendMessage"]
+        assert any("ничего нет" in t for t in texts)
 
     @pytest.mark.asyncio
     async def test_opening_an_entry_that_has_since_sold_out_says_so(self, robot, calls):

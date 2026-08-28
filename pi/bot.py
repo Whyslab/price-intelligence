@@ -10,11 +10,16 @@ That is also why it can answer a button press at all. Asking the question from
 scratch — the way `pi find` does — means scoring the whole database and takes a
 minute or two.
 
-Two surfaces, because browsing and reading are different jobs. A list is for
-comparing and discarding: ten entries, price, discount, shop and size on one
-line each, no pictures. A card is for one product, and there the photo is the
-point. Notifications keep using the card, since a notification is always one
-product.
+Two surfaces, because browsing and reading are different jobs. Browsing is a
+page of five offers, each its own photo with the price, the discount, the shop
+and the size under it — clothes are chosen by looking at them, and a list of
+text is the wrong shape for that. Reading is one card: the whole account of why
+this is a deal, what sizes are left, and what it costs delivered. Notifications
+use the card, since a notification is always one product.
+
+A first version made the browsing surface a compact list without pictures, on
+the argument that comparing wants numbers. Using it settled the question the
+other way.
 """
 from __future__ import annotations
 
@@ -36,7 +41,10 @@ from .notify import _money
 log = logging.getLogger(__name__)
 
 API = "https://api.telegram.org/bot{token}/{method}"
-PAGE = 10
+# Five, not ten: every entry is now its own photo message, and Telegram wants
+# roughly a second between messages to one chat. Ten would be eleven messages
+# trickling in over ten seconds.
+PAGE = 5
 # Telegram's own limit on callback_data. Everything below is kept far inside it,
 # which is why the payloads are terse rather than readable.
 CALLBACK_LIMIT = 64
@@ -97,35 +105,37 @@ def _age(then: str | None, now: str) -> str:
     return f"{hours / 24:.0f} дн назад"
 
 
-def format_list(rows: list[sqlite3.Row], page: int, total: int, now: str) -> str:
-    """The browsing surface: two lines per offer, no pictures.
+def format_entry(row: sqlite3.Row, now: str) -> str:
+    """One offer as the caption under its photo.
 
-    Ten cards with photos cannot be scrolled through, and an album of ten photos
-    carries neither prices nor links. What comparing needs is the price, the
-    discount, the shop and the size, and those fit on a line.
+    Short on purpose. Clothes are chosen by looking, and a paragraph under every
+    picture turns a page of them into a wall of text — the full account is on the
+    card behind the button.
     """
-    if not rows:
-        return (
-            "Под эти условия сейчас ничего нет.\n\n"
-            "Попробуйте ослабить фильтры — /settings."
-        )
+    shop = escape(row["store_name"] or row["domain"])
+    title = escape(row["title"])[:70]
+    brand = escape(row["brand_norm"] or row["brand"] or "")
+    size = escape(row["size_norm"] or row["size"] or "—")
+    head = f"−{row['discount_pct']:.0f}% · <b>{_money(row['price_usd'])}</b>"
+    if row["all_time_low"]:
+        head += " · 📉 минимум"
+    lines = [head]
+    if brand:
+        lines.append(f"<b>{brand}</b> · {title}")
+    else:
+        lines.append(title)
+    lines.append(f"<i>{shop} · {size} · {_age(row['found_at'], now)}</i>")
+    return "\n".join(lines)
+
+
+def format_page_header(page: int, total: int) -> str:
     pages = max(1, -(-total // PAGE))
-    out = [f"💰 <b>Скидки</b> · стр. {page + 1} из {pages} · всего {total:,}", ""]
-    for index, row in enumerate(rows, start=1):
-        shop = escape(row["store_name"] or row["domain"])
-        title = escape(row["title"])[:58]
-        brand = escape(row["brand_norm"] or row["brand"] or "")
-        size = escape(row["size_norm"] or row["size"] or "—")
-        price = _money(row["price_usd"])
-        head = f"<b>{index}.</b> −{row['discount_pct']:.0f}% · <b>{price}</b>"
-        if row["all_time_low"]:
-            head += " · 📉 минимум"
-        out.append(head)
-        out.append(f"    {brand + ' · ' if brand else ''}{title}")
-        out.append(
-            f"    <i>{shop} · {size} · {_age(row['found_at'], now)}</i>"
-        )
-    return "\n".join(out)
+    return f"💰 <b>Скидки</b> · стр. {page + 1} из {pages} · всего {total:,}"
+
+
+EMPTY_SHELF = (
+    "Под эти условия сейчас ничего нет.\n\nПопробуйте ослабить фильтры — /settings."
+)
 
 
 def format_landed(items: list) -> list[str]:
@@ -176,23 +186,25 @@ def format_card(row: sqlite3.Row, sizes: list[tuple[str, bool]], now: str,
 
 # --- keyboards --------------------------------------------------------------
 
-def list_keyboard(rows: list[sqlite3.Row], page: int, total: int) -> dict:
-    """Numbers to open an entry, arrows to page, and a way into the settings."""
-    numbers = [
-        {"text": str(index), "callback_data": f"o:{row['variant_id']}:{page}"}
-        for index, row in enumerate(rows, start=1)
-    ]
-    keyboard = [numbers[:5], numbers[5:]] if numbers else []
-    keyboard = [row for row in keyboard if row]
+def entry_keyboard(row: sqlite3.Row, page: int) -> dict:
+    """Under each photo: buy it, or see the whole account of why it is a deal."""
+    return {
+        "inline_keyboard": [[
+            {"text": "🛒 В магазин", "url": row["url"]},
+            {"text": "ℹ️ Подробно", "callback_data": f"o:{row['variant_id']}:{page}"},
+        ]]
+    }
 
+
+def nav_keyboard(page: int, total: int) -> dict:
+    """The last message of a page: where to go from here."""
     nav = []
     if page > 0:
-        nav.append({"text": "⬅️", "callback_data": f"p:{page - 1}"})
+        nav.append({"text": "⬅️ Назад", "callback_data": f"p:{page - 1}"})
     nav.append({"text": "⚙️", "callback_data": "menu"})
     if (page + 1) * PAGE < total:
-        nav.append({"text": "➡️", "callback_data": f"p:{page + 1}"})
-    keyboard.append(nav)
-    return {"inline_keyboard": keyboard}
+        nav.append({"text": "Дальше ➡️", "callback_data": f"p:{page + 1}"})
+    return {"inline_keyboard": [nav]}
 
 
 def card_keyboard(row: sqlite3.Row, page: int) -> dict:
@@ -326,23 +338,56 @@ class Bot:
             self.conn, sender["id"], chat_id, sender.get("username")
         )
 
+    PROFILE_FIELDS = ("genders", "kinds", "sizes", "brands")
+
     def _save(self, user_id: int, **fields) -> sqlite3.Row:
         row = dbm.get_bot_user(self.conn, user_id)
+        # Saying what you want *is* being set up. Keeping a separate "finished
+        # the wizard" flag meant answering a question in /settings changed
+        # nothing, because the notifications only consult a profile marked done.
+        if any(field in self.PROFILE_FIELDS for field in fields):
+            fields.setdefault("onboarded", 1)
         return dbm.upsert_bot_user(self.conn, user_id, row["chat_id"], row["username"], **fields)
 
     # -- screens --
 
     async def show_list(self, chat_id: str, user: sqlite3.Row, page: int, message_id: int | None):
+        """A page of offers, each as its own photo.
+
+        Clothes are chosen by looking at them, so every entry carries its
+        picture. That costs one message per offer instead of one per page, which
+        is why a page is five rather than ten: Telegram wants about a second
+        between messages to the same chat, and eleven of them is a wall arriving
+        slowly.
+
+        Paging sends a new page rather than editing the old one — a photo
+        message cannot be turned into a different photo — so the chat keeps what
+        you have already looked at, which is what scrolling back expects.
+        """
         rows, total = dbm.offers_for(
             self.conn, **profile_of(user), limit=PAGE, offset=page * PAGE
         )
+        if not rows:
+            await self.send(chat_id, EMPTY_SHELF)
+            return
+
         now = dbm.utcnow()
-        text = format_list(rows, page, total, now)
-        keyboard = list_keyboard(rows, page, total)
-        if message_id:
-            await self.edit(chat_id, message_id, text, keyboard)
-        else:
-            await self.send(chat_id, text, keyboard)
+        await self.send(chat_id, format_page_header(page, total))
+        for row in rows:
+            caption = format_entry(row, now)
+            keyboard = entry_keyboard(row, page)
+            sent = False
+            if row["image_url"]:
+                sent = await self.send_photo(chat_id, row["image_url"], caption, keyboard)
+            if not sent:
+                # No picture, or Telegram could not fetch it. The offer is still
+                # worth showing — it just shows as text.
+                await self.send(chat_id, caption, keyboard)
+            await asyncio.sleep(0.6)
+        await self.send(
+            chat_id, f"стр. {page + 1} · показано {len(rows)} из {total:,}",
+            nav_keyboard(page, total),
+        )
 
     async def show_card(self, chat_id: str, variant_id: int, page: int):
         row = self.conn.execute(
@@ -494,7 +539,7 @@ class Bot:
         elif data == "menu":
             await self.show_menu(chat_id, user)
         elif data.startswith("p:"):
-            await self.show_list(chat_id, user, int(data[2:]), message_id)
+            await self.show_list(chat_id, user, int(data[2:]), None)
         elif data.startswith("o:"):
             _, variant_id, page = data.split(":")
             await self.show_card(chat_id, int(variant_id), int(page))
