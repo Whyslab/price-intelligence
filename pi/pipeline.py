@@ -6,7 +6,7 @@ import logging
 import sqlite3
 import statistics
 from collections import Counter
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from itertools import groupby
@@ -16,7 +16,7 @@ import httpx
 
 from . import db as dbm
 from . import deals as dealm
-from . import reference, taxonomy, tls
+from . import personal, reference, taxonomy, tls
 from .config import Config
 from .domains import same_shop
 from .fx import Rates, load_rates
@@ -270,6 +270,7 @@ def store_result(
 CANDIDATES_SQL = """
     SELECT v.id AS variant_id, v.product_id, v.sku, v.size, v.size_norm, v.color,
            p.title, p.brand, p.url, p.image_url, p.store_id,
+           p.brand_norm, p.brand_family, p.gender, p.kind,
            s.name AS store_name, s.domain, s.country, s.currency
     FROM pi_candidates c
     JOIN variants v ON v.id = c.id
@@ -438,6 +439,7 @@ def find_deals(
     fold_duplicates: bool = True,
     skip_alerted: bool = True,
     watched: set[int] | None = None,
+    rank: Callable[[dealm.Deal, sqlite3.Row], float | None] | None = None,
 ) -> list[tuple[dealm.Deal, sqlite3.Row]]:
     """Score the variants that moved, returning the ones worth announcing.
 
@@ -448,6 +450,13 @@ def find_deals(
 
     `skip_alerted` is what `pi find` turns off: a search of what is on offer
     right now should show a deal whether or not it was announced last week.
+
+    `rank` is the second scale — how much *this reader* should care, as opposed
+    to how good the discount is. It orders the result and can drop a find below
+    that reader's bar by returning None. It runs before folding and capping, so
+    the trimming happens on the list the reader would actually be sent. Without
+    it the order is the discount's own score, which is what seeding and `pi find`
+    want.
     """
     if not variant_ids:
         return []
@@ -488,7 +497,16 @@ def find_deals(
             best_per_product[deal.product_id] = (deal, row)
 
     found = list(best_per_product.values())
-    found.sort(key=lambda pair: pair[0].score, reverse=True)
+    if rank is None:
+        found.sort(key=lambda pair: pair[0].score, reverse=True)
+    else:
+        ranked = ((rank(deal, row), (deal, row)) for deal, row in found)
+        found = [
+            pair for value, pair in sorted(
+                ((value, pair) for value, pair in ranked if value is not None),
+                key=lambda item: -item[0],
+            )
+        ]
     if fold_duplicates:
         found = _one_alert_per_article(found, market)
     if cap_per_store:
@@ -729,8 +747,15 @@ async def run(
         )
         log.info("%d offer(s) on the shelf, %d withdrawn", written, withdrawn)
 
+        # The notification list is the same shelf, ordered and trimmed for the
+        # person it is addressed to. Sizes and brands rank it and move its bar
+        # rather than cutting it: a shoe in somebody else's size still arrives
+        # when it is properly cheap, and a brand nobody named still arrives at
+        # all — a hard list fails exactly on what is not in it.
+        reader = personal.reader_for(conn, config.chat_id, config.filters)
         candidates = find_deals(
-            conn, scorable, config, market=market, trust=trust, watched=watching
+            conn, scorable, shelf_config(config), market=market, trust=trust,
+            watched=watching, rank=personal.ranker(reader, config.filters.min_score),
         )
         cap = limit if limit is not None else config.filters.max_alerts_per_run
         selected = candidates[:cap]

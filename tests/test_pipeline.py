@@ -308,7 +308,14 @@ async def test_dry_run_sends_nothing(config, shopify_payload, capsys):
 
 
 @respx.mock
-async def test_brand_filter_keeps_unwanted_deals_quiet(config, shopify_payload):
+async def test_a_brand_you_did_not_name_still_reaches_you(config, shopify_payload):
+    """Named brands are a priority, not a gate.
+
+    A hard list fails precisely on what is not in it: a find in a brand you had
+    not thought of would never arrive, and you would never learn that it had not.
+    So naming brands moves the bar and the ordering, and everything else still
+    gets through on the strength of the discount alone.
+    """
     _mock_rates()
     photo, text = _mock_telegram()
     respx.get("https://shop.example/products.json?limit=250").mock(
@@ -321,8 +328,8 @@ async def test_brand_filter_keeps_unwanted_deals_quiet(config, shopify_payload):
     stats = await pipeline.run(config, conn)
 
     assert stats.points_written > 0, "collection still happens"
-    assert stats.alerts_sent == 0, "but nothing matches the brand filter"
-    assert not photo.called and not text.called
+    assert stats.alerts_sent > 0, "an unnamed brand is not silenced"
+    assert photo.called or text.called
 
 
 def test_health_report_names_what_is_wrong(config):
