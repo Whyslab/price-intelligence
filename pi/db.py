@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -10,7 +11,7 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 SCHEMA_SQL = Path(__file__).with_name("schema.sql")
 
 
@@ -172,32 +173,57 @@ def _migrate_5_to_6(conn: sqlite3.Connection) -> None:
         conn.execute("DELETE FROM stores WHERE id = ?", (row["id"],))
 
 
-# Columns added to tables that already existed, by the version that added them.
-# Adding one is idempotent, so this is a list of what should be there rather
-# than a sequence of steps, and it runs before schema.sql is replayed.
-_ADDED_COLUMNS: dict[str, dict[str, str]] = {
-    # v7: what we make of what the shop wrote. Left empty by the migration
-    # itself — filling them reads every product and every variant, which is
-    # twenty seconds and not something a connection should do on its way
-    # somewhere else. `pi reclassify` fills them, and a normal run classifies
-    # what it collects, so the columns catch up either way.
-    "products": {
-        "brand_norm": "TEXT",
-        "brand_family": "TEXT",
-        "gender": "TEXT",
-        "kind": "TEXT",
-    },
-}
+# Adding a column used to mean writing it down twice: in schema.sql, for
+# databases created from now on, and in a list here, for databases that already
+# exist. Forgetting the second is silent — every test builds its database from
+# schema.sql and so has the column either way, while the live database quietly
+# does not. That is exactly what happened to `runs.scope`.
+#
+# So there is no list. schema.sql is the single statement of what a table should
+# look like, and an existing table is brought up to it.
+_COLUMN_DEF = re.compile(
+    r"^\s*(?!UNIQUE\b|PRIMARY\b|FOREIGN\b|CHECK\b|CONSTRAINT\b)([a-z_]+)\s+(.+)$",
+    re.I,
+)
+
+
+def _declared_columns(sql: str) -> dict[str, dict[str, str]]:
+    """Column name -> its declaration, per table, as schema.sql declares them."""
+    tables: dict[str, dict[str, str]] = {}
+    for match in re.finditer(
+        r"CREATE TABLE(?: IF NOT EXISTS)? (\w+)\s*\((.*?)\n\)", sql, re.S | re.I
+    ):
+        columns: dict[str, str] = {}
+        for line in match.group(2).splitlines():
+            line = line.split("--")[0].strip().rstrip(",")
+            found = _COLUMN_DEF.match(line)
+            if found:
+                columns[found.group(1)] = found.group(2).strip()
+        tables[match.group(1)] = columns
+    return tables
 
 
 def _add_columns(conn: sqlite3.Connection) -> None:
-    for table, columns in _ADDED_COLUMNS.items():
+    """Give every existing table the columns schema.sql says it should have.
+
+    Only touches tables that already exist — one missing entirely is created
+    complete by the schema replay that follows. Runs *before* that replay,
+    because an index over a new column cannot be built before the column is
+    there, and schema.sql declares both.
+
+    A NOT NULL column with no default cannot be added to a table with rows in
+    it. That is a real limit rather than something to work around: the fix is a
+    default in schema.sql, so let SQLite say so instead of swallowing it.
+    """
+    declared = _declared_columns(SCHEMA_SQL.read_text(encoding="utf-8"))
+    for table, columns in declared.items():
         existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
         if not existing:
-            continue  # a fresh database: schema.sql will create it complete
-        for name, kind in columns.items():
+            continue
+        for name, definition in columns.items():
             if name not in existing:
-                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {kind}")
+                log.info("adding %s.%s", table, name)
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
 
 
 def drop_fx_noise(conn: sqlite3.Connection) -> int:
@@ -286,6 +312,30 @@ def get_stores(
     return conn.execute(
         sql + " ORDER BY last_ok IS NOT NULL, last_ok, domain", params
     ).fetchall()
+
+
+def productive_store_ids(conn: sqlite3.Connection, days: int) -> set[int]:
+    """Stores that actually produced a notification in the last N days.
+
+    The whole reason the queue is uneven. Measured on the live database: 38
+    shops of 155 accounted for all 578 notifications ever sent, and ten of them
+    for 412 of those. Collecting the other 117 as often as these is how an
+    hourly sweep would turn back into a six-hourly one for the shops that matter.
+
+    Seeded rows are excluded — `sent = 0` marks a discount that was already
+    standing when collection began, which says nothing about the shop.
+    """
+    since = (datetime.now(UTC) - timedelta(days=days)).isoformat(timespec="seconds")
+    rows = conn.execute(
+        """
+        SELECT DISTINCT p.store_id
+          FROM alerts a
+          JOIN products p ON p.id = a.product_id
+         WHERE a.sent = 1 AND a.ts >= ?
+        """,
+        (since,),
+    )
+    return {row["store_id"] for row in rows}
 
 
 # --- catalogue --------------------------------------------------------------

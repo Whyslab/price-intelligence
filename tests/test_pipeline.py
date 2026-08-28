@@ -46,6 +46,16 @@ def known_store(conn, domain="shop.example", **fields):
     return dbm.upsert_store(conn, domain, **{**defaults, **fields})
 
 
+def make_due(conn, domain="shop.example"):
+    """Age a store so the queue considers it due again.
+
+    The queue collects a shop at most once an hour (once a day if it has never
+    found anything), so two runs back to back now collect once — which is the
+    point of it, and something a test spanning two runs has to say out loud.
+    """
+    dbm.upsert_store(conn, domain, last_ok=ts(1))
+
+
 def _mock_rates():
     respx.get("https://api.frankfurter.dev/v1/latest").mock(
         return_value=httpx.Response(200, json={"base": "USD", "rates": {"GBP": 0.73, "EUR": 0.86}})
@@ -169,6 +179,7 @@ async def test_the_first_pass_over_a_new_store_is_a_baseline_not_news(config, sh
         return_value=httpx.Response(200, json=cheaper)
     )
 
+    make_due(conn)
     second = await pipeline.run(config, conn)
     assert second.alerts_sent > 0
     assert photo.called or text.called
@@ -209,6 +220,7 @@ async def test_the_same_deal_is_not_sent_twice(config, shopify_payload):
     assert first.alerts_sent > 0
     sent_first_time = photo.call_count
 
+    make_due(conn)
     second = await pipeline.run(config, conn)
     assert second.alerts_sent == 0
     assert photo.call_count == sent_first_time
@@ -420,12 +432,15 @@ async def test_deals_past_the_cap_are_reconsidered_not_lost(config, shopify_payl
 
     # Nothing about the catalogue changes, so a run that only looked at moved
     # prices would send nothing at all.
+    make_due(conn)
     second = await pipeline.run(config, conn, limit=1)
     assert second.alerts_sent == 1, "the deferred deal goes out next time"
 
+    make_due(conn)
     third = await pipeline.run(config, conn, limit=1)
     assert third.alerts_sent == 1
 
+    make_due(conn)
     fourth = await pipeline.run(config, conn, limit=1)
     assert fourth.alerts_sent == 0, "and then it goes quiet"
     assert conn.execute("SELECT COUNT(*) FROM alerts").fetchone()[0] == 3
@@ -486,6 +501,7 @@ async def test_a_price_drop_after_seeding_is_still_announced(config, shopify_pay
         return_value=httpx.Response(200, json=cheaper)
     )
 
+    make_due(conn)
     stats = await pipeline.run(config, conn)
     assert stats.alerts_sent > 0, "a genuine further drop still gets through"
 
@@ -710,3 +726,127 @@ class TestStoreResult:
         assert written == 0
         assert changed == []
         assert len(products) == 1  # still touched, still worth classifying
+
+
+class TestUnevenQueue:
+    """Which shops get collected this hour, and which wait their turn."""
+
+    @staticmethod
+    def _store(conn, domain, hours_ago):
+        return known_store(conn, domain, last_ok=ts(hours_ago / 24))
+
+    def test_a_shop_that_finds_things_is_due_every_hour(self, conn):
+        store = self._store(conn, "good.example", hours_ago=2)
+        stores = dbm.get_stores(conn)
+        due, waiting = pipeline.due_stores(stores, productive={store})
+        assert [s["domain"] for s in due] == ["good.example"]
+        assert waiting == 0
+
+    def test_a_shop_that_never_finds_anything_waits_a_day(self, conn):
+        self._store(conn, "quiet.example", hours_ago=2)
+        due, waiting = pipeline.due_stores(dbm.get_stores(conn), productive=set())
+        assert due == []
+        assert waiting == 1
+
+    def test_it_comes_round_once_the_day_has_passed(self, conn):
+        self._store(conn, "quiet.example", hours_ago=30)
+        due, _ = pipeline.due_stores(dbm.get_stores(conn), productive=set())
+        assert [s["domain"] for s in due] == ["quiet.example"]
+
+    def test_a_productive_shop_outranks_a_quiet_one_that_is_older(self, conn):
+        """Two hours into a one-hour interval beats thirty into a twenty-four."""
+        good = self._store(conn, "good.example", hours_ago=2)
+        self._store(conn, "quiet.example", hours_ago=30)
+        due, _ = pipeline.due_stores(dbm.get_stores(conn), productive={good})
+        assert [s["domain"] for s in due] == ["good.example", "quiet.example"]
+
+    def test_a_shop_never_collected_goes_first(self, conn):
+        self._store(conn, "old.example", hours_ago=100)
+        dbm.upsert_store(conn, "new.example", platform="shopify", status="ok")
+        due, _ = pipeline.due_stores(dbm.get_stores(conn), productive=set())
+        assert due[0]["domain"] == "new.example"
+
+
+class TestAdaptiveBudget:
+    """The slice fits a quota that changes through the day, so it changes too."""
+
+    @staticmethod
+    def _run(conn, budget, blocked):
+        conn.execute(
+            "INSERT INTO runs (started_at, finished_at, shopify_budget, blocked) "
+            "VALUES (?, ?, ?, ?)",
+            (ts(), ts(), budget, blocked),
+        )
+
+    def test_with_no_history_it_starts_at_the_ceiling(self, conn):
+        assert pipeline._adaptive_budget(conn, ceiling=45) == 45
+
+    def test_a_clean_run_earns_a_few_more_shops(self, conn):
+        self._run(conn, budget=20, blocked=0)
+        assert pipeline._adaptive_budget(conn, ceiling=45) == 25
+
+    def test_a_block_costs_more_than_a_clean_run_earns(self, conn):
+        """Retreat faster than you advance: a block is expensive, a short run is not."""
+        self._run(conn, budget=30, blocked=1)
+        assert pipeline._adaptive_budget(conn, ceiling=45) == 19
+
+    def test_it_never_falls_below_the_floor(self, conn):
+        self._run(conn, budget=10, blocked=1)
+        assert pipeline._adaptive_budget(conn, ceiling=45) == pipeline.BUDGET_FLOOR
+
+    def test_it_never_climbs_past_the_ceiling(self, conn):
+        self._run(conn, budget=45, blocked=0)
+        assert pipeline._adaptive_budget(conn, ceiling=45) == 45
+
+
+class TestDegradationNotice:
+    """Saying so when the collector quietly stops working."""
+
+    @staticmethod
+    def _runs(conn, seen: list[int], scope="sweep", blocked=0):
+        for products in seen:
+            conn.execute(
+                "INSERT INTO runs (started_at, finished_at, products_seen, scope, blocked) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (ts(), ts(), products, scope, blocked),
+            )
+
+    def test_healthy_collection_says_nothing(self, conn):
+        self._runs(conn, [8000] * 25)
+        assert pipeline.degradation_notice(conn) is None
+
+    def test_it_speaks_up_after_a_run_of_weak_sweeps(self, conn):
+        self._runs(conn, [8000] * 20)
+        self._runs(conn, [1000] * 5)
+        notice = pipeline.degradation_notice(conn)
+        assert notice is not None
+        assert "меньше обычного" in notice
+
+    def test_one_short_run_is_not_news(self, conn):
+        """The quota varies through the day and shops go down on their own."""
+        self._runs(conn, [8000] * 24)
+        self._runs(conn, [1000])
+        assert pipeline.degradation_notice(conn) is None
+
+    def test_it_says_it_once_and_not_every_run_after(self, conn):
+        self._runs(conn, [8000] * 20)
+        self._runs(conn, [1000] * 5)
+        assert pipeline.degradation_notice(conn) is not None
+        self._runs(conn, [1000])
+        assert pipeline.degradation_notice(conn) is None
+
+    def test_a_hand_run_sweep_of_one_shop_is_not_a_collapse(self, conn):
+        """`pi run --stores one.com` reads one shop on purpose."""
+        self._runs(conn, [8000] * 20)
+        self._runs(conn, [500] * 5, scope="stores")
+        assert pipeline.degradation_notice(conn) is None
+
+    def test_it_waits_until_it_knows_what_normal_is(self, conn):
+        self._runs(conn, [100] * 6)
+        assert pipeline.degradation_notice(conn) is None
+
+    def test_blocks_are_named_as_the_likely_cause(self, conn):
+        self._runs(conn, [8000] * 20)
+        self._runs(conn, [1000] * 5, blocked=1)
+        notice = pipeline.degradation_notice(conn)
+        assert "квота" in notice

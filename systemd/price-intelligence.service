@@ -8,8 +8,9 @@ Wants=network-online.target
 Type=oneshot
 WorkingDirectory=%h/Projects/price-intelligence
 ExecStart=%h/Projects/price-intelligence/.venv/bin/python -m pi run
-# The sweep touches ~200 sites; give it room without letting it run forever.
-TimeoutStartSec=45min
+# A run must finish well inside the hour before the next one, and a slice of
+# twenty-odd shops takes minutes. Anything approaching this is stuck.
+TimeoutStartSec=30min
 Nice=10
 IOSchedulingClass=idle
 

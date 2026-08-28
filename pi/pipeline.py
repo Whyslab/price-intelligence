@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sqlite3
+import statistics
 from collections import Counter
 from collections.abc import Iterator
 from dataclasses import dataclass, field, replace
@@ -70,6 +71,76 @@ def _last_run_was_capped(conn: sqlite3.Connection) -> bool:
         "SELECT capped FROM runs WHERE finished_at IS NOT NULL ORDER BY id DESC LIMIT 1"
     ).fetchone()
     return bool(row and row["capped"])
+
+
+# How long a shop waits its turn, by whether it has ever been worth collecting.
+# A shop that produced a notification in the last PRODUCTIVE_DAYS is collected
+# every round; the rest once a day. This is what lets the list grow without the
+# sweep getting slower for the shops that matter: at 400 shops an even rotation
+# would put a full circle 20 hours away and make "hourly" a label rather than a
+# fact.
+PRODUCTIVE_DAYS = 30
+PRODUCTIVE_INTERVAL_HOURS = 1.0
+QUIET_INTERVAL_HOURS = 24.0
+
+
+def _overdue(store: sqlite3.Row, productive: set[int], now: datetime) -> float:
+    """How many of this shop's own intervals have passed since it was collected.
+
+    Overdue-ness rather than plain age, because the two groups are on different
+    clocks. A productive shop two hours old is at 2.0 and a quiet shop thirty
+    hours old is at 1.25, so the productive one goes first — which is the point.
+    Sorting by age alone would let a day's worth of quiet shops crowd out every
+    shop that has ever found anything.
+    """
+    interval = (
+        PRODUCTIVE_INTERVAL_HOURS if store["id"] in productive else QUIET_INTERVAL_HOURS
+    )
+    if not store["last_ok"]:
+        return float("inf")  # never collected: always first in line
+    age = (now - datetime.fromisoformat(store["last_ok"])).total_seconds() / 3600
+    return age / interval
+
+
+def due_stores(
+    stores: list[sqlite3.Row], productive: set[int], now: datetime | None = None
+) -> tuple[list[sqlite3.Row], int]:
+    """The shops whose turn it is, most overdue first. Returns (due, not_due)."""
+    now = now or datetime.now(UTC)
+    scored = sorted(
+        ((_overdue(store, productive, now), store) for store in stores),
+        key=lambda pair: -pair[0],
+    )
+    due = [store for score, store in scored if score >= 1.0]
+    return due, len(scored) - len(due)
+
+
+# The slice adapts instead of being a constant, because the quota it is fitting
+# into is not one. Measured over a day: a cold IP took all 196 shops once, while
+# by the afternoon the same sweep was cut off at twelve. A fixed number is
+# therefore either wasteful in the morning or self-defeating after lunch.
+BUDGET_FLOOR = 10
+BUDGET_STEP = 5
+# A block costs more than an under-full run, so the retreat is faster than the
+# advance: five shops added per clean run, a third taken off after a block.
+BUDGET_RETREAT = 0.66
+
+
+def _adaptive_budget(conn: sqlite3.Connection, ceiling: int) -> int:
+    """How many Shopify shops to attempt, learned from how the last run went."""
+    row = conn.execute(
+        """
+        SELECT shopify_budget, blocked FROM runs
+         WHERE finished_at IS NOT NULL AND shopify_budget IS NOT NULL
+         ORDER BY id DESC LIMIT 1
+        """
+    ).fetchone()
+    if row is None:
+        return ceiling
+    previous = int(row["shopify_budget"])
+    if row["blocked"]:
+        return max(BUDGET_FLOOR, int(previous * BUDGET_RETREAT))
+    return min(ceiling, previous + BUDGET_STEP)
 
 
 def _take_shopify_slice(
@@ -489,6 +560,11 @@ async def run(
         log.info("the previous run hit its alert cap — scoring everything this time")
         rescan = True
     stores = dbm.get_stores(conn, platforms=("shopify", "jsonld"), domains=domains)
+    # Naming stores explicitly is a deliberate act, so it skips both the queue
+    # and the budget: `--stores` means these, now. The budget is still recorded,
+    # because the next run adapts from the last recorded one and a hand-run
+    # sweep should not look to it like a collapse in capacity.
+    budget = config.max_shopify_stores
     if not domains:
         stores, skipped = _drop_hopeless(stores)
         if skipped:
@@ -496,19 +572,29 @@ async def run(
                 "skipping %d store(s) that publish no machine-readable prices "
                 "(re-check them with --stores)", skipped
             )
-        stores, deferred = _take_shopify_slice(stores, config.max_shopify_stores)
+        productive = dbm.productive_store_ids(conn, PRODUCTIVE_DAYS)
+        stores, waiting = due_stores(stores, productive)
+        if waiting:
+            log.info(
+                "%d store(s) collected recently enough to wait their turn "
+                "(%d shop(s) found something in the last %d days and are due hourly)",
+                waiting, len(productive), PRODUCTIVE_DAYS,
+            )
+        budget = _adaptive_budget(conn, budget)
+        stores, deferred = _take_shopify_slice(stores, budget)
         if deferred:
             log.info(
                 "taking %d Shopify store(s) this run, %d deferred to the next — "
                 "the per-IP quota does not stretch to all of them at once",
-                config.max_shopify_stores, deferred,
+                budget, deferred,
             )
     if not stores:
         log.warning("no readable stores — run `detect` first")
         return stats
 
     run_id = conn.execute(
-        "INSERT INTO runs (started_at) VALUES (?)", (dbm.utcnow(),)
+        "INSERT INTO runs (started_at, shopify_budget, scope) VALUES (?, ?, ?)",
+        (dbm.utcnow(), budget, "stores" if domains else "sweep"),
     ).lastrowid
 
     rates = load_rates(config.db_path.parent / "fx_cache.json")
@@ -667,7 +753,23 @@ async def run(
             "if this persists", limiter.penalties,
         )
     _finish_run(conn, run_id, stats)
+    # Last, because the notice is about the run just recorded — including
+    # whether it was blocked, which is only known a few lines above this.
+    await _warn_if_degraded(conn, config, dry_run=dry_run)
     return stats
+
+
+async def _warn_if_degraded(conn: sqlite3.Connection, config: Config, dry_run: bool) -> None:
+    notice = degradation_notice(conn)
+    if not notice:
+        return
+    log.warning("collection has been reading well under normal for several runs")
+    if dry_run or not config.telegram_ready:
+        print(notice)
+        return
+    async with httpx.AsyncClient(timeout=30) as client:  # noqa: SIM117
+        async with Telegram(config.bot_token, config.chat_id, client) as telegram:
+            await telegram.send_text(notice)
 
 
 def _finish_run(conn: sqlite3.Connection, run_id: int, stats: RunStats) -> None:
@@ -682,6 +784,79 @@ def _finish_run(conn: sqlite3.Connection, run_id: int, stats: RunStats) -> None:
             stats.products_seen, stats.points_written, stats.alerts_sent, run_id,
         ),
     )
+
+
+
+# How many consecutive weak runs before saying so, and how far below normal a
+# run has to be to count as weak.
+DEGRADED_RUNS = 5
+DEGRADED_SHARE = 0.5
+# The stretch of history "normal" is measured over. Long enough that a bad
+# afternoon does not become the new normal and silence the warning.
+BASELINE_RUNS = 20
+
+
+def _weak_runs(conn: sqlite3.Connection, offset: int = 0) -> bool:
+    """Have the last DEGRADED_RUNS sweeps all read well under the usual amount?
+
+    Hourly collection makes a single short run meaningless — the quota varies
+    through the day and shops go down on their own. A run of them does mean
+    something, and it is the case worth interrupting for: a collector that has
+    quietly stopped working looks exactly like a market with no discounts, and
+    without a signal the difference is noticed a week later.
+
+    `offset` steps the window back one run, which is how the caller tells a
+    condition that has just started from one that was already true and has
+    already been reported.
+    """
+    rows = conn.execute(
+        """
+        SELECT products_seen FROM runs
+         WHERE finished_at IS NOT NULL AND scope = 'sweep'
+         ORDER BY id DESC LIMIT ? OFFSET ?
+        """,
+        (DEGRADED_RUNS + BASELINE_RUNS, offset),
+    ).fetchall()
+    if len(rows) < DEGRADED_RUNS + BASELINE_RUNS:
+        return False  # not enough history to know what normal looks like
+    recent = [row["products_seen"] for row in rows[:DEGRADED_RUNS]]
+    baseline = statistics.median(row["products_seen"] for row in rows[DEGRADED_RUNS:])
+    if baseline <= 0:
+        return False
+    return all(seen < baseline * DEGRADED_SHARE for seen in recent)
+
+
+def degradation_notice(conn: sqlite3.Connection) -> str | None:
+    """A message worth sending, or None. Sent once, when the run of weak runs starts."""
+    if not _weak_runs(conn) or _weak_runs(conn, offset=1):
+        return None
+    rows = conn.execute(
+        """
+        SELECT products_seen, stores_ok, blocked FROM runs
+         WHERE finished_at IS NOT NULL AND scope = 'sweep'
+         ORDER BY id DESC LIMIT ?
+        """,
+        (DEGRADED_RUNS + BASELINE_RUNS,),
+    ).fetchall()
+    recent = rows[:DEGRADED_RUNS]
+    baseline = statistics.median(row["products_seen"] for row in rows[DEGRADED_RUNS:])
+    blocked = sum(1 for row in recent if row["blocked"])
+    average = statistics.mean(row["products_seen"] for row in recent)
+    lines = [
+        "⚠️ <b>Сборщик читает заметно меньше обычного</b>",
+        "",
+        f"Последние {DEGRADED_RUNS} обходов подряд: в среднем "
+        f"{average:,.0f} товаров за обход при обычных {baseline:,.0f}.",
+    ]
+    if blocked:
+        lines.append(f"Из них с блокировкой: {blocked}.")
+        lines.append("Скорее всего исчерпана квота на IP — обходы сами станут короче.")
+    else:
+        lines.append(
+            "Блокировок нет, значит дело не в квоте: стоит посмотреть "
+            "<code>pi health</code> и последние ошибки магазинов."
+        )
+    return "\n".join(lines)
 
 
 def health_report(conn: sqlite3.Connection) -> str:
