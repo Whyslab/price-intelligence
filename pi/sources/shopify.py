@@ -89,7 +89,7 @@ async def _get_page(
 ) -> httpx.Response | None:
     """GET through the shared limiter, backing off this shop — or all of them — on a 429."""
     for attempt in range(1, MAX_RETRIES + 1):
-        if getattr(limiter, "blocked", False):
+        if await limiter.confirm_blocked():
             return None  # the platform has shut us out; retrying only prolongs it
         try:
             # The slot is held across the request: Shopify objects to parallel
@@ -195,7 +195,10 @@ async def fetch(
 ) -> FetchResult:
     """Pull a whole Shopify catalogue, paginating with ?page=N."""
     limiter = limiter or NullLimiter()
-    if getattr(limiter, "blocked", False):
+    # Waits out a suspected block rather than giving up on the spot. A store
+    # failed in the same second the breaker tripped can never benefit from the
+    # breaker being wrong, and it has been wrong on every run so far.
+    if await limiter.confirm_blocked():
         return FetchResult(domain=domain, currency=currency, error="skipped: Shopify blocked this IP")
     base = f"https://{domain}".rstrip("/")
     if not currency:

@@ -391,7 +391,7 @@ async def test_deals_past_the_cap_are_reconsidered_not_lost(config, shopify_payl
 
     first = await pipeline.run(config, conn, limit=1)
     assert first.alerts_sent == 1
-    assert conn.execute("SELECT note FROM runs ORDER BY id DESC LIMIT 1").fetchone()[0] == "capped"
+    assert conn.execute("SELECT capped FROM runs ORDER BY id DESC LIMIT 1").fetchone()[0] == 1
 
     # Nothing about the catalogue changes, so a run that only looked at moved
     # prices would send nothing at all.
@@ -531,8 +531,8 @@ def test_the_summary_counts_notifications_not_seeded_rows(config, conn):
 def test_the_summary_says_when_a_run_was_cut_short(config, conn):
     """Otherwise "21 ok, 18 failed" reads like a bad day rather than a block."""
     conn.execute(
-        "INSERT INTO runs (started_at, finished_at, stores_ok, stores_failed, note)"
-        " VALUES (?, ?, 21, 18, 'blocked')",
+        "INSERT INTO runs (started_at, finished_at, stores_ok, stores_failed, blocked)"
+        " VALUES (?, ?, 21, 18, 1)",
         (ts(0), ts(0)),
     )
     assert "Shopify заблокировал IP" in pipeline.health_report(conn)

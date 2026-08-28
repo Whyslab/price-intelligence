@@ -101,11 +101,14 @@ class TestPenalties:
         assert limiter.rate > 50.0
 
     async def test_an_explicit_pause_is_honoured(self):
+        """Jitter may stretch a pause but must never shorten one: a shop that
+        sent Retry-After named the number, and coming back early is not ours to
+        choose."""
         limiter = RateLimiter(rate=1000.0, per_host_rate=1000.0, cooldown=10.0)
         await limiter.penalise(pause=0.05, host="shop.example")
         start = time.monotonic()
         await limiter.acquire("shop.example")
-        assert 0.04 <= time.monotonic() - start < 1.0
+        assert 0.05 <= time.monotonic() - start < 1.0
 
 
 async def test_the_null_limiter_does_nothing():
@@ -229,3 +232,99 @@ class TestBreakerNeedsASuccessDrought:
         for n in range(4):
             await limiter.penalise(host=f"shop{n}.example")
         assert limiter.blocked
+
+
+class TestTheConvoy:
+    """Shops refused in the same second must not come back in the same second.
+
+    The live failure: eight shops were refused at 00:24:41, each paused for
+    exactly 60s, and four of them woke together at 00:25:42. Nothing had been
+    allowed to succeed during that minute, so the breaker read a drought and
+    abandoned seventeen stores — one second before six of those same shops
+    returned 200.
+    """
+
+    async def test_identical_pauses_come_back_at_different_times(self):
+        limiter = RateLimiter(rate=10_000.0, per_host_rate=10_000.0, cooldown=0.05)
+        for n in range(8):
+            await limiter.penalise(host=f"shop{n}.example")
+
+        async def when(host):
+            start = time.monotonic()
+            await limiter.acquire(host)
+            return time.monotonic() - start
+
+        waits = await asyncio.gather(*(when(f"shop{n}.example") for n in range(8)))
+        assert min(waits) >= 0.05, "nobody comes back early"
+        assert max(waits) - min(waits) > 0.005, "and they do not come back together"
+
+    async def test_a_request_getting_through_lifts_the_block(self):
+        """A platform-wide refusal cannot produce a success. One arriving means
+        the breaker was reading a convoy, and the sweep should carry on."""
+        limiter = RateLimiter(rate=1000.0, per_host_rate=1000.0, cooldown=0.001)
+        give_it_a_sample(limiter)
+        for n in range(4):
+            await limiter.penalise(host=f"shop{n}.example")
+        assert limiter.blocked
+
+        limiter.note_success("shop0.example")
+        assert not limiter.blocked
+
+    async def test_a_real_block_stays_tripped(self):
+        limiter = RateLimiter(rate=1000.0, per_host_rate=1000.0, cooldown=0.001)
+        give_it_a_sample(limiter)
+        for n in range(8):
+            await limiter.penalise(host=f"shop{n}.example")
+        assert limiter.blocked, "nothing got through, so the block holds"
+
+
+class TestConfirmingABlock:
+    """Tripping the breaker must not fail the queue in the same instant.
+
+    Live evidence: the block was declared at 10:45:14, fifteen queued stores were
+    marked "skipped: Shopify blocked this IP" inside that second, and at 10:45:30
+    one of them returned 750 products. The stores that had not started yet are
+    the ones a revocation can still save, so they wait.
+    """
+
+    async def test_a_waiter_is_released_when_a_request_gets_through(self, monkeypatch):
+        monkeypatch.setattr("pi.throttle.CONFIRM_WINDOW", 5.0)
+        limiter = RateLimiter(rate=1000.0, per_host_rate=1000.0, cooldown=0.001)
+        give_it_a_sample(limiter)
+        for n in range(4):
+            await limiter.penalise(host=f"shop{n}.example")
+        assert limiter.blocked
+
+        async def a_request_lands():
+            await asyncio.sleep(0.05)
+            limiter.note_success("slow.example")
+
+        start = time.monotonic()
+        confirmed, _ = await asyncio.gather(limiter.confirm_blocked(), a_request_lands())
+        assert confirmed is False, "one success is proof the platform is not refusing all"
+        assert time.monotonic() - start < 1.0, "and the waiter leaves at once"
+
+    async def test_a_real_block_is_confirmed_once_the_window_passes(self, monkeypatch):
+        monkeypatch.setattr("pi.throttle.CONFIRM_WINDOW", 0.1)
+        limiter = RateLimiter(rate=1000.0, per_host_rate=1000.0, cooldown=0.001)
+        give_it_a_sample(limiter)
+        for n in range(4):
+            await limiter.penalise(host=f"shop{n}.example")
+        assert await limiter.confirm_blocked() is True
+
+    async def test_waiters_are_released_together_not_one_by_one(self, monkeypatch):
+        """The cost of a genuine block is one window for the whole run."""
+        monkeypatch.setattr("pi.throttle.CONFIRM_WINDOW", 0.2)
+        limiter = RateLimiter(rate=1000.0, per_host_rate=1000.0, cooldown=0.001)
+        give_it_a_sample(limiter)
+        for n in range(4):
+            await limiter.penalise(host=f"shop{n}.example")
+
+        start = time.monotonic()
+        results = await asyncio.gather(*(limiter.confirm_blocked() for _ in range(15)))
+        assert all(results)
+        assert time.monotonic() - start < 0.6, "fifteen waiters, one window"
+
+    async def test_nothing_to_confirm_when_there_is_no_block(self):
+        limiter = RateLimiter(rate=1000.0, per_host_rate=1000.0)
+        assert await limiter.confirm_blocked() is False

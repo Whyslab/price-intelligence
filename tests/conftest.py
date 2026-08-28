@@ -45,11 +45,14 @@ def make_history(points: list[tuple[float, float | None, float]]) -> list[sqlite
     scratch.row_factory = sqlite3.Row
     scratch.execute(
         "CREATE TABLE p (variant_id INT, ts TEXT, price_usd REAL, compare_at_usd REAL,"
-        " in_stock INT, currency TEXT, price_native REAL, fx_rate REAL)"
+        " in_stock INT, currency TEXT, price_native REAL, compare_at_native REAL,"
+        " fx_rate REAL)"
     )
     for price, compare, days_ago in points:
+        # USD at a rate of 1.0, so the native and dollar columns coincide and a
+        # test can keep talking in the one set of numbers it cares about.
         scratch.execute(
-            "INSERT INTO p VALUES (1, ?, ?, ?, 1, 'USD', ?, 1.0)",
-            (ts(days_ago), price, compare, price),
+            "INSERT INTO p VALUES (1, ?, ?, ?, 1, 'USD', ?, ?, 1.0)",
+            (ts(days_ago), price, compare, price, compare),
         )
     return scratch.execute("SELECT * FROM p ORDER BY ts").fetchall()

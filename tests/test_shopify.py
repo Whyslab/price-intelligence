@@ -1,6 +1,7 @@
 """Shopify adapter, against a catalogue captured from a real store."""
 from __future__ import annotations
 
+import asyncio
 import httpx
 import pytest
 import respx
@@ -246,6 +247,9 @@ async def test_the_limiter_holds_its_slot_across_the_request(shopify_payload):
         async def penalise(self, pause=None, host=""):
             events.append(f"penalise:{host}")
 
+        async def confirm_blocked(self):
+            return False
+
     respx.get("https://shop.example/products.json?limit=250").mock(
         return_value=httpx.Response(200, json=shopify_payload)
     )
@@ -260,11 +264,14 @@ async def test_the_limiter_holds_its_slot_across_the_request(shopify_payload):
 
 
 @respx.mock
-async def test_a_blocked_platform_stops_the_sweep_instead_of_probing_it(shopify_payload):
+async def test_a_blocked_platform_stops_the_sweep_instead_of_probing_it(
+    shopify_payload, monkeypatch
+):
     """Measured: once blocked, even one request every two seconds returns 429
     from every shop, for over twenty minutes. Continuing only prolongs it."""
     from pi.throttle import MIN_ATTEMPTS_BEFORE_BLOCK, RateLimiter
 
+    monkeypatch.setattr("pi.throttle.CONFIRM_WINDOW", 0.05)
     limiter = RateLimiter(rate=1000.0, per_host_rate=1000.0, cooldown=0.001)
     for _ in range(MIN_ATTEMPTS_BEFORE_BLOCK):
         limiter.note_attempt()
@@ -281,3 +288,36 @@ async def test_a_blocked_platform_stops_the_sweep_instead_of_probing_it(shopify_
     assert not route.called, "no request is made at all"
     assert not result.ok
     assert "blocked" in result.error
+
+
+@respx.mock
+async def test_a_store_waiting_out_a_false_block_is_still_collected(
+    shopify_payload, monkeypatch
+):
+    """The breaker fires on a back-off convoy as readily as on a real block, and
+    a store failed in the same instant can never be saved by it being wrong."""
+    from pi.throttle import MIN_ATTEMPTS_BEFORE_BLOCK, RateLimiter
+
+    monkeypatch.setattr("pi.throttle.CONFIRM_WINDOW", 5.0)
+    limiter = RateLimiter(rate=1000.0, per_host_rate=1000.0, cooldown=0.001)
+    for _ in range(MIN_ATTEMPTS_BEFORE_BLOCK):
+        limiter.note_attempt()
+    for n in range(4):
+        await limiter.penalise(host=f"other{n}.example")
+
+    respx.get("https://shop.example/products.json?limit=250").mock(
+        return_value=httpx.Response(200, json=shopify_payload)
+    )
+
+    async def another_shop_answers():
+        await asyncio.sleep(0.05)
+        limiter.note_success("elsewhere.example")
+
+    async with httpx.AsyncClient() as client:
+        result, _ = await asyncio.gather(
+            shopify.fetch(client, "shop.example", currency="USD", limiter=limiter),
+            another_shop_answers(),
+        )
+
+    assert result.ok, "the block was lifted before this store gave up"
+    assert result.products

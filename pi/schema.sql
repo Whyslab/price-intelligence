@@ -43,8 +43,9 @@ CREATE TABLE IF NOT EXISTS variants (
 CREATE INDEX IF NOT EXISTS ix_variants_sku       ON variants(sku);
 CREATE INDEX IF NOT EXISTS ix_variants_size_norm ON variants(size_norm);
 
--- Append-only, but a row is written only when price, compare_at or stock actually
--- changed. A 6-hourly sweep over an unchanged catalogue writes nothing.
+-- Append-only, but a row is written only when the price, the struck-through price
+-- or stock actually changed *in the shop's own currency*. A 6-hourly sweep over an
+-- unchanged catalogue writes nothing, whatever the exchange rate did.
 CREATE TABLE IF NOT EXISTS price_points (
     variant_id      INTEGER NOT NULL REFERENCES variants(id) ON DELETE CASCADE,
     ts              TEXT    NOT NULL,
@@ -53,6 +54,10 @@ CREATE TABLE IF NOT EXISTS price_points (
     in_stock        INTEGER NOT NULL DEFAULT 1,
     currency        TEXT    NOT NULL,
     price_native    REAL    NOT NULL,
+    -- The struck-through price as the shop quotes it. Comparisons are made on
+    -- the native pair, never on the USD one: an exchange rate that moves while
+    -- the shop stands still is not a price change.
+    compare_at_native REAL,
     fx_rate         REAL    NOT NULL,
     PRIMARY KEY (variant_id, ts)
 );
@@ -88,5 +93,11 @@ CREATE TABLE IF NOT EXISTS runs (
     products_seen  INTEGER NOT NULL DEFAULT 0,
     points_written INTEGER NOT NULL DEFAULT 0,
     alerts_sent    INTEGER NOT NULL DEFAULT 0,
+    -- Two independent facts about a run, which shared one `note` column until
+    -- they started overwriting each other: a run can hit its alert cap *and* be
+    -- cut off by Shopify, and the capped flag is what makes the next run
+    -- reconsider the deals that did not fit.
+    capped         INTEGER NOT NULL DEFAULT 0,
+    blocked        INTEGER NOT NULL DEFAULT 0,
     note           TEXT
 );

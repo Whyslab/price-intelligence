@@ -1,13 +1,16 @@
 """SQLite access. Plain SQL, one connection helper, schema versioned by PRAGMA."""
 from __future__ import annotations
 
+import logging
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-SCHEMA_VERSION = 2
+log = logging.getLogger(__name__)
+
+SCHEMA_VERSION = 3
 SCHEMA_SQL = Path(__file__).with_name("schema.sql")
 
 
@@ -42,6 +45,8 @@ def migrate(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA_SQL.read_text(encoding="utf-8"))
     if current == 1:
         _migrate_1_to_2(conn)
+    if current in (1, 2):
+        _migrate_2_to_3(conn)
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
 
@@ -62,6 +67,82 @@ def _migrate_1_to_2(conn: sqlite3.Connection) -> None:
         )
         """
     )
+
+
+def _migrate_2_to_3(conn: sqlite3.Connection) -> None:
+    """Add the native struck-through price and the separate run flags.
+
+    Also throws away the history rows that only ever recorded an exchange rate
+    moving. Until now `record_price` compared prices in dollars, so 157.50 SGD
+    read on two days at rates 1.2705 and 1.2713 looked like $123.97 falling to
+    $123.89 — a "price change" the shop never made. Those rows are most of the
+    history: they inflate the database, they make an all-time low out of a
+    currency wobble, and they are about to be the input to a 30-day reference
+    price, where they would do real damage.
+    """
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(price_points)")}
+    if "compare_at_native" not in columns:
+        conn.execute("ALTER TABLE price_points ADD COLUMN compare_at_native REAL")
+        # Reconstruct it from what we stored: compare_at_usd was rounded to the
+        # cent, so this is approximate, and it is only used to compare with the
+        # next observation. A 1% tolerance covers the rounding.
+        conn.execute(
+            "UPDATE price_points SET compare_at_native = round(compare_at_usd * fx_rate, 2)"
+            " WHERE compare_at_usd IS NOT NULL"
+        )
+
+    run_columns = {row["name"] for row in conn.execute("PRAGMA table_info(runs)")}
+    if "capped" not in run_columns:
+        conn.execute("ALTER TABLE runs ADD COLUMN capped INTEGER NOT NULL DEFAULT 0")
+        conn.execute("UPDATE runs SET capped = 1 WHERE note = 'capped'")
+    if "blocked" not in run_columns:
+        conn.execute("ALTER TABLE runs ADD COLUMN blocked INTEGER NOT NULL DEFAULT 0")
+        conn.execute("UPDATE runs SET blocked = 1 WHERE note = 'blocked'")
+
+    dropped = drop_fx_noise(conn)
+    if dropped:
+        log.info("removed %d history rows that only recorded an exchange rate moving", dropped)
+
+
+def drop_fx_noise(conn: sqlite3.Connection) -> int:
+    """Delete points identical to the one before them in the shop's own currency.
+
+    "Identical" means the same asking price, the same currency, the same stock
+    state and a struck-through price within 1% (it was reconstructed from a
+    rounded dollar figure, so it cannot be compared exactly). The *earliest* row
+    of such a run is kept: it is the one that records when the price actually
+    took effect.
+    """
+    cur = conn.execute(
+        """
+        DELETE FROM price_points WHERE rowid IN (
+            SELECT rowid FROM (
+                SELECT rowid,
+                       price_native,
+                       currency,
+                       in_stock,
+                       compare_at_native,
+                       LAG(price_native)      OVER w AS prev_price,
+                       LAG(currency)          OVER w AS prev_currency,
+                       LAG(in_stock)          OVER w AS prev_stock,
+                       LAG(compare_at_native) OVER w AS prev_compare
+                FROM price_points
+                WINDOW w AS (PARTITION BY variant_id ORDER BY ts)
+            )
+            WHERE prev_currency IS NOT NULL
+              AND currency = prev_currency
+              AND in_stock = prev_stock
+              AND abs(price_native - prev_price) < 0.005
+              AND (
+                    (compare_at_native IS NULL AND prev_compare IS NULL)
+                 OR (compare_at_native IS NOT NULL AND prev_compare IS NOT NULL
+                     AND abs(compare_at_native - prev_compare)
+                         <= 0.01 * max(compare_at_native, prev_compare))
+              )
+        )
+        """
+    )
+    return cur.rowcount
 
 
 @contextmanager
@@ -187,28 +268,36 @@ def record_price(
     price_native: float,
     fx_rate: float,
     ts: str | None = None,
+    compare_at_native: float | None = None,
 ) -> bool:
-    """Append a price point, but only if something actually changed.
+    """Append a price point, but only if the shop actually changed something.
 
-    Returns True when a row was written. Skipping unchanged observations keeps
-    the history small enough that the median queries below stay cheap.
+    "Changed" is judged in the shop's own currency. Judging it in dollars made
+    every daily exchange-rate tick look like a price move: 157.50 SGD read twice
+    at rates 1.2705 and 1.2713 became $123.97 and $123.89, and the second one was
+    written down as news. That noise was most of the database, and it turned a
+    currency wobble into an all-time low.
+
+    Returns True when a row was written.
     """
     prev = latest_point(conn, variant_id)
     if prev is not None and (
-        abs(prev["price_usd"] - price_usd) < 0.005
-        and _same_money(prev["compare_at_usd"], compare_at_usd)
+        prev["currency"] == currency
+        and abs(prev["price_native"] - price_native) < 0.005
+        and _same_money(prev["compare_at_native"], compare_at_native)
         and bool(prev["in_stock"]) is bool(in_stock)
     ):
         return False
     conn.execute(
         """
         INSERT OR REPLACE INTO price_points
-            (variant_id, ts, price_usd, compare_at_usd, in_stock, currency, price_native, fx_rate)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            (variant_id, ts, price_usd, compare_at_usd, in_stock, currency,
+             price_native, compare_at_native, fx_rate)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             variant_id, ts or utcnow(), price_usd, compare_at_usd,
-            int(in_stock), currency, price_native, fx_rate,
+            int(in_stock), currency, price_native, compare_at_native, fx_rate,
         ),
     )
     return True

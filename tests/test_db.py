@@ -41,11 +41,35 @@ def test_unchanged_prices_are_not_recorded_again(conn):
 
 def test_every_kind_of_change_is_recorded(conn):
     variant = _variant(conn)
-    dbm.record_price(conn, variant, 120.0, 220.0, True, "USD", 120.0, 1.0, ts=ts(4))
-    assert dbm.record_price(conn, variant, 110.0, 220.0, True, "USD", 110.0, 1.0, ts=ts(3))  # price
-    assert dbm.record_price(conn, variant, 110.0, 200.0, True, "USD", 110.0, 1.0, ts=ts(2))  # tag
-    assert dbm.record_price(conn, variant, 110.0, 200.0, False, "USD", 110.0, 1.0, ts=ts(1))  # stock
+    dbm.record_price(conn, variant, 120.0, 220.0, True, "USD", 120.0, 1.0, ts=ts(4), compare_at_native=220.0)
+    assert dbm.record_price(  # price
+        conn, variant, 110.0, 220.0, True, "USD", 110.0, 1.0, ts=ts(3), compare_at_native=220.0
+    )
+    assert dbm.record_price(  # struck-through price
+        conn, variant, 110.0, 200.0, True, "USD", 110.0, 1.0, ts=ts(2), compare_at_native=200.0
+    )
+    assert dbm.record_price(  # stock
+        conn, variant, 110.0, 200.0, False, "USD", 110.0, 1.0, ts=ts(1), compare_at_native=200.0
+    )
     assert conn.execute("SELECT COUNT(*) FROM price_points").fetchone()[0] == 4
+
+
+def test_a_moving_exchange_rate_is_not_a_price_change(conn):
+    """157.50 SGD read on two days became $123.97 and $123.89, and the second was
+    written down as news. That noise was most of the database."""
+    variant = _variant(conn)
+    assert dbm.record_price(conn, variant, 123.97, None, True, "SGD", 157.50, 1.2705, ts=ts(3))
+    assert dbm.record_price(
+        conn, variant, 123.89, None, True, "SGD", 157.50, 1.2713, ts=ts(0)
+    ) is False
+    assert conn.execute("SELECT COUNT(*) FROM price_points").fetchone()[0] == 1
+
+
+def test_a_shop_changing_currency_is_recorded(conn):
+    """Same number, different money — that is a change, not a repeat."""
+    variant = _variant(conn)
+    assert dbm.record_price(conn, variant, 130.0, None, True, "USD", 130.0, 1.0, ts=ts(1))
+    assert dbm.record_price(conn, variant, 151.0, None, True, "EUR", 130.0, 0.86, ts=ts(0))
 
 
 def test_history_comes_back_oldest_first(conn):
@@ -104,7 +128,8 @@ class TestPruning:
     def test_old_history_goes_but_the_current_price_stays(self, conn):
         variant = _variant(conn)
         for days in (400, 300, 200, 100, 10):
-            dbm.record_price(conn, variant, 100.0 + days, None, True, "USD", 100.0, 1.0, ts=ts(days))
+            price = 100.0 + days
+            dbm.record_price(conn, variant, price, None, True, "USD", price, 1.0, ts=ts(days))
 
         removed = dbm.prune_history(conn, keep_days=180)
         assert removed == 3

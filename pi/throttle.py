@@ -30,6 +30,30 @@ of successes over the same window. The caller then abandons the Shopify part of
 the run and retries on the next timer, rather than spending half an hour
 collecting 429s and keeping the block alive.
 
+*The breaker used to trip on its own back-off convoy.* Every refused host was
+paused for exactly the same 60 seconds, so they all woke in the same second and
+refused together — and because nobody had been allowed to ask anything during
+that minute, there were no successes either, which read as a drought. From one
+live run:
+
+    00:24:41-42  eight shops refuse, each paused 60s
+    00:25:42     four of them wake in the same second -> "platform-wide block"
+    00:25:43     six of those very shops return 200
+
+Three things follow. Pauses are jittered so a convoy disperses instead of
+re-forming. The breaker is *revocable*: a single request getting through proves
+the platform is not refusing everything, so the block is lifted. And tripping it
+no longer fails the queue instantly — the stores still waiting hold for
+CONFIRM_WINDOW seconds instead, which is what gives a revocation time to arrive.
+Without that last part revocation is useless: measured on a live sweep, the block
+was declared at 10:45:14, fifteen queued stores were failed inside that same
+second, and sixteen seconds later one of the shops it had given up on returned
+750 products.
+
+A real block produces no success, so the wait expires and the sweep is abandoned
+as before — at a cost of one CONFIRM_WINDOW, paid once because every waiter is
+released together.
+
 *Per shop, and overall.* Each host also gets its own bucket so no one shop is
 hit repeatedly in quick succession, and a global bucket paces the sweep.
 """
@@ -37,6 +61,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import time
 from collections import deque
 from contextlib import asynccontextmanager
@@ -53,6 +78,16 @@ PLATFORM_WINDOW = 30.0
 # request every time, so a sweep whose opening requests land on them would
 # otherwise abandon all 138 stores two seconds in.
 MIN_ATTEMPTS_BEFORE_BLOCK = 12
+# A pause is stretched by a random factor in this range so that shops refused in
+# the same second do not all come back in the same second. Without it the retries
+# arrive as one volley, which looks exactly like the block it then causes us to
+# declare. The range starts at 1.0 and never below: when a shop sends an explicit
+# Retry-After, waiting less than it asked is not ours to choose.
+PAUSE_JITTER = (1.0, 1.6)
+# How long a suspected block is held as provisional. Requests that have not
+# started yet wait this out; a success from one already in flight cancels it.
+# Long enough for a jittered 60s penalty to come back and prove itself wrong.
+CONFIRM_WINDOW = 75.0
 
 
 class _Bucket:
@@ -124,22 +159,49 @@ class RateLimiter:
 
     @property
     def blocked(self) -> bool:
-        """True once the platform has started refusing everything.
+        """True once the platform looks like it is refusing everything.
 
-        The caller should stop making Shopify requests for the rest of the run.
-        Going slower does not lift it and continuing to probe prolongs it.
+        Provisional: see `confirm_blocked`, which is what a caller about to make a
+        request should await instead. This property is for reporting on a finished
+        run.
         """
         return self.blocked_at is not None
+
+    async def confirm_blocked(self) -> bool:
+        """Hold off while a suspected block proves itself, then say whether it did.
+
+        Returns False the moment a request gets through — the sweep carries on.
+        Returns True once CONFIRM_WINDOW has passed with nothing getting through,
+        and then the caller should give up on Shopify for this run.
+        """
+        while (started := self.blocked_at) is not None:
+            left = CONFIRM_WINDOW - (time.monotonic() - started)
+            if left <= 0:
+                return True
+            await asyncio.sleep(min(left, 0.5))
+        return False
 
     def note_attempt(self, host: str = "") -> None:
         """Record that a request was made, successful or not."""
         self.attempts += 1
 
     def note_success(self, host: str = "") -> None:
-        """Record that a request got through. Cheap, and it is what keeps the
-        breaker from tripping on a sweep that is merely bumpy."""
+        """Record that a request got through.
+
+        This is what keeps the breaker from tripping on a sweep that is merely
+        bumpy — and it also lifts a block that has already been declared. A
+        platform-wide refusal cannot produce a success, so one arriving means the
+        breaker was reading a back-off convoy rather than a block, and the rest of
+        the sweep should go ahead.
+        """
         self._last_success = time.monotonic()
         self.successes += 1
+        if self.blocked_at is not None:
+            self.blocked_at = None
+            self._recent.clear()
+            log.warning(
+                "%s got through after all — lifting the block and carrying on", host or "a shop"
+            )
 
     def _bucket(self, host: str) -> _Bucket:
         bucket = self._hosts.get(host)
@@ -172,7 +234,7 @@ class RateLimiter:
         """Called on a 429. Slows `host`, and the whole sweep only if many complain."""
         async with self._lock:
             now = time.monotonic()
-            wait = self.cooldown if pause is None else pause
+            wait = (self.cooldown if pause is None else pause) * random.uniform(*PAUSE_JITTER)
             self.penalties += 1
 
             if host:
@@ -212,6 +274,10 @@ class NullLimiter:
 
     penalties = 0
     rate = float("inf")
+    blocked = False
+
+    async def confirm_blocked(self) -> bool:
+        return False
 
     async def acquire(self, host: str = "") -> None:
         return

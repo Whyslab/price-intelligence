@@ -73,35 +73,45 @@ def _is_fake_sale(history: list[sqlite3.Row], fake_sale_days: int) -> bool:
     Only the tag's own stability is tested, not the asking price's: a shop that
     keeps "was £220" pinned for two months while nudging the price between £120
     and £130 is still running a permanent sale.
+
+    Compared in the shop's own currency, so a moving exchange rate cannot make a
+    pinned tag look like it just changed.
     """
-    tagged = [r for r in history if r["compare_at_usd"]]
+    tagged = [r for r in history if _tag_native(r)]
     if len(tagged) < 2:
         return False
     newest = tagged[-1]
+    newest_tag = _tag_native(newest)
     unchanged_since = newest
     for row in reversed(tagged):
-        if (
-            abs(row["compare_at_usd"] - newest["compare_at_usd"]) > 0.005
-            or row["compare_at_usd"] <= row["price_usd"]
-        ):
+        tag = _tag_native(row)
+        if abs(tag - newest_tag) > 0.005 or tag <= row["price_native"]:
             break
         unchanged_since = row
     age = _parse(newest["ts"]) - _parse(unchanged_since["ts"])
     return age >= timedelta(days=fake_sale_days)
 
 
-def _dropped_hours_ago(history: list[sqlite3.Row], price_usd: float) -> float | None:
+def _tag_native(row: sqlite3.Row) -> float | None:
+    """The struck-through price in the shop's currency, or None if there is none."""
+    return row["compare_at_native"] or None
+
+
+def _dropped_hours_ago(history: list[sqlite3.Row], price_native: float) -> float | None:
     """How long the current price has been in effect, in hours.
 
     None when there is only one observation: first sight of a product tells us
     when we looked, not when the shop changed anything, and reporting that as
     "the price just dropped" would be a claim we cannot support.
+
+    Matched on the shop's own price. In dollars, a variant whose price had not
+    moved in months reported "price dropped 4 hours ago" every time the euro did.
     """
     if len(history) < 2:
         return None
     started = None
     for row in reversed(history):
-        if abs(row["price_usd"] - price_usd) > 0.005:
+        if abs(row["price_native"] - price_native) > 0.005:
             break
         started = row
     if started is None:
@@ -124,15 +134,28 @@ def evaluate(
     `history` is every recorded point for the variant, oldest first, including
     the current one.
     """
-    if not in_stock or price_usd <= 0:
+    if not in_stock or price_usd <= 0 or not history:
         return None
     if not (filters.min_price_usd <= price_usd <= filters.max_price_usd):
         return None
 
-    past = [r["price_usd"] for r in history[:-1]] if len(history) > 1 else []
+    # Everything below is arithmetic in the shop's own currency, converted to
+    # dollars only at the end. Comparing dollar figures recorded on different
+    # days compares two things at once — the shop's price and the exchange rate —
+    # and the rate is not news.
+    current = history[-1]
+    currency = current["currency"]
+    fx_rate = current["fx_rate"] or 1.0
+    price_native = current["price_native"]
+    compare_native = _tag_native(current)
+
+    # A shop that switched currency invalidates its own past: 120 GBP and 120 EUR
+    # are not comparable, and pretending otherwise invents a discount.
+    comparable = [r for r in history[:-1] if r["currency"] == currency]
+    past = [r["price_native"] for r in comparable]
     span_days = (
-        (_parse(history[-1]["ts"]) - _parse(history[0]["ts"])).total_seconds() / 86400
-        if len(history) > 1
+        (_parse(current["ts"]) - _parse(comparable[0]["ts"])).total_seconds() / 86400
+        if comparable
         else 0.0
     )
     has_history = len(past) >= MIN_HISTORY_POINTS and span_days >= MIN_HISTORY_DAYS
@@ -140,21 +163,22 @@ def evaluate(
 
     # Our own median beats the shop's claim; the tag is the fallback.
     if has_history:
-        reference, source = statistics.median(past), "history"
-    elif compare_at_usd and compare_at_usd > price_usd:
-        reference, source = compare_at_usd, "tag"
+        reference_native, source = statistics.median(past), "history"
+    elif compare_native and compare_native > price_native:
+        reference_native, source = compare_native, "tag"
     else:
         return None
 
-    if reference <= price_usd:
+    if reference_native <= price_native:
         return None
 
-    discount_pct = (reference - price_usd) / reference * 100
-    saving_usd = reference - price_usd
+    discount_pct = (reference_native - price_native) / reference_native * 100
+    saving_usd = round((reference_native - price_native) / fx_rate, 2)
+    reference = round(reference_native / fx_rate, 2)
     if discount_pct < filters.min_discount_pct or saving_usd < filters.min_saving_usd:
         return None
 
-    all_time_low = bool(past) and price_usd < min(past) - 0.005
+    all_time_low = bool(past) and price_native < min(past) - 0.005
 
     score = discount_pct * 1.6
     if source == "history":
@@ -178,7 +202,7 @@ def evaluate(
         score=score,
         all_time_low=all_time_low,
         fake_sale=fake_sale,
-        dropped_hours_ago=_dropped_hours_ago(history, price_usd),
+        dropped_hours_ago=_dropped_hours_ago(history, price_native),
         history_points=len(history),
     )
 

@@ -5,7 +5,10 @@ import asyncio
 import logging
 import sqlite3
 from collections import Counter
+from collections.abc import Iterator
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
+from itertools import groupby
 
 import httpx
 
@@ -47,11 +50,17 @@ def make_client(timeout: float = 30.0) -> httpx.AsyncClient:
 
 
 def _last_run_was_capped(conn: sqlite3.Connection) -> bool:
-    """Did the previous run leave deals unsent because it hit the cap?"""
+    """Did the previous run leave deals unsent because it hit the cap?
+
+    Read from its own column. While this shared `runs.note` with the blocked
+    flag, a run that was both capped and cut off by Shopify — which is every run
+    that has ever been capped — recorded only the second fact, so the deals over
+    the cap were never reconsidered.
+    """
     row = conn.execute(
-        "SELECT note FROM runs WHERE finished_at IS NOT NULL ORDER BY id DESC LIMIT 1"
+        "SELECT capped FROM runs WHERE finished_at IS NOT NULL ORDER BY id DESC LIMIT 1"
     ).fetchone()
-    return bool(row and row["note"] == "capped")
+    return bool(row and row["capped"])
 
 
 def _take_shopify_slice(
@@ -150,39 +159,79 @@ def store_result(
             if dbm.record_price(
                 conn, variant_id, price_usd, compare_usd, variant.in_stock,
                 currency, variant.price, rate, ts=ts,
+                compare_at_native=variant.compare_at,
             ):
                 written += 1
                 changed.append(variant_id)
     return written, changed
 
 
+CANDIDATES_SQL = """
+    SELECT v.id AS variant_id, v.product_id, v.sku, v.size, v.size_norm, v.color,
+           p.title, p.brand, p.url, p.image_url,
+           s.name AS store_name, s.domain, s.country, s.currency
+    FROM pi_candidates c
+    JOIN variants v ON v.id = c.id
+    JOIN products p ON p.id = v.product_id
+    JOIN stores   s ON s.id = p.store_id
+"""
+
+
+def _candidates(
+    conn: sqlite3.Connection, variant_ids: list[int], config: Config
+) -> dict[int, sqlite3.Row]:
+    """Metadata for every variant worth scoring, in one query, filters applied.
+
+    Asking per variant costs a query each, which is invisible on the few hundred
+    that move in a normal run and ruinous on the 2.7 million that `pi seed` and
+    `--rescan` look at — and seed is a required step before the first live run.
+    """
+    conn.execute("DROP TABLE IF EXISTS temp.pi_candidates")
+    conn.execute("CREATE TEMP TABLE pi_candidates (id INTEGER PRIMARY KEY)")
+    conn.executemany(
+        "INSERT OR IGNORE INTO pi_candidates (id) VALUES (?)",
+        ((variant_id,) for variant_id in variant_ids),
+    )
+    filters = config.filters
+    kept: dict[int, sqlite3.Row] = {}
+    rejected: list[tuple[int]] = []
+    for row in conn.execute(CANDIDATES_SQL):
+        if filters.wants_brand(row["brand"]) and filters.wants_size(row["size_norm"]):
+            kept[row["variant_id"]] = row
+        else:
+            rejected.append((row["variant_id"],))
+    if rejected:
+        conn.executemany("DELETE FROM pi_candidates WHERE id = ?", rejected)
+    return kept
+
+
+def _histories(conn: sqlite3.Connection) -> Iterator[tuple[int, list[sqlite3.Row]]]:
+    """Every candidate's price history, oldest first, in one ordered pass."""
+    rows = conn.execute(
+        """
+        SELECT pp.* FROM price_points pp
+        JOIN pi_candidates c ON c.id = pp.variant_id
+        ORDER BY pp.variant_id, pp.ts
+        """
+    )
+    for variant_id, points in groupby(rows, key=lambda row: row["variant_id"]):
+        yield variant_id, list(points)
+
+
 def find_deals(
     conn: sqlite3.Connection, variant_ids: list[int], config: Config
 ) -> list[tuple[dealm.Deal, sqlite3.Row]]:
     """Score the variants that moved, returning the ones worth announcing."""
-    best_per_product: dict[int, tuple[dealm.Deal, sqlite3.Row]] = {}
-    for variant_id in variant_ids:
-        row = conn.execute(
-            """
-            SELECT v.id AS variant_id, v.product_id, v.sku, v.size, v.size_norm, v.color,
-                   p.title, p.brand, p.url, p.image_url,
-                   s.name AS store_name, s.domain, s.country, s.currency
-            FROM variants v
-            JOIN products p ON p.id = v.product_id
-            JOIN stores   s ON s.id = p.store_id
-            WHERE v.id = ?
-            """,
-            (variant_id,),
-        ).fetchone()
-        if row is None:
-            continue
-        if not config.filters.wants_brand(row["brand"]):
-            continue
-        if not config.filters.wants_size(row["size_norm"]):
-            continue
+    if not variant_ids:
+        return []
+    rows = _candidates(conn, variant_ids, config)
+    if not rows:
+        return []
 
-        history = dbm.price_history(conn, variant_id)
-        if not history:
+    best_per_product: dict[int, tuple[dealm.Deal, sqlite3.Row]] = {}
+    for variant_id, history in _histories(conn):
+        row = rows.get(variant_id)
+        if row is None:
             continue
         current = history[-1]
         deal = dealm.evaluate(
@@ -399,7 +448,7 @@ async def run(
                 "reconsider them (raise max_alerts_per_run to see them sooner)",
                 overflow, cap,
             )
-            conn.execute("UPDATE runs SET note = 'capped' WHERE id = ?", (run_id,))
+            conn.execute("UPDATE runs SET capped = 1 WHERE id = ?", (run_id,))
 
         if dry_run:
             for deal, row in selected:
@@ -429,7 +478,7 @@ async def run(
                 await asyncio.sleep(1.0)  # Telegram allows ~30 messages/second; be calm
 
     if limiter.blocked:
-        conn.execute("UPDATE runs SET note = 'blocked' WHERE id = ?", (run_id,))
+        conn.execute("UPDATE runs SET blocked = 1 WHERE id = ?", (run_id,))
         log.error(
             "Shopify blocked this IP part-way through; %d store(s) were skipped and "
             "will be collected on the next run", stats.stores_failed,
@@ -465,15 +514,21 @@ def health_report(conn: sqlite3.Connection) -> str:
     last = conn.execute(
         "SELECT * FROM runs WHERE finished_at IS NOT NULL ORDER BY id DESC LIMIT 1"
     ).fetchone()
+    # Compare against a cutoff built the way we store timestamps. SQLite's
+    # datetime() yields "2026-08-27 08:25:00" while our rows read
+    # "2026-08-27T00:24:19+00:00", and 'T' sorts after ' ', so every row from
+    # today counted as being inside the last day whatever its hour.
+    a_day_ago = (datetime.now(UTC) - timedelta(days=1)).isoformat(timespec="seconds")
     day = conn.execute(
-        "SELECT COUNT(*) FROM alerts WHERE sent = 1 AND ts > datetime('now', '-1 day')"
+        "SELECT COUNT(*) FROM alerts WHERE sent = 1 AND ts > ?", (a_day_ago,)
     ).fetchone()[0]
     stale = conn.execute(
         """
         SELECT COUNT(*) FROM stores
         WHERE platform = 'shopify'
-          AND (last_ok IS NULL OR last_ok < datetime('now', '-1 day'))
-        """
+          AND (last_ok IS NULL OR last_ok < ?)
+        """,
+        (a_day_ago,),
     ).fetchone()[0]
     shopify_total = conn.execute(
         "SELECT COUNT(*) FROM stores WHERE platform = 'shopify'"
@@ -500,9 +555,9 @@ def health_report(conn: sqlite3.Connection) -> str:
             f"Товаров просмотрено: {last['products_seen']:,}",
             f"Изменений цен: {last['points_written']:,}",
         ]
-        if last["note"] == "blocked":
+        if last["blocked"]:
             lines.append("⚠️ Обход прерван: Shopify заблокировал IP. Остальные магазины — в следующий раз.")
-        elif last["note"] == "capped":
+        if last["capped"]:
             lines.append("ℹ️ Уведомлений было больше лимита; следующий обход пришлёт остальные.")
     lines += [
         f"Уведомлений за сутки: {day}",

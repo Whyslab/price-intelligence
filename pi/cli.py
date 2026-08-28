@@ -11,6 +11,7 @@ from urllib.parse import urlparse
 from . import db as dbm
 from . import pipeline
 from .config import Config, load_config
+from .domains import same_host
 from .notify import Telegram
 from .sources import detect, jsonld
 from .throttle import RateLimiter
@@ -26,19 +27,33 @@ def _log(level: str) -> None:
 
 
 def read_sites(path: Path) -> list[str]:
-    """Read the site list: one URL or bare domain per line, # for comments."""
+    """Read the site list: one URL or bare domain per line, # for comments.
+
+    Entries differing only by a `www.` prefix are the same server, and keeping
+    both means crawling one shop twice: the list held `sneakerjunkiesusa.com` and
+    `www.sneakerjunkiesusa.com`, which became 9,868 and 9,812 near-identical
+    products in the database. The first spelling seen wins.
+    """
     if not path.exists():
         raise SystemExit(f"site list not found: {path}")
     domains: list[str] = []
+    seen: dict[str, str] = {}
     for line in path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
         host = urlparse(line if "//" in line else f"https://{line}").netloc or line
         host = host.split("@")[-1].split(":")[0].strip().lower()
-        if host:
-            domains.append(host)
-    return list(dict.fromkeys(domains))
+        if not host:
+            continue
+        key = same_host(host)
+        if key in seen:
+            if seen[key] != host:
+                print(f"  {host}: same shop as {seen[key]}, skipped")
+            continue
+        seen[key] = host
+        domains.append(host)
+    return domains
 
 
 def cmd_sites(args, config: Config) -> int:
