@@ -1,0 +1,10 @@
+# Article numbers to be told about whatever the thresholds say.
+#
+# One per line, written the way the manufacturer writes it. Matched against the
+# article numbers found in titles and SKUs, and against the shops' own SKUs.
+# Lines starting with # are ignored, so this file can be left as it is.
+#
+# Examples — delete the # to switch one on:
+# CW2288-111    # Nike Air Force 1 '07 White
+# M2002RDB      # New Balance 2002R
+# 1201A019-021  # ASICS Gel-Kayano 14

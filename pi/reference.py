@@ -34,11 +34,42 @@ from datetime import UTC, datetime, timedelta
 
 from .domains import same_shop
 
-# Article numbers as the big brands write them: Nike CW2288-111, adidas IF4396,
-# the older six-digit Nike 414571-102, Converse 162050C. Matched in SKUs and in
-# titles alike, because plenty of shops put the code in the product name and
-# nowhere else.
-_STYLE_CODE = re.compile(r"\b([A-Z]{2}\d{4}-\d{3}|\d{6}-\d{3}|[A-Z]{2}\d{4}|[A-Z]?\d{5}[A-Z])\b")
+# Article numbers as the big brands write them. Matched in SKUs and in titles
+# alike, because plenty of shops put the code in the product name and nowhere
+# else.
+#
+# Which shapes earn their place was measured, not guessed. The number that
+# matters is not how many products gain a code but how many codes end up shared
+# by three shops or more, since that is what a market price needs. Across the
+# whole catalogue, added to the original set:
+#
+#     New Balance  M2002RDB, U204LMMA   +597 shared keys   +7,060 products
+#     Asics        1201A019-021         +295               +2,401
+#     Puma         635235-01             +69               +9,283
+#     adidas 2+5   IF43961               +30               +7,447
+#     Reebok       100008493             +17               +3,717
+#     Vans         VN0A7Q2J               +0                 +350
+#
+# The first three are in. The last three are not: they cost the most in false
+# matches — a bare nine-digit run is anything at all — and return almost nothing.
+# Puma's shape earns its place on 69 keys rather than on the 9,283 products,
+# which are mostly one shop talking to itself.
+#
+# Converse was listed here as an example and never matched: 162050C is six
+# digits and a letter, and the pattern claiming it wanted five. Written properly
+# it adds 26 shared keys, among them the Chuck 70 in nineteen shops.
+_STYLE_CODE = re.compile(
+    r"\b("
+    r"[A-Z]{2}\d{4}-\d{3}"          # Nike, Jordan   CW2288-111
+    r"|\d{6}-\d{3}"                 # older Nike     414571-102
+    r"|\d{4}[A-Z]\d{3}-\d{3}"       # Asics          1201A019-021
+    r"|\d{6}-\d{2}"                 # Puma           635235-01
+    r"|[A-Z]{2}\d{4}"                # adidas         IF4396
+    r"|[A-Z]{1,2}\d{3,4}[A-Z]{2,4}\d?"  # New Balance M990GL6, U204LMMA, CT302OE
+    r"|\d{6}[A-Z]"                   # Converse       162050C
+    r"|[A-Z]?\d{5}[A-Z]"             # five-digit codes with a colour letter
+    r")\b"
+)
 _NOT_ALNUM = re.compile(r"[^a-z0-9]+")
 # Colour and packaging notes that shops append to an otherwise identical title.
 _TITLE_NOISE = re.compile(
@@ -195,6 +226,24 @@ class MarketIndex:
     @property
     def keys(self) -> int:
         return len(self._by_key)
+
+    def identity(self, product_id: int) -> tuple[str, str] | None:
+        """The strongest key under which other shops also stock this product.
+
+        Strongest first, because the keys are not equally trustworthy: an
+        article number is the manufacturer's and two shops arrive at it
+        independently, while a title match is two shops happening to describe
+        something similarly. None means nobody else stocks it, and it stands
+        alone.
+        """
+        keys = self._keys_by_product.get(product_id)
+        if not keys:
+            return None
+        for kind in (STYLE, SKU, TITLE):
+            matching = sorted(key for key in keys if key[0] == kind)
+            if matching:
+                return matching[0]
+        return None
 
     def look_up(self, product_id: int, shop: str) -> Market:
         """What everyone *except* `shop` is charging for this product.

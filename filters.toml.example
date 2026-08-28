@@ -33,7 +33,12 @@ reference_window_days = 30
 # Products are matched between shops on the manufacturer's article number, so a
 # price can be judged against what everyone else is asking even with no history
 # at all. Both settings are counts of *other* shops that must stock the article.
-market_min_shops = 3   # before their prices are treated as the market price
+# Two, not three: at three the market price covered 45,929 products of 449,243,
+# at two it covers 98,678. The median of two shops is noisier than of three, so
+# if false "discounts" start arriving, this is the first thing to put back.
+market_min_shops = 2   # before their prices are treated as the market price
+# A recommended price is a claim about the brand rather than about one shop, so
+# this one keeps its third witness.
 msrp_min_shops   = 3   # before their struck-through prices imply an RRP
 
 # A struck-through price this many percent above that RRP is the shop's own

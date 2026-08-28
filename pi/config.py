@@ -84,6 +84,9 @@ class Config:
     # off. With least-recently-collected ordering the slices cover everything.
     max_shopify_stores: int
     log_level: str
+    # Article numbers to be told about whatever the thresholds say. A missing
+    # file simply means nothing is being watched, which is the usual case.
+    watchlist_file: Path = ROOT / "data" / "watchlist.txt"
     filters: Filters = field(default_factory=Filters)
 
     @property
@@ -121,6 +124,7 @@ def load_config(env_file: Path | None = None) -> Config:
     return Config(
         db_path=_resolve(os.getenv("PI_DB_PATH", "data/pi.db")),
         sites_file=_resolve(os.getenv("PI_SITES_FILE", "data/sites.txt")),
+        watchlist_file=_resolve(os.getenv("PI_WATCHLIST_FILE", "data/watchlist.txt")),
         bot_token=os.getenv("TELEGRAM_BOT_TOKEN") or None,
         chat_id=os.getenv("TELEGRAM_CHAT_ID") or None,
         concurrency=int(os.getenv("PI_CONCURRENCY", "8")),

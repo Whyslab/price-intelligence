@@ -10,7 +10,7 @@ import respx
 
 from pi import db as dbm
 from pi import deals as dealm
-from pi import pipeline
+from pi import pipeline, reference
 from pi.config import Config, Filters
 
 from .conftest import ts
@@ -566,3 +566,73 @@ def test_the_summary_shows_how_much_of_the_list_is_going_stale(config, conn):
     dbm.upsert_store(conn, "never.example", platform="shopify")
 
     assert "Shopify не обновлялись сутки: 2 из 3" in pipeline.health_report(conn)
+
+
+class TestOneAlertPerArticle:
+    """The same shoe on offer in three shops used to be three notifications.
+
+    Alerts are unique per product, and a product is a row in one shop's
+    catalogue — so nothing stopped the same article arriving three times over
+    with three different shop names on it.
+    """
+
+    @staticmethod
+    def _deal(product_id: int, score: int) -> dealm.Deal:
+        return dealm.Deal(
+            variant_id=product_id, product_id=product_id, price_usd=100.0,
+            reference_usd=200.0, reference_source="market", discount_pct=50.0,
+            saving_usd=100.0, score=score, all_time_low=False, fake_sale=False,
+            dropped_hours_ago=1.0, history_points=2,
+        )
+
+    class _Market:
+        """Stands in for the index: products 1-3 are the same article, 4 is not."""
+
+        def identity(self, product_id: int):
+            return ("style", "CW2288-111") if product_id in (1, 2, 3) else None
+
+    def test_three_shops_selling_one_article_produce_one_notification(self):
+        found = [(self._deal(pid, score), None) for pid, score in ((1, 90), (2, 80), (3, 70))]
+        kept = pipeline._one_alert_per_article(found, self._Market())
+
+        assert len(kept) == 1
+        deal, _ = kept[0]
+        assert deal.product_id == 1, "the best-scoring one is the one that goes out"
+        assert deal.also_in_shops == 2, "and it says how many others had it"
+
+    def test_a_product_nobody_else_stocks_is_left_alone(self):
+        found = [(self._deal(4, 90), None), (self._deal(5, 80), None)]
+        kept = pipeline._one_alert_per_article(found, self._Market())
+
+        assert len(kept) == 2
+        assert all(deal.also_in_shops == 0 for deal, _ in kept)
+
+    def test_seeding_still_accounts_for_every_shop_selling_it(self, config, conn):
+        """A duplicate folded away at seeding time comes back as news later.
+
+        Seeding records what is already on offer so it is never announced. A
+        deal it dropped into another's count was never recorded, so the next
+        sweep finds it standing there and calls it new.
+        """
+        for n, domain in enumerate(("one.example", "two.example", "three.example")):
+            store = dbm.upsert_store(conn, domain, platform="shopify", currency="USD")
+            product = dbm.upsert_product(
+                conn, store, f"p{n}", "Nike Air Force 1 CW2288-111", f"https://{domain}/x"
+            )
+            variant = dbm.upsert_variant(conn, product, f"v{n}", sku="CW2288-111")
+            dbm.set_product_keys(
+                conn, product,
+                reference.keys_for("Nike", "Nike Air Force 1 CW2288-111", ["CW2288-111"]),
+            )
+            dbm.record_price(
+                conn, variant, 100.0, 300.0, True, "USD", 100.0, 1.0,
+                ts=dbm.utcnow(), compare_at_native=300.0,
+            )
+        conn.execute("UPDATE stores SET last_ok = ?", (dbm.utcnow(),))
+
+        sent = pipeline.find_deals(conn, pipeline.all_scorable_variants(conn), config)
+        assert len(sent) == 1, "one article, one notification"
+        assert sent[0][0].also_in_shops == 2
+
+        assert pipeline.seed_alerts(conn, config) == 3, "but all three are suppressed"
+        assert pipeline.seed_alerts(conn, config, dry_run=True) == 0

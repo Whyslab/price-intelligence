@@ -113,6 +113,8 @@ def format_caption(
     lines.append(
         f"💰 <b>{_money(deal.price_usd)}</b> ({_reference_phrase(deal)})"
     )
+    if deal.watched:
+        lines.append("⭐ Из вашего списка отслеживания")
     if deal.all_time_low:
         lines.append("📉 Минимум за всё время наблюдения")
     if deal.beats_market and deal.reference_source != "market":
@@ -120,6 +122,11 @@ def format_caption(
     if deal.inflated_tag and deal.msrp_usd:
         lines.append(
             f"🚩 Магазин зачеркнул цену выше рекомендованной {_money(deal.msrp_usd)}"
+        )
+    if deal.also_in_shops:
+        lines.append(
+            f"🔁 Тот же артикул со скидкой ещё в {deal.also_in_shops} магазинах — "
+            "это лучшее из предложений"
         )
     if deal.rule_priced:
         lines.append("⚠️ Магазин считает скидки по правилу, а не от прежней цены")

@@ -6,6 +6,7 @@ import asyncio
 import logging
 import os
 import sys
+from dataclasses import replace
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -161,6 +162,59 @@ def cmd_seed(args, config: Config) -> int:
     return 0
 
 
+def cmd_find(args, config: Config) -> int:
+    """Ask the database what is on offer right now, instead of waiting to be told.
+
+    The same scoring the notifier uses, with the thresholds overridable on the
+    command line, and without the two rules that exist only because a
+    notification run has to be short: nothing is capped per shop, and a deal
+    already announced still shows up — it is still on offer.
+    """
+    conn = dbm.connect(config.db_path)
+    overrides: dict = {}
+    if args.brand:
+        overrides["brands_allow"] = tuple(b.strip().lower() for b in args.brand.split(","))
+    if args.size:
+        overrides["sizes"] = tuple(z.strip().upper() for z in args.size.split(","))
+    if args.any_size:
+        overrides["sizes"] = ()
+    for name, value in (
+        ("min_discount_pct", args.min_discount),
+        ("min_price_usd", args.min_price),
+        ("max_price_usd", args.max_price),
+        ("min_saving_usd", args.min_saving),
+        ("min_score", args.min_score),
+    ):
+        if value is not None:
+            overrides[name] = value
+    scoped = replace(config, filters=replace(config.filters, **overrides))
+
+    print("считаю по всей базе, это занимает минуту-другую…", file=sys.stderr)
+    found = pipeline.find_deals(
+        conn, pipeline.all_scorable_variants(conn), scoped,
+        cap_per_store=False, skip_alerted=False,
+        watched=pipeline.watched_products(conn, pipeline.read_watchlist(config.watchlist_file)),
+    )
+    if args.shop:
+        wanted = same_host(args.shop.strip().lower())
+        found = [pair for pair in found if same_host(pair[1]["domain"]) == wanted]
+    if not found:
+        print("ничего не нашлось — попробуйте ослабить пороги")
+        return 0
+
+    for deal, row in found[: args.limit]:
+        size = row["size_norm"] or row["size"] or "—"
+        shop = row["store_name"] or row["domain"]
+        print(
+            f"−{deal.discount_pct:4.0f}%  ${deal.price_usd:>8,.2f}  {size:<8} "
+            f"{(row['brand'] or '')[:14]:<14} {row['title'][:44]:<44} {shop[:22]:<22} "
+            f"score {deal.score:3d}"
+        )
+        print(f"        {row['url']}")
+    print(f"\nвсего {len(found):,}, показано {min(len(found), args.limit)}")
+    return 0
+
+
 def cmd_reindex(args, config: Config) -> int:
     """Rebuild the keys products are matched by between shops.
 
@@ -269,6 +323,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="rebuild the article numbers products are matched by between shops",
     )
     p.set_defaults(func=cmd_reindex)
+
+    p = sub.add_parser(
+        "find", help="search the database for what is discounted right now"
+    )
+    p.add_argument("--brand", help="comma-separated, matched as substrings")
+    p.add_argument("--size", help="comma-separated, e.g. US10,EU44")
+    p.add_argument("--any-size", action="store_true", help="ignore the size filter entirely")
+    p.add_argument("--shop", help="only this shop's domain")
+    p.add_argument("--min-discount", type=float, metavar="PCT")
+    p.add_argument("--min-price", type=float, metavar="USD")
+    p.add_argument("--max-price", type=float, metavar="USD")
+    p.add_argument("--min-saving", type=float, metavar="USD")
+    p.add_argument("--min-score", type=int)
+    p.add_argument("--limit", type=int, default=25, help="rows to print (default 25)")
+    p.set_defaults(func=cmd_find)
 
     p = sub.add_parser("health", help="collection health summary")
     p.add_argument("--send", action="store_true", help="send it to Telegram")

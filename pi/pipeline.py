@@ -6,7 +6,7 @@ import logging
 import sqlite3
 from collections import Counter
 from collections.abc import Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from itertools import groupby
 from pathlib import Path
@@ -200,7 +200,10 @@ CANDIDATES_SQL = """
 
 
 def _candidates(
-    conn: sqlite3.Connection, variant_ids: list[int], config: Config
+    conn: sqlite3.Connection,
+    variant_ids: list[int],
+    config: Config,
+    watched: set[int] | None = None,
 ) -> dict[int, sqlite3.Row]:
     """Metadata for every variant worth scoring, in one query, filters applied.
 
@@ -218,7 +221,8 @@ def _candidates(
     kept: dict[int, sqlite3.Row] = {}
     rejected: list[tuple[int]] = []
     for row in conn.execute(CANDIDATES_SQL):
-        if filters.wants_brand(row["brand"]) and filters.wants_size(row["size_norm"]):
+        wanted = filters.wants_brand(row["brand"]) and filters.wants_size(row["size_norm"])
+        if wanted or (watched and row["product_id"] in watched):
             kept[row["variant_id"]] = row
         else:
             rejected.append((row["variant_id"],))
@@ -254,10 +258,76 @@ def _cap_per_store(
     kept = []
     for deal, row in found:
         shop = same_shop(row["domain"])
-        if seen[shop] >= limit:
+        if seen[shop] >= limit and not deal.watched:
             continue
         seen[shop] += 1
         kept.append((deal, row))
+    return kept
+
+
+def read_watchlist(path: Path) -> set[str]:
+    """Article numbers to be told about regardless of the thresholds.
+
+    One per line, blank lines and # comments ignored. Written as the
+    manufacturer writes them — CW2288-111, M2002RDB — and matched against both
+    the article numbers we extract and the shops' own SKUs, because a shop that
+    uses the manufacturer's number as its SKU is the common case.
+    """
+    if not path.exists():
+        return set()
+    codes = set()
+    for line in path.read_text(encoding="utf-8").splitlines():
+        code = line.split("#", 1)[0].strip().upper()
+        if code:
+            codes.add(code)
+    return codes
+
+
+def watched_products(conn: sqlite3.Connection, codes: set[str]) -> set[int]:
+    """Which products those article numbers refer to, in any shop."""
+    if not codes:
+        return set()
+    placeholders = ",".join("?" * len(codes))
+    rows = conn.execute(
+        f"""
+        SELECT product_id FROM product_keys
+        WHERE key_type IN ('style', 'sku') AND key IN ({placeholders})
+        """,
+        sorted(codes),
+    )
+    return {row[0] for row in rows}
+
+
+def _one_alert_per_article(
+    found: list[tuple[dealm.Deal, sqlite3.Row]], market: reference.MarketIndex
+) -> list[tuple[dealm.Deal, sqlite3.Row]]:
+    """Fold the same article discounted in several shops into one notification.
+
+    Alerts are unique per product, and a product is a row in one shop's
+    catalogue — so the same shoe on offer in three shops is three products and
+    three messages saying the same thing. Grouped on the manufacturer's article
+    number, the reader hears about the shoe once, at the best price found, and
+    is told how many other shops were also selling it.
+
+    Only articles other shops actually stock are grouped: `identity` returns
+    None for a product nobody else has, and those pass through untouched.
+    """
+    best: dict[tuple[str, str], int] = {}
+    kept: list[tuple[dealm.Deal, sqlite3.Row]] = []
+    for deal, row in found:
+        key = market.identity(deal.product_id)
+        if key is None:
+            kept.append((deal, row))
+            continue
+        at = best.get(key)
+        if at is None:
+            best[key] = len(kept)
+            kept.append((deal, row))
+            continue
+        winner, winner_row = kept[at]
+        # The list arrives sorted by score, so the first one seen is the one to
+        # keep; the rest only raise the count.
+        kept[at] = (replace(winner, also_in_shops=winner.also_in_shops + 1), winner_row)
     return kept
 
 
@@ -268,17 +338,24 @@ def find_deals(
     market: reference.MarketIndex | None = None,
     trust: dict[int, reference.Trust] | None = None,
     cap_per_store: bool = True,
+    fold_duplicates: bool = True,
+    skip_alerted: bool = True,
+    watched: set[int] | None = None,
 ) -> list[tuple[dealm.Deal, sqlite3.Row]]:
     """Score the variants that moved, returning the ones worth announcing.
 
-    `cap_per_store` is what `seed` turns off: the cap exists so one shop's
-    promotion cannot fill a notification run, but seeding is not a run — it has
-    to account for every qualifying deal, or the ones it trimmed come back as
-    news on the next sweep.
+    `cap_per_store` and `fold_duplicates` are what `seed` turns off. Both exist
+    so one shop's promotion, or one shoe stocked everywhere, cannot fill a
+    notification run — but seeding is not a run. It has to account for every
+    qualifying deal, or the ones it trimmed come back as news on the next sweep.
+
+    `skip_alerted` is what `pi find` turns off: a search of what is on offer
+    right now should show a deal whether or not it was announced last week.
     """
     if not variant_ids:
         return []
-    rows = _candidates(conn, variant_ids, config)
+    watched = watched or set()
+    rows = _candidates(conn, variant_ids, config, watched)
     if not rows:
         return []
     if market is None:
@@ -303,8 +380,9 @@ def find_deals(
             filters=config.filters,
             market=market.look_up(row["product_id"], same_shop(row["domain"])),
             trust=trust.get(row["store_id"]),
+            watched=row["product_id"] in watched,
         )
-        if deal is None or dealm.already_alerted(conn, deal):
+        if deal is None or (skip_alerted and dealm.already_alerted(conn, deal)):
             continue
         # One notification per product: the same hoodie discounted in six sizes
         # is one thing worth knowing, so keep only its best-scoring variant.
@@ -314,9 +392,11 @@ def find_deals(
 
     found = list(best_per_product.values())
     found.sort(key=lambda pair: pair[0].score, reverse=True)
-    if not cap_per_store:
-        return found
-    return _cap_per_store(found, config.filters.max_alerts_per_store)
+    if fold_duplicates:
+        found = _one_alert_per_article(found, market)
+    if cap_per_store:
+        found = _cap_per_store(found, config.filters.max_alerts_per_store)
+    return found
 
 
 def seed_alerts(conn: sqlite3.Connection, config: Config, dry_run: bool = False) -> int:
@@ -332,7 +412,10 @@ def seed_alerts(conn: sqlite3.Connection, config: Config, dry_run: bool = False)
     Seeding records them without sending, so only price drops from here on are
     announced. Returns how many were suppressed.
     """
-    candidates = find_deals(conn, all_scorable_variants(conn), config, cap_per_store=False)
+    candidates = find_deals(
+        conn, all_scorable_variants(conn), config,
+        cap_per_store=False, fold_duplicates=False,
+    )
     if dry_run:
         return len(candidates)
     ts = dbm.utcnow()
@@ -506,7 +589,11 @@ async def run(
             return stats
 
         scorable = all_scorable_variants(conn) if rescan else changed
-        candidates = find_deals(conn, scorable, config)
+        codes = read_watchlist(config.watchlist_file)
+        watching = watched_products(conn, codes)
+        if codes:
+            log.info("watching %d article(s), matching %d product(s)", len(codes), len(watching))
+        candidates = find_deals(conn, scorable, config, watched=watching)
         cap = limit if limit is not None else config.filters.max_alerts_per_run
         selected = candidates[:cap]
         overflow = len(candidates) - len(selected)

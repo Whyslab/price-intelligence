@@ -77,6 +77,13 @@ class Deal:
     inflated_tag: bool = False
     rule_priced: bool = False
     blanket_pct: float | None = None
+    # How many other shops had the same article on offer this run. Their alerts
+    # were folded into this one, so the reader hears about the shoe once.
+    also_in_shops: int = 0
+    # An article on the watchlist. It reaches the reader whatever the thresholds
+    # say, because the point of watching one is not to be told only about the
+    # big drops.
+    watched: bool = False
 
     @property
     def bucket(self) -> int:
@@ -154,6 +161,7 @@ def evaluate(
     filters: Filters,
     market: Market | None = None,
     trust: Trust | None = None,
+    watched: bool = False,
 ) -> Deal | None:
     """Score one variant. Returns None when it is not worth a notification.
 
@@ -165,7 +173,7 @@ def evaluate(
     """
     if not in_stock or price_usd <= 0 or not history:
         return None
-    if not (filters.min_price_usd <= price_usd <= filters.max_price_usd):
+    if not watched and not (filters.min_price_usd <= price_usd <= filters.max_price_usd):
         return None
     market = market or Market()
     trust = trust or Trust()
@@ -224,7 +232,9 @@ def evaluate(
 
     discount_pct = (reference_native - price_native) / reference_native * 100
     saving_usd = round((reference_native - price_native) / fx_rate, 2)
-    if discount_pct < filters.min_discount_pct or saving_usd < filters.min_saving_usd:
+    if not watched and (
+        discount_pct < filters.min_discount_pct or saving_usd < filters.min_saving_usd
+    ):
         return None
 
     past = [r["price_native"] for r in history[:-1] if r["currency"] == current["currency"]]
@@ -248,7 +258,7 @@ def evaluate(
     if rule_priced:
         score -= 20         # so is every other "was" price in this shop
     score = int(max(0, min(100, round(score))))
-    if score < filters.min_score:
+    if not watched and score < filters.min_score:
         return None
 
     return Deal(
@@ -271,6 +281,7 @@ def evaluate(
         inflated_tag=inflated_tag,
         blanket_pct=trust.blanket_pct if rule_priced else None,
         rule_priced=rule_priced,
+        watched=watched,
     )
 
 

@@ -38,6 +38,43 @@ class TestKeys:
         keys = reference.keys_for("Acme", "Sock", ["12"])
         assert not any(key_type == "sku" for key_type, _ in keys)
 
+    @pytest.mark.parametrize(
+        "brand,code",
+        [
+            ("New Balance", "M2002RDB"),   # in 13 shops
+            ("New Balance", "U204LMMA"),   # in 18
+            ("New Balance", "CT302OE"),
+            ("ASICS", "1201A019-021"),     # Gel-Kayano 14, in 14 shops
+            ("Puma", "635235-01"),
+            ("Converse", "162050C"),       # Chuck 70, in 19 shops
+            ("adidas", "IF4396"),
+            ("Nike", "414571-102"),
+        ],
+    )
+    def test_the_article_numbers_the_other_brands_use(self, brand, code):
+        """Nike and adidas were the only shapes recognised, so everyone else was
+        matched on their title or not at all.
+
+        Which shapes to add was measured on the whole catalogue by how many codes
+        end up shared by three shops or more — the thing a market price needs —
+        rather than by how many products gain a code.
+        """
+        assert ("style", code) in reference.keys_for(brand, f"{brand} Shoe {code}", [None])
+
+    @pytest.mark.parametrize(
+        "sku",
+        [
+            "197595459334",   # a barcode
+            "19389900015",    # a shop's own stock number
+            "1234567C",       # too long to be the Converse form
+        ],
+    )
+    def test_numbers_that_are_not_article_numbers_are_left_alone(self, sku):
+        """A false match claims two different shoes are the same one, and the
+        market price it then computes is arithmetic on unrelated products.
+        """
+        assert not reference.style_codes(sku)
+
 
 class TestMsrpMode:
     """A real recommended price is copied by everyone; an invented one by nobody."""
