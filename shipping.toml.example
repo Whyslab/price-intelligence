@@ -1,0 +1,64 @@
+# Copy to shipping.toml and correct from your own orders. Everything here is an
+# estimate: there is no API that will tell you what a shop charges to ship, so
+# the choice is between a guess that is written down and a guess in your head.
+#
+# What this file is NOT: it never decides whether something is a discount. The
+# thresholds in filters.toml are applied to the price of the item. Delivery is
+# shown beside that price and takes points off the score, but an estimate this
+# rough must not silently throw away real finds.
+
+# --- where you have things sent --------------------------------------------
+# Rates and thresholds checked against the tax authorities on 28.08.2026.
+# They change; check them again before trusting a number that surprises you.
+
+[destination.NO]
+name  = "Норвегия"
+# skatteetaten.no: 25% VAT on goods bought from abroad, no lower limit. The
+# VOEC scheme lets a registered shop collect it at checkout for items under
+# NOK 3,000, which changes who collects it, not whether it is owed.
+vat_pct = 25.0
+# toll.no: 10.7% on most clothing, nothing on shoes. Norway is not in the EU
+# customs union, so this applies to EU shops too.
+duty_pct = { clothing = 10.7, shoes = 0.0, accessories = 0.0, unknown = 10.7 }
+# There is no duty-free allowance for online orders.
+duty_free_usd = 0.0
+# What a carrier charges to clear a parcel a shop did not clear itself. Zero if
+# the shop is VOEC-registered — we cannot tell which are, so this is charged
+# and the card says the estimate is cautious.
+clearance_fee_usd = 15.0
+
+[destination.UA]
+name  = "Украина"
+# €150 per shipment, and below it nothing is owed at all.
+duty_free_eur = 150.0
+# Above the threshold: 10% duty on the excess, then 20% VAT on excess + duty.
+duty_pct = { clothing = 10.0, shoes = 10.0, accessories = 10.0, unknown = 10.0 }
+vat_pct = 20.0
+clearance_fee_usd = 0.0
+
+# --- what it costs to get here ----------------------------------------------
+# By where the shop is, because that is what we know about every shop. Figures
+# in US dollars, for one pair of shoes or one garment.
+
+[shipping.default]
+EU   = { NO = 20.0, UA = 18.0 }
+GB   = { NO = 22.0, UA = 25.0 }
+US   = { NO = 35.0, UA = 35.0 }
+ASIA = { NO = 30.0, UA = 30.0 }
+# Used when the shop's country is unknown — 34 of 155 readable shops. Deliberately
+# on the high side: an underestimate makes a bad deal look good.
+OTHER = { NO = 35.0, UA = 35.0 }
+
+# Free over this much, which most shops do somewhere. Per region, same idea.
+[shipping.free_over]
+EU   = 200.0
+GB   = 200.0
+US   = 250.0
+ASIA = 250.0
+OTHER = 250.0
+
+# --- shops you have actually ordered from ------------------------------------
+# Anything here overrides the estimate above. This is the part worth filling in
+# over time: an estimate you have checked is worth more than four you have not.
+[shipping.shop]
+# "slamjam.com" = { NO = 15.0, UA = 20.0, free_over = 250.0 }
