@@ -11,7 +11,7 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 SCHEMA_SQL = Path(__file__).with_name("schema.sql")
 
 
@@ -338,6 +338,91 @@ def productive_store_ids(conn: sqlite3.Connection, days: int) -> set[int]:
     return {row["store_id"] for row in rows}
 
 
+# --- offers -----------------------------------------------------------------
+
+def record_offers(
+    conn: sqlite3.Connection,
+    scored: list[int],
+    qualifying: list,
+    ts: str,
+) -> tuple[int, int]:
+    """Update what is on offer after a run. Returns (written, withdrawn).
+
+    `scored` is every variant this run looked at, and `qualifying` the subset
+    still worth showing. Everything scored and not
+    qualifying is withdrawn — that is how a sale ending removes itself, and why
+    the two lists have to be passed together rather than only the good news.
+
+    `found_at` is when the price actually dropped, taken from the deal's own
+    reading of the history rather than from the clock. A shop that has been
+    running the same sale for a month would otherwise be presented as a fresh
+    find every time it is scored — and on a first fill, everything at once.
+
+    It also survives a rewrite: overwriting it each time the shop confirms the
+    same price would reset it on every run.
+    """
+    now = datetime.fromisoformat(ts)
+
+    def dropped_at(deal) -> str | None:
+        """When the price fell, or None if the history cannot say.
+
+        Most variants have been seen exactly once — 2.7 million of 2.76 — so for
+        most offers there is no earlier price to have fallen from. None here
+        means "ask the database", and the statement below falls back to the
+        first time this price was ever seen, which is a thing we do know.
+        """
+        hours = deal.dropped_hours_ago
+        if hours is None:
+            return None
+        return (now - timedelta(hours=hours)).isoformat(timespec="seconds")
+
+    keep = {deal.variant_id for deal in qualifying}
+    stale = [(variant_id,) for variant_id in scored if variant_id not in keep]
+    if stale:
+        conn.executemany("DELETE FROM offers WHERE variant_id = ?", stale)
+    conn.executemany(
+        """
+        INSERT INTO offers (
+            variant_id, product_id, found_at, checked_at, price_usd,
+            reference_usd, reference_source, discount_pct, saving_usd, score,
+            all_time_low
+        ) VALUES (
+            ?, ?,
+            COALESCE(
+                ?,
+                (SELECT MIN(ts) FROM price_points WHERE variant_id = ?),
+                ?
+            ),
+            ?, ?, ?, ?, ?, ?, ?, ?
+        )
+        ON CONFLICT (variant_id) DO UPDATE SET
+            checked_at       = excluded.checked_at,
+            price_usd        = excluded.price_usd,
+            reference_usd    = excluded.reference_usd,
+            reference_source = excluded.reference_source,
+            discount_pct     = excluded.discount_pct,
+            saving_usd       = excluded.saving_usd,
+            score            = excluded.score,
+            all_time_low     = excluded.all_time_low,
+            -- Only when the price actually moved: see the docstring.
+            found_at = CASE
+                WHEN abs(offers.price_usd - excluded.price_usd) < 0.005
+                THEN offers.found_at ELSE excluded.found_at END
+        """,
+        [
+            (
+                deal.variant_id, deal.product_id,
+                dropped_at(deal), deal.variant_id, ts,   # the COALESCE above
+                ts, deal.price_usd,
+                deal.reference_usd, deal.reference_source, deal.discount_pct,
+                deal.saving_usd, deal.score, int(deal.all_time_low),
+            )
+            for deal in qualifying
+        ],
+    )
+    return len(qualifying), len(stale)
+
+
 # --- catalogue --------------------------------------------------------------
 
 def upsert_product(
@@ -506,3 +591,121 @@ def drop_orphans(conn: sqlite3.Connection) -> dict[str, int]:
         "DELETE FROM products WHERE id NOT IN (SELECT DISTINCT product_id FROM variants)"
     ).rowcount
     return {"variants": variants, "products": products}
+
+
+# --- bot users --------------------------------------------------------------
+
+_PROFILE_FIELDS = ("genders", "kinds", "sizes", "brands")
+
+
+def get_bot_user(conn: sqlite3.Connection, user_id: int) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM bot_users WHERE id = ?", (user_id,)).fetchone()
+
+
+def upsert_bot_user(
+    conn: sqlite3.Connection, user_id: int, chat_id: str, username: str | None = None, **fields
+) -> sqlite3.Row:
+    """Create the row on first contact, then update only what was passed."""
+    conn.execute(
+        """
+        INSERT INTO bot_users (id, chat_id, username, created_at) VALUES (?, ?, ?, ?)
+        ON CONFLICT (id) DO UPDATE SET chat_id = excluded.chat_id,
+                                       username = excluded.username
+        """,
+        (user_id, chat_id, username, utcnow()),
+    )
+    if fields:
+        assigns = ", ".join(f"{key} = :{key}" for key in fields)
+        conn.execute(
+            f"UPDATE bot_users SET {assigns} WHERE id = :id", {**fields, "id": user_id}
+        )
+    return get_bot_user(conn, user_id)
+
+
+def offers_for(
+    conn: sqlite3.Connection,
+    genders: list[str] | None = None,
+    kinds: list[str] | None = None,
+    sizes: list[str] | None = None,
+    brands: list[str] | None = None,
+    limit: int = 10,
+    offset: int = 0,
+) -> tuple[list[sqlite3.Row], int]:
+    """What is on offer for one person, best first. Returns (page, total).
+
+    Every filter is optional and an absent one means "no opinion", so the
+    default is the whole shelf. Sizes are matched against the variant on offer,
+    not against the product: a shoe on sale in EU38 is not on sale in EU44, and
+    saying otherwise is the fastest way to make the list untrustworthy.
+
+    Gender allows NULL through whenever men are wanted. 87% of the catalogue
+    never states a gender, so excluding the unknown would hide almost everything;
+    asking for women is the narrow, clean filter, and that one does exclude it.
+    """
+    where = ["1 = 1"]
+    params: list = []
+    if genders:
+        if "women" in genders and "men" not in genders:
+            where.append("p.gender = 'women'")
+        elif "men" in genders and "women" not in genders:
+            where.append("(p.gender = 'men' OR p.gender IS NULL)")
+    if kinds:
+        where.append(f"p.kind IN ({','.join('?' * len(kinds))})")
+        params += kinds
+    if sizes:
+        where.append(f"v.size_norm IN ({','.join('?' * len(sizes))})")
+        params += sizes
+    if brands:
+        where.append(
+            "(" + " OR ".join(["lower(p.brand_family) = ?"] * len(brands)) + ")"
+        )
+        params += [b.lower() for b in brands]
+    clause = " AND ".join(where)
+
+    total = conn.execute(
+        f"""
+        SELECT COUNT(*) FROM offers o
+          JOIN variants v ON v.id = o.variant_id
+          JOIN products p ON p.id = o.product_id
+         WHERE {clause}
+        """,
+        params,
+    ).fetchone()[0]
+
+    rows = conn.execute(
+        f"""
+        SELECT o.*, v.size_norm, v.size, v.sku,
+               p.title, p.url, p.image_url, p.brand, p.brand_norm, p.brand_family,
+               p.gender, p.kind, s.domain, s.name AS store_name, s.country, s.currency
+          FROM offers o
+          JOIN variants v ON v.id = o.variant_id
+          JOIN products p ON p.id = o.product_id
+          JOIN stores s   ON s.id = p.store_id
+         WHERE {clause}
+         ORDER BY o.score DESC, o.discount_pct DESC
+         LIMIT ? OFFSET ?
+        """,
+        [*params, limit, offset],
+    ).fetchall()
+    return rows, total
+
+
+def sizes_in_stock(conn: sqlite3.Connection, product_id: int) -> list[tuple[str, bool]]:
+    """Every size of a product with whether the shop still has it.
+
+    Shown on the card rather than filtered on, because the sizes that are left
+    are the answer to a different question than "is mine there" — buying a
+    present is exactly the case where the size that matters is not yours.
+    """
+    rows = conn.execute(
+        """
+        SELECT v.size_norm, v.size, pp.in_stock
+          FROM variants v
+          JOIN price_points pp ON pp.variant_id = v.id
+         WHERE v.product_id = ?
+           AND pp.ts = (SELECT MAX(ts) FROM price_points WHERE variant_id = v.id)
+         ORDER BY v.size_norm
+        """,
+        (product_id,),
+    ).fetchall()
+    return [(row["size_norm"] or row["size"] or "—", bool(row["in_stock"])) for row in rows]

@@ -308,7 +308,14 @@ async def test_dry_run_sends_nothing(config, shopify_payload, capsys):
 
 
 @respx.mock
-async def test_brand_filter_keeps_unwanted_deals_quiet(config, shopify_payload):
+async def test_a_brand_you_did_not_name_still_reaches_you(config, shopify_payload):
+    """Named brands are a priority, not a gate.
+
+    A hard list fails precisely on what is not in it: a find in a brand you had
+    not thought of would never arrive, and you would never learn that it had not.
+    So naming brands moves the bar and the ordering, and everything else still
+    gets through on the strength of the discount alone.
+    """
     _mock_rates()
     photo, text = _mock_telegram()
     respx.get("https://shop.example/products.json?limit=250").mock(
@@ -321,8 +328,8 @@ async def test_brand_filter_keeps_unwanted_deals_quiet(config, shopify_payload):
     stats = await pipeline.run(config, conn)
 
     assert stats.points_written > 0, "collection still happens"
-    assert stats.alerts_sent == 0, "but nothing matches the brand filter"
-    assert not photo.called and not text.called
+    assert stats.alerts_sent > 0, "an unnamed brand is not silenced"
+    assert photo.called or text.called
 
 
 def test_health_report_names_what_is_wrong(config):
@@ -850,3 +857,51 @@ class TestDegradationNotice:
         self._runs(conn, [1000] * 5, blocked=1)
         notice = pipeline.degradation_notice(conn)
         assert "квота" in notice
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_a_run_leaves_what_is_on_offer_on_the_shelf(config, shopify_payload):
+    """The bot reads this table; searching the database instead takes minutes."""
+    _mock_rates()
+    _mock_telegram()
+    respx.get("https://shop.example/products.json?limit=250").mock(
+        return_value=httpx.Response(200, json=shopify_payload)
+    )
+    conn = dbm.connect(config.db_path)
+    known_store(conn)
+    await pipeline.run(config, conn)
+
+    offers = conn.execute("SELECT COUNT(*) FROM offers").fetchone()[0]
+    sent = conn.execute("SELECT COUNT(*) FROM alerts WHERE sent = 1").fetchone()[0]
+    assert offers >= sent > 0, "everything announced is also on the shelf"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_an_offer_is_withdrawn_when_the_sale_ends(config, shopify_payload):
+    _mock_rates()
+    _mock_telegram()
+    respx.get("https://shop.example/products.json?limit=250").mock(
+        return_value=httpx.Response(200, json=shopify_payload)
+    )
+    conn = dbm.connect(config.db_path)
+    known_store(conn)
+    await pipeline.run(config, conn)
+    assert conn.execute("SELECT COUNT(*) FROM offers").fetchone()[0] > 0
+
+    # The shop puts its prices back up: same catalogue, no discount left.
+    full_price = json.loads(json.dumps(shopify_payload))
+    for product in full_price["products"]:
+        for variant in product["variants"]:
+            variant["compare_at_price"] = None
+            variant["price"] = f"{float(variant['price']) * 4:.2f}"
+    respx.get("https://shop.example/products.json?limit=250").mock(
+        return_value=httpx.Response(200, json=full_price)
+    )
+    make_due(conn)
+    await pipeline.run(config, conn)
+
+    assert conn.execute("SELECT COUNT(*) FROM offers").fetchone()[0] == 0, (
+        "a sale that ended must leave the shelf, or the bot shows prices that are gone"
+    )
