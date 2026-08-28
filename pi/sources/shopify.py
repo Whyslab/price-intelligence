@@ -28,7 +28,10 @@ from .base import FetchResult, ScrapedProduct, ScrapedVariant
 log = logging.getLogger(__name__)
 
 PAGE_SIZE = 250
-MAX_PAGES = 60    # 15,000 products; larger catalogues are logged, not silently cut
+# Pages read in one pass. Not a limit on catalogue size: a shop with more than
+# this many pages is picked up where it was left off on the next run, which is
+# the same mechanism that resumes a sweep Shopify cut short.
+MAX_PAGES = 60
 MAX_RETRIES = 3
 
 _CURRENCY_JS = re.compile(
@@ -192,14 +195,24 @@ async def fetch(
     currency: str | None = None,
     max_pages: int = MAX_PAGES,
     limiter: RateLimiter | NullLimiter | None = None,
+    cursor: int = 0,
 ) -> FetchResult:
-    """Pull a whole Shopify catalogue, paginating with ?page=N."""
+    """Read a slice of a Shopify catalogue, paginating with ?page=N.
+
+    Starts at `cursor` (a page number, 0 meaning the beginning) and reports in
+    `next_cursor` where to carry on, so a catalogue larger than one pass — or a
+    pass that Shopify cut short — is finished by the following run instead of
+    being quietly truncated to whatever arrived first.
+    """
     limiter = limiter or NullLimiter()
     # Waits out a suspected block rather than giving up on the spot. A store
     # failed in the same second the breaker tripped can never benefit from the
     # breaker being wrong, and it has been wrong on every run so far.
     if await limiter.confirm_blocked():
-        return FetchResult(domain=domain, currency=currency, error="skipped: Shopify blocked this IP")
+        return FetchResult(
+            domain=domain, currency=currency, error="skipped: Shopify blocked this IP",
+            next_cursor=cursor,
+        )
     base = f"https://{domain}".rstrip("/")
     if not currency:
         currency = await detect_currency(client, base, limiter)
@@ -208,15 +221,20 @@ async def fetch(
 
     products: list[ScrapedProduct] = []
     seen_ids: set[str] = set()
+    page_number = max(1, cursor)
     url = f"{base}/products.json?limit={PAGE_SIZE}"
-    page_number = 1
+    if page_number > 1:
+        url += f"&page={page_number}"
     exhausted = False
 
     for _ in range(max_pages):
         resp = await _get_page(client, url, limiter, domain)
         if resp is None:
             if not products:
-                return FetchResult(domain=domain, currency=currency, error="products.json unreachable")
+                return FetchResult(
+                    domain=domain, currency=currency,
+                    error="products.json unreachable", next_cursor=cursor,
+                )
             break
         try:
             payload = resp.json()
@@ -232,10 +250,12 @@ async def fetch(
                 products.append(product)
 
         # The storefront endpoint paginates with ?page=N and sends no Link header —
-        # unlike the Admin API, whose cursor style is what Link is for. Honour a
-        # Link header if one does turn up, otherwise step the page number on.
+        # unlike the Admin API, whose cursor style is what Link is for. A Link
+        # header, if one does turn up, is the authority on whether there is more,
+        # so it is consulted before the short-page rule.
         link = _LINK_NEXT.search(resp.headers.get("Link", ""))
         if link:
+            page_number += 1
             url = link.group(1)
             continue
         if len(raw) < PAGE_SIZE:
@@ -244,12 +264,16 @@ async def fetch(
         page_number += 1
         url = f"{base}/products.json?limit={PAGE_SIZE}&page={page_number}"
 
-    if not exhausted and len(products) >= max_pages * PAGE_SIZE:
-        # Say so out loud. A catalogue quietly cut off at the page cap is the
-        # kind of missing data nobody notices for months.
-        log.warning(
-            "%s: stopped at the %d-page cap with %d products — catalogue is larger",
-            domain, max_pages, len(products),
-        )
+    if exhausted:
+        return FetchResult(domain=domain, products=products, currency=currency)
 
-    return FetchResult(domain=domain, products=products, currency=currency)
+    # Stopped without reaching the end: the page cap, or a refusal part way
+    # through. Either way say where to resume. Reporting this as a finished
+    # catalogue is how www.flatspot.com came to sit at 1,000 products.
+    log.info(
+        "%s: read %d products and stopped at page %d — resuming there next run",
+        domain, len(products), page_number,
+    )
+    return FetchResult(
+        domain=domain, products=products, currency=currency, next_cursor=page_number
+    )

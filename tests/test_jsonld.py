@@ -12,6 +12,19 @@ from pi.sources import jsonld
 FIXTURES = Path(__file__).parent / "fixtures"
 
 
+def no_other_sitemaps(host: str = "shop.example") -> None:
+    """Answer 404 for the sitemap paths a test has not mocked itself.
+
+    Discovery reads every candidate now rather than stopping at the first one
+    that answers, because zalando.pl's /sitemap.xml lists its static pages and
+    its catalogue lives in another file. Register this last: respx takes the
+    first route that matches, so anything a test mocks explicitly still wins.
+    """
+    respx.route(host=host, path__regex=r"^/sitemap").mock(
+        return_value=httpx.Response(404)
+    )
+
+
 def test_parses_a_plain_product_page():
     page = (FIXTURES / "product_page.html").read_text(encoding="utf-8")
     parsed = jsonld.parse_product(page, "https://shop.example/adilette.html")
@@ -81,6 +94,7 @@ async def test_sitemap_walk_finds_product_pages_and_skips_the_rest():
             </urlset>""",
         )
     )
+    no_other_sitemaps()
     async with httpx.AsyncClient() as client:
         urls = await jsonld.discover_product_urls(client, "https://shop.example")
 
@@ -110,6 +124,7 @@ async def test_clean_product_paths_are_found_without_any_url_marker():
             </urlset>""",
         )
     )
+    no_other_sitemaps()
     async with httpx.AsyncClient() as client:
         urls = await jsonld.discover_product_urls(client, "https://shop.example")
 
@@ -135,14 +150,15 @@ async def test_the_cursor_advances_so_successive_runs_cover_the_catalogue():
         return_value=httpx.Response(200, text=page)
     )
 
+    no_other_sitemaps()
     async with httpx.AsyncClient() as client:
-        first, cursor = await jsonld.fetch(client, "shop.example", budget=2, cursor=0)
-        assert first.ok and cursor == 2
-        second, cursor = await jsonld.fetch(client, "shop.example", budget=2, cursor=cursor)
-        assert second.ok and cursor == 4
+        first = await jsonld.fetch(client, "shop.example", budget=2, cursor=0)
+        assert first.ok and first.next_cursor == 2
+        second = await jsonld.fetch(client, "shop.example", budget=2, cursor=first.next_cursor)
+        assert second.ok and second.next_cursor == 4
         # wraps around rather than running off the end
-        third, cursor = await jsonld.fetch(client, "shop.example", budget=2, cursor=cursor)
-        assert third.ok and cursor == 1
+        third = await jsonld.fetch(client, "shop.example", budget=2, cursor=second.next_cursor)
+        assert third.ok and third.next_cursor == 1
 
 
 @respx.mock
@@ -156,8 +172,9 @@ async def test_a_store_with_no_markup_reports_an_error():
     respx.get("https://shop.example/product/x.html").mock(
         return_value=httpx.Response(200, text="<html>no markup</html>")
     )
+    no_other_sitemaps()
     async with httpx.AsyncClient() as client:
-        result, _ = await jsonld.fetch(client, "shop.example", budget=1)
+        result = await jsonld.fetch(client, "shop.example", budget=1)
     assert not result.ok
     assert "schema.org" in result.error
 
@@ -252,6 +269,7 @@ async def test_the_sitemap_is_found_where_robots_txt_says_it_is():
     )
     off_site = respx.get("https://evil.example/other.xml")
 
+    no_other_sitemaps()
     async with httpx.AsyncClient() as client:
         urls = await jsonld.discover_product_urls(client, "https://shop.example")
 
@@ -268,6 +286,260 @@ async def test_the_standard_paths_are_still_tried_without_robots_txt():
             text="<urlset><url><loc>https://shop.example/product/one.html</loc></url></urlset>",
         )
     )
+    no_other_sitemaps()
     async with httpx.AsyncClient() as client:
         urls = await jsonld.discover_product_urls(client, "https://shop.example")
     assert urls == ["https://shop.example/product/one.html"]
+
+
+class TestCrawlingWhenTheSitemapIsUseless:
+    """36 live stores reported "no product URLs in sitemap".
+
+    Two different faults hide behind that one message. eobuwie.pl, modivo.pl,
+    basket4ballers.com and dripla.com answer 404 for /sitemap.xml altogether;
+    www.ageha.it serves a valid sitemap that lists five pages, none of them a
+    product. Both shops still have a catalogue, reachable by following category
+    links the way a customer would.
+    """
+
+    @respx.mock
+    async def test_a_sitemap_of_static_pages_falls_back_to_crawling(self):
+        respx.get("https://shop.example/robots.txt").mock(return_value=httpx.Response(404))
+        respx.get("https://shop.example/sitemap.xml").mock(
+            return_value=httpx.Response(
+                200,
+                text=(
+                    "<urlset>"
+                    "<url><loc>https://shop.example/about-us</loc></url>"
+                    "<url><loc>https://shop.example/contact</loc></url>"
+                    "</urlset>"
+                ),
+            )
+        )
+        respx.get("https://shop.example/sitemap_index.xml").mock(return_value=httpx.Response(404))
+        respx.get("https://shop.example/sitemap/products.xml").mock(
+            return_value=httpx.Response(404)
+        )
+        respx.get("https://shop.example/").mock(
+            return_value=httpx.Response(
+                200, text='<a href="/collections/sneakers">Sneakers</a>'
+            )
+        )
+        respx.get("https://shop.example/collections/sneakers").mock(
+            return_value=httpx.Response(
+                200,
+                text=(
+                    '<a href="/products/air-max-90">one</a>'
+                    '<a href="/products/gel-lyte-iii">two</a>'
+                ),
+            )
+        )
+        respx.get("https://shop.example/collections/sneakers?page=2").mock(
+            return_value=httpx.Response(200, text='<a href="/products/air-max-90">one</a>')
+        )
+
+        async with httpx.AsyncClient() as client:
+            urls = await jsonld.discover_product_urls(client, "https://shop.example")
+
+        assert urls == [
+            "https://shop.example/products/air-max-90",
+            "https://shop.example/products/gel-lyte-iii",
+        ]
+
+    @respx.mock
+    async def test_pages_that_announce_themselves_as_products_are_read_first(self):
+        """The run only reads the first `budget` URLs, so their order decides everything.
+
+        Measured on basket4ballers.com: the crawl found 214 URLs, of which the 38
+        carrying a product marker all parsed and the categories sorting ahead of
+        them alphabetically parsed as nothing. Ordering alone took that store
+        from zero products to thirty-six.
+        """
+        respx.get("https://shop.example/").mock(
+            return_value=httpx.Response(
+                200,
+                text=(
+                    '<a href="/aaa-looks-like-a-slug">not a product</a>'
+                    '<a href="/products/zzz-air-max-90">a product</a>'
+                ),
+            )
+        )
+        async with httpx.AsyncClient() as client:
+            urls = await jsonld.crawl_product_urls(client, "https://shop.example")
+
+        assert urls[0] == "https://shop.example/products/zzz-air-max-90"
+        assert "https://shop.example/aaa-looks-like-a-slug" in urls
+
+    @respx.mock
+    async def test_campaign_parameters_do_not_multiply_one_page_into_many(self):
+        """eobuwie.pl links the same brand listing five ways with itm_* parameters.
+
+        Each one would have cost a page from a budget of thirty.
+        """
+        respx.get("https://shop.example/").mock(
+            return_value=httpx.Response(
+                200,
+                text=(
+                    '<a href="/products/one?itm_source=home&itm_medium=brands">a</a>'
+                    '<a href="/products/one?utm_campaign=x">b</a>'
+                    '<a href="/products/one">c</a>'
+                    '<a href="/products/two?colour=black">d</a>'
+                ),
+            )
+        )
+        async with httpx.AsyncClient() as client:
+            urls = await jsonld.crawl_product_urls(client, "https://shop.example")
+
+        assert urls == [
+            "https://shop.example/products/one",
+            "https://shop.example/products/two?colour=black",
+        ], "tracking is stripped, a real variant parameter is kept"
+
+    @respx.mock
+    async def test_the_crawl_stops_at_its_budget(self):
+        """These are somebody else's servers and a crawl has no natural end."""
+        respx.get("https://shop.example/").mock(
+            return_value=httpx.Response(
+                200,
+                text="".join(
+                    f'<a href="/collections/cat-{n}">c{n}</a>' for n in range(50)
+                ),
+            )
+        )
+        listing = respx.route(
+            host="shop.example", path__regex=r"^/collections/cat-\d+$"
+        ).mock(return_value=httpx.Response(200, text='<a href="/products/p">p</a>'))
+
+        async with httpx.AsyncClient() as client:
+            await jsonld.crawl_product_urls(client, "https://shop.example", budget=6)
+
+        assert listing.call_count <= 5, "the front page counts against the budget too"
+
+
+class TestDetectingAShopByItsProductPage:
+    """The homepage is the wrong place to look for schema.org/Product.
+
+    Deciding from the front page alone classified 45 live stores as having no
+    structured data. Six of them were opened by hand — BSTN, Oi Polloi,
+    Consortium, Wood Wood, Blue Tomato, Laced — and every one answers 200 with a
+    readable catalogue behind it.
+    """
+
+    @respx.mock
+    async def test_a_shop_with_a_bare_homepage_is_judged_by_a_product_page(self):
+        from pi.sources import detect
+
+        respx.get("https://shop.example/products.json?limit=1").mock(
+            return_value=httpx.Response(404)
+        )
+        respx.get("https://shop.example/").mock(
+            return_value=httpx.Response(200, text="<html><body>welcome</body></html>")
+        )
+        respx.get("https://shop.example/robots.txt").mock(return_value=httpx.Response(404))
+        respx.get("https://shop.example/sitemap.xml").mock(
+            return_value=httpx.Response(
+                200,
+                text="<urlset><url><loc>https://shop.example/product/one.html</loc></url></urlset>",
+            )
+        )
+        respx.get("https://shop.example/product/one.html").mock(
+            return_value=httpx.Response(
+                200, text=(FIXTURES / "product_page.html").read_text(encoding="utf-8")
+            )
+        )
+
+        no_other_sitemaps()
+        async with httpx.AsyncClient() as client:
+            verdict = await detect.probe(client, "shop.example")
+
+        assert verdict["platform"] == "jsonld"
+
+    @respx.mock
+    async def test_a_shop_with_no_product_pages_at_all_says_so(self):
+        """The old message blamed the storefront for what was never checked."""
+        from pi.sources import detect
+
+        respx.get("https://shop.example/products.json?limit=1").mock(
+            return_value=httpx.Response(404)
+        )
+        respx.get("https://shop.example/").mock(
+            return_value=httpx.Response(200, text="<html><body>welcome</body></html>")
+        )
+        respx.get("https://shop.example/robots.txt").mock(return_value=httpx.Response(404))
+        respx.route(host="shop.example", path__regex=r"^/sitemap").mock(
+            return_value=httpx.Response(404)
+        )
+
+        async with httpx.AsyncClient() as client:
+            verdict = await detect.probe(client, "shop.example")
+
+        assert verdict["platform"] == "unknown"
+        assert verdict["error"] == "no product pages found in the sitemap or by crawling"
+
+    @respx.mock
+    async def test_a_javascript_priced_shop_is_told_apart_from_an_empty_one(self):
+        """These two need different answers, and used to get the same one.
+
+        A shop we simply could not find a product page on might be reachable a
+        different way. A shop whose product page loads and carries a name, an
+        article number and no price is rendering it in JavaScript — a wall, not
+        a gap in the parser. 43 of the 45 stores behind the old verdict are the
+        second kind, and nothing in this adapter will ever read them.
+        """
+        from pi.sources import detect
+
+        respx.get("https://shop.example/products.json?limit=1").mock(
+            return_value=httpx.Response(404)
+        )
+        respx.get("https://shop.example/").mock(
+            return_value=httpx.Response(200, text="<html><body>welcome</body></html>")
+        )
+        respx.get("https://shop.example/robots.txt").mock(return_value=httpx.Response(404))
+        respx.get("https://shop.example/sitemap.xml").mock(
+            return_value=httpx.Response(
+                200,
+                text="<urlset><url><loc>https://shop.example/product/one.html</loc></url></urlset>",
+            )
+        )
+        respx.get("https://shop.example/product/one.html").mock(
+            return_value=httpx.Response(
+                200, text='<h1 itemprop="name">Air Max 90</h1><div id="root"></div>'
+            )
+        )
+
+        no_other_sitemaps()
+        async with httpx.AsyncClient() as client:
+            verdict = await detect.probe(client, "shop.example")
+
+        assert verdict["platform"] == "unknown"
+        assert "JavaScript" in verdict["error"]
+
+
+@respx.mock
+async def test_a_sitemap_of_static_pages_is_not_the_end_of_the_search():
+    """zalando.pl's /sitemap.xml lists nine pages, none of them a product.
+
+    Discovery used to return on the first sitemap that answered with anything at
+    all, so those nine were the whole catalogue as far as we were concerned.
+    """
+    respx.get("https://shop.example/robots.txt").mock(return_value=httpx.Response(404))
+    respx.get("https://shop.example/sitemap.xml").mock(
+        return_value=httpx.Response(
+            200,
+            text="<urlset><url><loc>https://shop.example/delivery-and-returns</loc></url></urlset>",
+        )
+    )
+    respx.get("https://shop.example/sitemap_index.xml").mock(return_value=httpx.Response(404))
+    respx.get("https://shop.example/sitemap/products.xml").mock(
+        return_value=httpx.Response(
+            200,
+            text="<urlset><url><loc>https://shop.example/products/air-max-90</loc></url></urlset>",
+        )
+    )
+
+    async with httpx.AsyncClient() as client:
+        urls = await jsonld.discover_product_urls(client, "https://shop.example")
+
+    assert urls == ["https://shop.example/products/air-max-90"], (
+        "a marked product outranks a plausible-looking static page from an earlier sitemap"
+    )

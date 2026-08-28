@@ -9,17 +9,18 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from itertools import groupby
+from pathlib import Path
 
 import httpx
 
 from . import db as dbm
 from . import deals as dealm
-from . import reference
+from . import reference, tls
 from .config import Config
 from .domains import same_shop
 from .fx import Rates, load_rates
 from .notify import Telegram, format_caption
-from .sources import jsonld, shopify
+from .sources import impersonate, jsonld, shopify
 from .sources.base import FetchResult
 from .throttle import RateLimiter
 
@@ -42,11 +43,17 @@ class RunStats:
     failures: list[tuple[str, str]] = field(default_factory=list)
 
 
-def make_client(timeout: float = 30.0) -> httpx.AsyncClient:
+def make_client(timeout: float = 30.0, ca_cache: Path | None = None) -> httpx.AsyncClient:
+    """The shared HTTP client, trusting any intermediates we have had to fetch.
+
+    Verification is the stock one; `ca_cache` only adds certificates that shops'
+    own servers omit from their chains. See pi.tls.
+    """
     return httpx.AsyncClient(
         timeout=timeout,
         headers=HEADERS,
         follow_redirects=True,
+        verify=tls.context_with(ca_cache),
         limits=httpx.Limits(max_connections=64, max_keepalive_connections=16),
     )
 
@@ -114,20 +121,24 @@ def _drop_hopeless(stores: list[sqlite3.Row]) -> tuple[list[sqlite3.Row], int]:
 
 async def collect_store(
     client: httpx.AsyncClient, store: sqlite3.Row, jsonld_budget: int, limiter: RateLimiter
-) -> tuple[FetchResult, int | None]:
-    """Fetch one store with the adapter its platform calls for."""
+) -> FetchResult:
+    """Fetch one store with the adapter its platform calls for.
+
+    Both adapters read a slice and say where to resume, so a large catalogue is
+    covered over successive runs rather than truncated to whatever one pass got.
+    """
     platform = store["platform"]
     if platform == "shopify":
         return await shopify.fetch(
-            client, store["domain"], store["currency"], limiter=limiter
-        ), None
+            client, store["domain"], store["currency"],
+            limiter=limiter, cursor=store["sitemap_cursor"],
+        )
     if platform == "jsonld":
-        result, cursor = await jsonld.fetch(
+        return await jsonld.fetch(
             client, store["domain"], store["currency"],
             budget=jsonld_budget, cursor=store["sitemap_cursor"],
         )
-        return result, cursor
-    return FetchResult(domain=store["domain"], error=f"no adapter for platform {platform!r}"), None
+    return FetchResult(domain=store["domain"], error=f"no adapter for platform {platform!r}")
 
 
 def store_result(
@@ -437,15 +448,24 @@ async def run(
         log.info("%d store(s) seen for the first time — collecting a baseline, not alerting",
                  len(first_sight))
 
-    async with make_client() as client:
+    async with make_client(ca_cache=tls.cache_dir(config.db_path)) as client:
 
         async def one(store: sqlite3.Row):
             pool = pools.get(store["platform"], pools["jsonld"])
             async with pool:
+                # A handful of shops answer only a browser's TLS fingerprint.
+                # They get their own client; everyone else shares the pooled one.
+                if store["impersonate"] and impersonate.available():
+                    async with impersonate.ImpersonatingClient(
+                        timeout=30.0, headers=HEADERS
+                    ) as browser:
+                        return store, await collect_store(
+                            browser, store, jsonld_budget, limiter
+                        )
                 return store, await collect_store(client, store, jsonld_budget, limiter)
 
         for coro in asyncio.as_completed([one(s) for s in stores]):
-            store, (result, cursor) = await coro
+            store, result = await coro
             if not result.ok:
                 stats.stores_failed += 1
                 stats.failures.append((store["domain"], result.error or "unknown"))
@@ -473,11 +493,12 @@ async def run(
             }
             if result.currency:
                 fields["currency"] = result.currency
-            if cursor is not None:
-                fields["sitemap_cursor"] = cursor
+            fields["sitemap_cursor"] = result.next_cursor
             dbm.upsert_store(conn, store["domain"], **fields)
             log.info(
-                "%-38s %4d products, %3d price changes", store["domain"], len(result.products), written
+                "%-38s %4d products, %3d price changes%s",
+                store["domain"], len(result.products), written,
+                "" if result.complete else f" (partial, resuming at {result.next_cursor})",
             )
 
         if collect_only:

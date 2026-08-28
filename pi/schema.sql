@@ -22,7 +22,12 @@ CREATE TABLE IF NOT EXISTS stores (
     blanket_share REAL,
     -- jsonld stores are crawled a page at a time; the cursor walks their sitemap
     -- across runs so a 8,000-product catalogue is covered without hammering it.
-    sitemap_cursor INTEGER NOT NULL DEFAULT 0
+    sitemap_cursor INTEGER NOT NULL DEFAULT 0,
+    -- Set when a shop answers only to a client presenting a browser's TLS
+    -- fingerprint. Measured on the 25 shops that reply 403 to us: nine answer
+    -- 200 that way and three of those go on to yield products. See
+    -- pi.sources.impersonate.
+    impersonate   INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS products (

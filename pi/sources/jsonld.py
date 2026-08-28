@@ -13,6 +13,12 @@ Two honest limitations, both handled rather than hidden:
 * Prices live on individual product pages, so a catalogue costs one request per
   product. Each run therefore walks a bounded slice of the store's sitemap and
   saves a cursor, covering the whole catalogue over successive runs.
+* Not every shop has a usable sitemap. Measured on the live list, 36 stores
+  reported "no product URLs": for eobuwie.pl, modivo.pl, basket4ballers.com and
+  dripla.com /sitemap.xml answers 404 outright, while www.ageha.it serves a
+  perfectly valid sitemap containing five links, none of them a product. For
+  those the catalogue is found the way a person would find it — by following
+  category links from the front page — see `crawl_product_urls`.
 """
 from __future__ import annotations
 
@@ -29,7 +35,12 @@ from .base import FetchResult, ScrapedProduct, ScrapedVariant
 
 log = logging.getLogger(__name__)
 
-DEFAULT_BUDGET = 200
+# Product pages read from one shop in one run. Every product costs a request,
+# so this is a bargain struck with somebody else's servers rather than a number
+# to maximise. At 200 the large catalogues were not moving: www.footlocker.com
+# sat at 133 products and www.ssense.com at 200 while the cursor inched through
+# their sitemaps. Overridable with --jsonld-budget or PI_JSONLD_BUDGET.
+DEFAULT_BUDGET = 400
 PER_HOST_CONCURRENCY = 4
 SITEMAP_CANDIDATES = ("/sitemap.xml", "/sitemap_index.xml", "/sitemap/products.xml")
 # robots.txt is where a site is supposed to declare its sitemap, and plenty put
@@ -55,6 +66,22 @@ _NON_PRODUCT_HINTS = (
 )
 
 AVAILABLE = {"instock", "in_stock", "limitedavailability", "onlineonly", "presale", "backorder"}
+
+# Paths that list products rather than being one. These overlap with
+# _NON_PRODUCT_HINTS on purpose: a /collections/ URL is not a product, but it is
+# exactly where products are linked from, so the sitemap filter throws it away
+# and the crawler goes looking for it.
+_CATEGORY_HINTS = (
+    "/collections/", "/collection/", "/category", "/categories", "/shop",
+    "/c/", "/catalog", "/brand", "/marken", "/marche", "/produkte",
+    "/men", "/women", "/kids", "/sale", "/new", "/footwear", "/sneaker",
+    "/clothing", "/apparel", "/accessories",
+)
+# How much a crawl may cost one shop in one run: page fetches, and how deep the
+# pagination of any single category is followed.
+CRAWL_PAGE_BUDGET = 30
+CRAWL_PAGINATION_DEPTH = 5
+_HREF = re.compile(r"""<a\b[^>]*\bhref\s*=\s*["\']([^"\'#\s]+)["\']""", re.IGNORECASE)
 
 
 def _text(value) -> str | None:
@@ -208,6 +235,117 @@ async def _get(client: httpx.AsyncClient, url: str) -> httpx.Response | None:
     return resp if resp.status_code == 200 else None
 
 
+# Campaign parameters make one page look like a dozen. eobuwie.pl links the same
+# brand listing five ways with itm_source/itm_medium/itm_campaign, and every one
+# of them would have cost a page from the crawl budget.
+_TRACKING = ("utm_", "itm_", "gclid", "fbclid", "msclkid", "_gl")
+
+
+def _strip_tracking(query: str) -> str:
+    kept = [
+        pair for pair in query.split("&")
+        if pair and not any(pair.lower().startswith(t) for t in _TRACKING)
+    ]
+    return "&".join(kept)
+
+
+def _internal_links(page: str, page_url: str, host: str) -> list[str]:
+    """Every same-host link on a page, absolute and de-duplicated."""
+    out: list[str] = []
+    for raw in _HREF.findall(page):
+        url = urljoin(page_url, html.unescape(raw))
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https") or parsed.netloc != host:
+            continue
+        out.append(parsed._replace(fragment="", query=_strip_tracking(parsed.query)).geturl())
+    return list(dict.fromkeys(out))
+
+
+def _path_of(url: str) -> str:
+    """The path a hint should be matched against — never the host.
+
+    Every hint begins with a slash, and so does the "//" in a URL's scheme, so
+    matching against the whole string lets the hostname answer the question:
+    https://shop.example/products/one contains "/shop" and was read as a
+    category listing on that basis alone.
+    """
+    parsed = urlparse(url.lower())
+    return parsed.path + (f"?{parsed.query}" if parsed.query else "")
+
+
+def _is_product_url(url: str) -> bool:
+    """The same judgement the sitemap walk makes, applied to a crawled link."""
+    path = _path_of(url)
+    if path.endswith((".xml", ".xml.gz", ".jpg", ".jpeg", ".png", ".webp", ".pdf", ".svg")):
+        return False
+    if any(bad in path for bad in _NON_PRODUCT_HINTS):
+        return False
+    return any(hint in path for hint in _PRODUCT_HINTS) or _looks_like_a_page(url)
+
+
+async def crawl_product_urls(
+    client: httpx.AsyncClient, base: str, limit: int = 5000, budget: int = CRAWL_PAGE_BUDGET
+) -> list[str]:
+    """Find products the way a person would: follow category links from the front page.
+
+    This is the fallback for shops whose sitemap cannot be used, and it is
+    deliberately bounded — `budget` page fetches per shop per run — because a
+    crawl has no natural end and these are somebody else's servers.
+    """
+    host = urlparse(base).netloc
+    front = await _get(client, base)
+    if front is None:
+        return []
+    spent = 1
+
+    links = _internal_links(front.text, base, host)
+    products = {url for url in links if _is_product_url(url)}
+    root = base.rstrip("/")
+    categories = [
+        url for url in links
+        if url.rstrip("/") != root
+        and url not in products          # /shop/asics-gel-lyte-iii is both, and is a product
+        and any(hint in _path_of(url) for hint in _CATEGORY_HINTS)
+    ]
+    # Shallow listings first: /collections/mens carries more of the catalogue per
+    # request than /collections/mens/sale/nike, and the budget is small.
+    categories.sort(key=lambda u: (len(urlparse(u).path.strip("/").split("/")), len(u)))
+
+    for category in categories:
+        if spent >= budget or len(products) >= limit:
+            break
+        for page_number in range(1, CRAWL_PAGINATION_DEPTH + 1):
+            if spent >= budget or len(products) >= limit:
+                break
+            url = category
+            if page_number > 1:
+                url = f"{category}{'&' if '?' in category else '?'}page={page_number}"
+            page = await _get(client, url)
+            spent += 1
+            if page is None:
+                break
+            found = {u for u in _internal_links(page.text, url, host) if _is_product_url(u)}
+            # A site that ignores ?page= serves page one again, so the absence of
+            # anything new is how pagination is known to have run out.
+            if not found - products:
+                products |= found
+                break
+            products |= found
+
+    # Order matters more here than in the sitemap walk. A crawl picks up
+    # listings alongside products, and the run only reads the first `budget`
+    # URLs — basket4ballers.com yielded 214 URLs of which the 38 that announce
+    # themselves as products all parsed, while the categories ahead of them in
+    # alphabetical order parsed as nothing at all.
+    marked = sorted(u for u in products if any(h in _path_of(u) for h in _PRODUCT_HINTS))
+    rest = sorted(u for u in products if u not in set(marked))
+    log.debug(
+        "%s: crawled %d pages, %d product URLs (%d marked)",
+        base, spent, len(products), len(marked),
+    )
+    return (marked + rest)[:limit]
+
+
 async def sitemap_urls(client: httpx.AsyncClient, base: str) -> list[str]:
     """Where this site's sitemap might be: robots.txt first, then the usual guesses."""
     found: list[str] = []
@@ -224,9 +362,21 @@ async def sitemap_urls(client: httpx.AsyncClient, base: str) -> list[str]:
 async def discover_product_urls(
     client: httpx.AsyncClient, base: str, limit: int = 5000
 ) -> list[str]:
-    """Walk the sitemap (following one level of index) for product pages."""
+    """Walk the sitemaps (following one level of index) for product pages.
+
+    Every candidate is read, not just the first that answers. Stopping at the
+    first non-empty sitemap sounds thrifty and is how zalando.pl came back with
+    nine URLs — its /sitemap.xml lists the shop's static pages, and the
+    catalogue is in a different file entirely. A sitemap of terms-and-conditions
+    pages is not a reason to stop looking for the one with the shoes in it.
+    """
     host = urlparse(base).netloc
+    marked: list[str] = []
+    plausible: list[str] = []
+
     for candidate in await sitemap_urls(client, base):
+        if len(marked) >= limit:
+            break
         resp = await _get(client, candidate)
         if resp is None:
             continue
@@ -246,24 +396,65 @@ async def discover_product_urls(
             if child_resp is not None:
                 pages.extend(html.unescape(loc) for loc in _LOC.findall(child_resp.text))
 
-        candidates = [
-            u for u in dict.fromkeys(pages)
-            if urlparse(u).netloc == host
-            and not u.lower().endswith((".xml", ".xml.gz", ".jpg", ".png", ".webp"))
-            and not any(bad in u.lower() for bad in _NON_PRODUCT_HINTS)
-        ]
-        # A URL that announces itself as a product is taken at its word.
-        marked = [u for u in candidates if any(h in u.lower() for h in _PRODUCT_HINTS)]
-        if marked:
-            return marked[:limit]
-        # Otherwise fall back to every URL with a real slug and let the JSON-LD
-        # parser be the judge. Crawling is budgeted per run anyway, so a few
-        # pages that turn out not to be products cost little — while demanding
-        # a marker discards whole catalogues that use clean paths.
-        plausible = [u for u in candidates if _looks_like_a_page(u)]
-        if plausible:
-            return plausible[:limit]
-    return []
+        for url in pages:
+            if urlparse(url).netloc != host:
+                continue
+            path = _path_of(url)
+            if path.endswith((".xml", ".xml.gz", ".jpg", ".png", ".webp")):
+                continue
+            if any(bad in path for bad in _NON_PRODUCT_HINTS):
+                continue
+            # A URL that announces itself as a product is taken at its word;
+            # anything else with a real slug is kept as a fallback and left for
+            # the JSON-LD parser to judge, because plenty of shops serve
+            # products from clean paths with no marker at all.
+            if any(hint in path for hint in _PRODUCT_HINTS):
+                marked.append(url)
+            elif _looks_like_a_page(url):
+                plausible.append(url)
+
+    found = list(dict.fromkeys(marked)) or list(dict.fromkeys(plausible))
+    if found:
+        return found[:limit]
+    # No usable sitemap. Some shops have none at all, others publish one that
+    # lists only their static pages; either way the catalogue is still there to
+    # be walked.
+    return await crawl_product_urls(client, base, limit)
+
+
+async def has_readable_products(
+    client: httpx.AsyncClient, base: str, tries: int = 3
+) -> str | None:
+    """Can a price be read off one of this shop's product pages?
+
+    Returns None when yes, and otherwise the reason — which is the point.
+    schema.org/Product belongs on a product page, not the homepage, so asking
+    the homepage produced one blanket verdict for shops with nothing in common.
+
+    Measured after the fix, on the 45 stores that verdict covered: two are
+    readable (highsnobiety.com, soletrader.co.uk) and the rest publish no
+    machine-readable price at all. Their pages carry a name and an article
+    number and render the price in JavaScript, which is a wall rather than a
+    gap in this parser — so the reason has to say which of the two it is.
+    """
+    # Ask for far more URLs than will be opened. The ordering — pages that
+    # announce themselves as products first — only helps if it has something to
+    # order: asking for three got www.consortium.co.uk's first three category
+    # pages, and none of them is a product.
+    urls = await discover_product_urls(client, base, limit=max(30, tries * 10))
+    if not urls:
+        return "no product pages found in the sitemap or by crawling"
+    opened = 0
+    for url in urls[:tries]:
+        page = await _get(client, url)
+        if page is None:
+            continue
+        opened += 1
+        if parse_product(page.text, url) is not None:
+            return None
+    if not opened:
+        return "product pages found but none of them would load"
+    return "product pages carry no machine-readable price (rendered in JavaScript)"
 
 
 async def fetch(
@@ -272,12 +463,19 @@ async def fetch(
     currency: str | None = None,
     budget: int = DEFAULT_BUDGET,
     cursor: int = 0,
-) -> tuple[FetchResult, int]:
-    """Crawl `budget` product pages starting at `cursor`. Returns (result, next_cursor)."""
+) -> FetchResult:
+    """Crawl `budget` product pages starting at `cursor`.
+
+    Where to carry on is reported in `result.next_cursor`, the same way the
+    Shopify adapter reports it — one convention, because the pipeline should not
+    have to know which adapter it is talking to.
+    """
     base = f"https://{domain}".rstrip("/")
     urls = await discover_product_urls(client, base)
     if not urls:
-        return FetchResult(domain=domain, error="no product URLs in sitemap"), 0
+        return FetchResult(
+            domain=domain, error="no product URLs in the sitemap or by crawling"
+        )
 
     start = cursor % len(urls)
     window = (urls + urls)[start : start + budget]
@@ -302,7 +500,11 @@ async def fetch(
     await asyncio.gather(*(one(u) for u in window))
 
     if not products:
-        return FetchResult(domain=domain, error="no schema.org/Product markup found"), next_cursor
+        return FetchResult(
+            domain=domain, error="no schema.org/Product markup found", next_cursor=next_cursor
+        )
 
     dominant = currency or max(currencies, key=currencies.get)
-    return FetchResult(domain=domain, products=products, currency=dominant), next_cursor
+    return FetchResult(
+        domain=domain, products=products, currency=dominant, next_cursor=next_cursor
+    )

@@ -322,3 +322,76 @@ async def test_a_store_waiting_out_a_false_block_is_still_collected(
 
     assert result.ok, "the block was lifted before this store gave up"
     assert result.products
+
+
+class TestFinishingACatalogueOverSeveralRuns:
+    """A pass that stopped early used to be filed as a complete success.
+
+    www.flatspot.com's last sweep returned 1,000 products; the database knows of
+    17,348 for that shop. Nothing in the run said so, the shop was marked
+    collected and went to the back of the queue, and the same first pages came
+    back next time. Two different things cut a sweep short — the page cap on a
+    large catalogue, and Shopify refusing part way through — and both are
+    answered the same way: say where to carry on.
+    """
+
+    @staticmethod
+    def _full_page(shopify_payload):
+        repeats = -(-shopify.PAGE_SIZE // len(shopify_payload["products"]))
+        return {"products": shopify_payload["products"] * repeats}
+
+    @respx.mock
+    async def test_stopping_at_the_page_cap_says_where_to_resume(self, shopify_payload):
+        respx.route(host="shop.example", path="/products.json").mock(
+            return_value=httpx.Response(200, json=self._full_page(shopify_payload))
+        )
+        async with httpx.AsyncClient() as client:
+            result = await shopify.fetch(client, "shop.example", currency="USD", max_pages=2)
+
+        assert result.ok
+        assert not result.complete
+        assert result.next_cursor == 3, "two full pages read from page one, carry on at three"
+
+    @respx.mock
+    async def test_a_finished_catalogue_asks_for_no_second_pass(self, shopify_payload):
+        respx.get("https://shop.example/products.json?limit=250").mock(
+            return_value=httpx.Response(200, json=shopify_payload)
+        )
+        async with httpx.AsyncClient() as client:
+            result = await shopify.fetch(client, "shop.example", currency="USD")
+
+        assert result.complete
+        assert result.next_cursor == 0
+
+    @respx.mock
+    async def test_the_next_run_starts_where_the_last_one_stopped(self, shopify_payload):
+        page_two = respx.get("https://shop.example/products.json?limit=250&page=2").mock(
+            return_value=httpx.Response(200, json=shopify_payload)
+        )
+        first_page = respx.get("https://shop.example/products.json?limit=250")
+
+        async with httpx.AsyncClient() as client:
+            result = await shopify.fetch(client, "shop.example", currency="USD", cursor=2)
+
+        assert page_two.called
+        assert not first_page.called, "the pages already read are not read again"
+        assert result.products
+
+    @respx.mock
+    async def test_a_sweep_cut_short_keeps_its_place_rather_than_starting_over(
+        self, shopify_payload
+    ):
+        """The refusal arrives mid-catalogue; the page already read is not lost."""
+        respx.get("https://shop.example/products.json?limit=250").mock(
+            return_value=httpx.Response(200, json=self._full_page(shopify_payload))
+        )
+        respx.get("https://shop.example/products.json?limit=250&page=2").mock(
+            return_value=httpx.Response(429)
+        )
+
+        async with httpx.AsyncClient() as client:
+            result = await shopify.fetch(client, "shop.example", currency="USD")
+
+        assert result.ok, "one good page is still a result"
+        assert result.next_cursor == 2
+        assert result.products

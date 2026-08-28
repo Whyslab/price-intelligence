@@ -33,16 +33,32 @@ class ScrapedProduct:
 
 @dataclass(slots=True)
 class FetchResult:
-    """What one pass over one store produced."""
+    """What one pass over one store produced.
+
+    `next_cursor` is where the following run should carry on from, and zero
+    means the catalogue was read to the end. Both adapters need it and for the
+    same reason: neither reads a large shop in one go. jsonld crawls a bounded
+    slice of product pages; Shopify pages through a catalogue that a
+    platform-wide block can cut off half way. A pass that stopped early used to
+    be recorded as a complete success, so the shop went to the back of the queue
+    with most of its catalogue unread — www.flatspot.com's last sweep returned
+    1,000 products out of the 17,348 we know it has.
+    """
 
     domain: str
     products: list[ScrapedProduct] = field(default_factory=list)
     currency: str | None = None
     error: str | None = None
+    next_cursor: int = 0
 
     @property
     def ok(self) -> bool:
         return self.error is None
+
+    @property
+    def complete(self) -> bool:
+        """Was the whole catalogue read, or only a slice of it?"""
+        return self.ok and self.next_cursor == 0
 
 
 _CLOTHING = {

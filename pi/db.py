@@ -10,7 +10,7 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 SCHEMA_SQL = Path(__file__).with_name("schema.sql")
 
 
@@ -51,6 +51,8 @@ def migrate(conn: sqlite3.Connection) -> None:
         _migrate_3_to_4(conn)
     if current in (1, 2, 3, 4):
         _migrate_4_to_5(conn)
+    if current in (1, 2, 3, 4, 5):
+        _migrate_5_to_6(conn)
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
 
@@ -137,6 +139,32 @@ def _migrate_4_to_5(conn: sqlite3.Connection) -> None:
     4 would otherwise never be offered the column.
     """
     _add_missing_trust_columns(conn)
+
+
+def _migrate_5_to_6(conn: sqlite3.Connection) -> None:
+    """Add stores.impersonate, and drop the www duplicates of two shops.
+
+    `sneakerjunkiesusa.com` and `www.sneakerjunkiesusa.com` were both being
+    collected as separate shops — 9,868 and 9,812 products for one catalogue.
+    Market comparison already collapses them (pi.domains.same_shop), so they
+    never counted as two shops agreeing, but they cost a slot in every sweep and
+    twenty thousand rows in the database. The site list keeps the form without
+    the prefix, so that is the row that stays.
+    """
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(stores)")}
+    if "impersonate" not in columns:
+        conn.execute("ALTER TABLE stores ADD COLUMN impersonate INTEGER NOT NULL DEFAULT 0")
+
+    duplicates = conn.execute(
+        """
+        SELECT d.id, d.domain FROM stores d
+        JOIN stores keep ON keep.domain = substr(d.domain, 5)
+        WHERE d.domain LIKE 'www.%'
+        """
+    ).fetchall()
+    for row in duplicates:
+        log.info("dropping %s — the same shop is already tracked without www.", row["domain"])
+        conn.execute("DELETE FROM stores WHERE id = ?", (row["id"],))
 
 
 def drop_fx_noise(conn: sqlite3.Connection) -> int:

@@ -8,8 +8,11 @@ __pycache__/
 
 # Local state
 data/*.db
+data/*.db.*
 data/*.db-wal
 data/*.db-shm
+# Intermediate certificates fetched for shops whose servers omit them (pi/tls.py)
+data/ca-cache/
 data/fx_cache.json
 filters.toml
 

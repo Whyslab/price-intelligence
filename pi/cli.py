@@ -4,12 +4,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import sys
 from pathlib import Path
 from urllib.parse import urlparse
 
 from . import db as dbm
-from . import pipeline, reference
+from . import pipeline, reference, tls
 from .config import Config, load_config
 from .domains import same_host
 from .notify import Telegram
@@ -94,6 +95,7 @@ def cmd_detect(args, config: Config) -> int:
                 limiter=RateLimiter(
                     rate=config.shopify_rate, per_host_rate=config.shopify_host_rate
                 ),
+                ca_cache=tls.cache_dir(config.db_path),
             )
 
     tally = asyncio.run(go())
@@ -239,7 +241,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--limit", type=int, help="send at most N alerts")
     p.add_argument("--stores", help="comma-separated domains, for testing")
     p.add_argument(
-        "--jsonld-budget", type=int, default=jsonld.DEFAULT_BUDGET,
+        "--jsonld-budget", type=int,
+        default=int(os.getenv("PI_JSONLD_BUDGET", jsonld.DEFAULT_BUDGET)),
         help="product pages to crawl per non-Shopify store per run",
     )
     p.set_defaults(func=cmd_run)
