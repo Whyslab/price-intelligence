@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
+from datetime import UTC, datetime
 
 import httpx
 import pytest
@@ -12,6 +13,8 @@ from pi import db as dbm
 from pi import deals as dealm
 from pi import pipeline, reference
 from pi.config import Config, Filters
+from pi.fx import Rates
+from pi.sources.base import FetchResult, ScrapedProduct, ScrapedVariant
 
 from .conftest import ts
 
@@ -91,6 +94,28 @@ async def test_a_discounted_shopify_catalogue_produces_a_photo_alert(config, sho
     assert body["photo"].startswith("http")
     assert "−" in body["caption"] and "%" in body["caption"]
     assert body["parse_mode"] == "HTML"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_a_run_classifies_what_it_collected(config, shopify_payload):
+    """Brand, gender and kind must be filled by the run, not wait for a command."""
+    _mock_rates()
+    _mock_telegram()
+    respx.get("https://shop.example/products.json?limit=250").mock(
+        return_value=httpx.Response(200, json=shopify_payload)
+    )
+
+    conn = dbm.connect(config.db_path)
+    known_store(conn)
+    await pipeline.run(config, conn)
+
+    unclassified = conn.execute(
+        "SELECT COUNT(*) FROM products WHERE kind IS NULL AND brand_norm IS NULL"
+    ).fetchone()[0]
+    total = conn.execute("SELECT COUNT(*) FROM products").fetchone()[0]
+    assert total > 0
+    assert unclassified < total, "the run left every product unclassified"
 
 
 @respx.mock
@@ -636,3 +661,52 @@ class TestOneAlertPerArticle:
 
         assert pipeline.seed_alerts(conn, config) == 3, "but all three are suppressed"
         assert pipeline.seed_alerts(conn, config, dry_run=True) == 0
+
+
+class TestStoreResult:
+    """Persisting one shop's catalogue — the path everything else is built on."""
+
+    @staticmethod
+    def _result(domain="shop.com"):
+        return FetchResult(
+            domain=domain,
+            currency="USD",
+            products=[
+                ScrapedProduct(
+                    external_id="p1",
+                    title="Wmns Air Force 1",
+                    url="https://shop.com/p1",
+                    brand="Nike",
+                    category="Sneakers",
+                    variants=[
+                        ScrapedVariant(external_id="v1", price=100.0, size="US 7"),
+                        ScrapedVariant(external_id="v2", price=100.0, size="US 7.5"),
+                    ],
+                )
+            ],
+        )
+
+    def test_it_reports_the_products_it_touched(self, conn):
+        """The run classifies these afterwards, so losing one loses its brand and kind."""
+        store_id = dbm.upsert_store(conn, "shop.com")
+        rates = Rates({"USD": 1.0}, fetched_at=datetime.now(UTC), source="test")
+        written, changed, products = pipeline.store_result(
+            conn, store_id, self._result(), rates
+        )
+        assert written == 2
+        assert len(changed) == 2
+        assert len(products) == 1
+        stored = conn.execute("SELECT id FROM products").fetchone()[0]
+        assert products == [stored]
+
+    def test_a_second_pass_over_unchanged_prices_writes_no_points(self, conn):
+        """The reason hourly collection costs almost nothing in disk."""
+        store_id = dbm.upsert_store(conn, "shop.com")
+        rates = Rates({"USD": 1.0}, fetched_at=datetime.now(UTC), source="test")
+        pipeline.store_result(conn, store_id, self._result(), rates)
+        written, changed, products = pipeline.store_result(
+            conn, store_id, self._result(), rates
+        )
+        assert written == 0
+        assert changed == []
+        assert len(products) == 1  # still touched, still worth classifying

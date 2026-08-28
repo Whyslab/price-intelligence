@@ -11,7 +11,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from . import db as dbm
-from . import pipeline, reference, tls
+from . import pipeline, reference, taxonomy, tls
 from .config import Config, load_config
 from .domains import same_host
 from .notify import Telegram
@@ -285,6 +285,33 @@ def cmd_reindex(args, config: Config) -> int:
     return 0
 
 
+def cmd_reclassify(args, config: Config) -> int:
+    """Re-derive brand, gender and kind from what the shops wrote.
+
+    Separate from `reindex` because it answers a different question — that one
+    asks which products are the same product, this one asks what each product
+    is. Both are rebuilt rather than patched, and both need re-running after a
+    change to the rules they apply.
+    """
+    conn = dbm.connect(config.db_path)
+    stats = taxonomy.classify(conn)
+    total = stats["products"]
+
+    def share(n: int) -> str:
+        return f"{n:,} ({n / total * 100:.1f}%)" if total else "0"
+
+    known = stats["gender_stated"] + stats["gender_borrowed"]
+    print(f"товаров: {total:,}")
+    print(f"марка определена:  {share(stats['brand'])}, словарь {stats['brands']:,} марок")
+    print(f"тип определён:     {share(stats['kind'])}")
+    print(
+        f"пол определён:     {share(known)}"
+        f" — {stats['gender_stated']:,} названо магазином,"
+        f" {stats['gender_borrowed']:,} перенесено по артикулу"
+    )
+    return 0
+
+
 def cmd_prune(args, config: Config) -> int:
     conn = dbm.connect(config.db_path)
     before = config.db_path.stat().st_size if config.db_path.exists() else 0
@@ -360,6 +387,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="rebuild the article numbers products are matched by between shops",
     )
     p.set_defaults(func=cmd_reindex)
+
+    p = sub.add_parser(
+        "reclassify",
+        help="re-derive brand, gender and kind for every product",
+    )
+    p.set_defaults(func=cmd_reclassify)
 
     p = sub.add_parser(
         "find", help="search the database for what is discounted right now"

@@ -10,7 +10,7 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 SCHEMA_SQL = Path(__file__).with_name("schema.sql")
 
 
@@ -40,6 +40,11 @@ def migrate(conn: sqlite3.Connection) -> None:
         )
     if current == SCHEMA_VERSION:
         return
+    # Columns first, because replaying schema.sql creates indexes and a new
+    # index over a new column cannot be built before the column exists. This
+    # bites only on tables that already exist: CREATE TABLE IF NOT EXISTS is a
+    # no-op there, so the column arrives by ALTER or not at all.
+    _add_columns(conn)
     # Every statement in schema.sql is CREATE ... IF NOT EXISTS, so replaying it
     # is how both "create from scratch" and "add what version N introduced" work.
     conn.executescript(SCHEMA_SQL.read_text(encoding="utf-8"))
@@ -165,6 +170,34 @@ def _migrate_5_to_6(conn: sqlite3.Connection) -> None:
     for row in duplicates:
         log.info("dropping %s — the same shop is already tracked without www.", row["domain"])
         conn.execute("DELETE FROM stores WHERE id = ?", (row["id"],))
+
+
+# Columns added to tables that already existed, by the version that added them.
+# Adding one is idempotent, so this is a list of what should be there rather
+# than a sequence of steps, and it runs before schema.sql is replayed.
+_ADDED_COLUMNS: dict[str, dict[str, str]] = {
+    # v7: what we make of what the shop wrote. Left empty by the migration
+    # itself — filling them reads every product and every variant, which is
+    # twenty seconds and not something a connection should do on its way
+    # somewhere else. `pi reclassify` fills them, and a normal run classifies
+    # what it collects, so the columns catch up either way.
+    "products": {
+        "brand_norm": "TEXT",
+        "brand_family": "TEXT",
+        "gender": "TEXT",
+        "kind": "TEXT",
+    },
+}
+
+
+def _add_columns(conn: sqlite3.Connection) -> None:
+    for table, columns in _ADDED_COLUMNS.items():
+        existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if not existing:
+            continue  # a fresh database: schema.sql will create it complete
+        for name, kind in columns.items():
+            if name not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {kind}")
 
 
 def drop_fx_noise(conn: sqlite3.Connection) -> int:
