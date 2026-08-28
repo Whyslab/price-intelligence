@@ -74,5 +74,15 @@ brands_deny = []
 # Leave empty to accept any size. Normalisation is best effort: a bare "44"
 # is read as EU44 and a bare "10" as US10, which is right most of the time
 # but not always, so prefer listing several forms of your size.
+# List every regional form of your size: the catalogue is labelled mostly in US
+# sizes — 1,422,974 variants against 318,482 in EU and 49,529 in UK — so an
+# EU-only filter throws away most of what is on offer. Half sizes too: shops
+# round the conversion differently.
 sizes = []
-# e.g. sizes = ["EU44", "US10", "US10.5", "UK9.5"]
+# e.g. footwear EU 44-45 plus clothing L-XL:
+# sizes = [
+#     "EU44", "EU44.5", "EU45", "US10", "US10.5", "US11", "UK9", "UK9.5", "UK10",
+#     "L", "XL", "L/XL",
+# ]
+# Listing only shoe sizes silently drops all clothing: it is sized S/M/L/XL, and
+# one-size accessories are "OS".

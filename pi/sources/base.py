@@ -66,6 +66,8 @@ _CLOTHING = {
     "OS", "ONE SIZE", "OSFA",
 }
 _NUM = re.compile(r"(\d+(?:[.,]5)?)")
+# "X-L", "X L", "XX-L", "X-X-L" — every way a shop spaces out an X size.
+_X_SIZE = re.compile(r"\b((?:X[\s-]?){1,3})([SLM])\b")
 
 
 def normalize_size(raw: str | None) -> str | None:
@@ -84,6 +86,10 @@ def normalize_size(raw: str | None) -> str | None:
     s = re.sub(r"\b(LARGE)\b", "L", s)
     s = re.sub(r"\b(MEDIUM)\b", "M", s)
     s = re.sub(r"\b(SMALL)\b", "S", s)
+    # "X-Large" and "X Large" are XL, and used to come out as "X-L" and "X L" —
+    # forms no size filter matches, because nobody writes their size that way.
+    # 12,017 variants in the live catalogue were sized like this.
+    s = _X_SIZE.sub(lambda m: m.group(1).replace("-", "").replace(" ", "") + m.group(2), s)
     if s in _CLOTHING:
         return "OS" if s in {"ONE SIZE", "OSFA"} else s
 

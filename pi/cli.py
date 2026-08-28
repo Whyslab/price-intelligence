@@ -16,6 +16,7 @@ from .config import Config, load_config
 from .domains import same_host
 from .notify import Telegram
 from .sources import detect, jsonld
+from .sources.base import normalize_size
 from .throttle import RateLimiter
 
 
@@ -222,12 +223,35 @@ def cmd_find(args, config: Config) -> int:
     return 0
 
 
-def cmd_reindex(args, config: Config) -> int:
-    """Rebuild the keys products are matched by between shops.
+def _renormalise_sizes(conn) -> int:
+    """Re-derive `variants.size_norm` from the size the shop wrote.
 
-    A normal run keeps them current for what it collects; this fills them in for
-    a catalogue gathered before the keys existed, and re-derives them all after a
-    change to how they are extracted.
+    Normalisation is stored, not computed on read, so a shop's size only gets
+    the current reading when that shop is next collected — weeks, for a catalogue
+    swept in slices. After a change to `normalize_size` the stored values are
+    stale, and a size filter silently skips whatever still carries the old form:
+    "X-Large" normalised to "X-L" for 12,017 variants, and nobody's filter says
+    "X-L".
+    """
+    rows = conn.execute("SELECT id, size, size_norm FROM variants WHERE size IS NOT NULL")
+    changed = [
+        (fresh, variant_id)
+        for variant_id, size, stored in rows
+        if (fresh := normalize_size(size)) != stored
+    ]
+    if changed:
+        with dbm.transaction(conn):
+            conn.executemany("UPDATE variants SET size_norm = ? WHERE id = ?", changed)
+    return len(changed)
+
+
+def cmd_reindex(args, config: Config) -> int:
+    """Rebuild what the code derives from what the shops actually sent.
+
+    Article numbers, so products can be matched between shops, and normalised
+    sizes. A normal run keeps both current for what it collects; this fills them
+    in for a catalogue gathered earlier, and re-derives everything after a change
+    to how they are read.
     """
     conn = dbm.connect(config.db_path)
     rows = conn.execute(
@@ -256,6 +280,8 @@ def cmd_reindex(args, config: Config) -> int:
     ).fetchone()[0]
     print(f"{len(rows):,} товаров, у {keyed:,} есть опознавательные ключи")
     print(f"{shared:,} ключей встречаются больше чем в одном магазине")
+    resized = _renormalise_sizes(conn)
+    print(f"размеров пересчитано: {resized:,}")
     return 0
 
 

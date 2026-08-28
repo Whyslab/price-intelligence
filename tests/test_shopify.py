@@ -193,6 +193,28 @@ def test_size_normalisation(raw, expected):
     assert normalize_size(raw) == expected
 
 
+@pytest.mark.parametrize(
+    "raw,expected",
+    [("X-Large", "XL"), ("X Large", "XL"), ("X-L", "XL"), ("X L", "XL"),
+     ("XX-Large", "XXL"), ("X-X-Large", "XXL"), ("X-Small", "XS"), ("XL", "XL")],
+)
+def test_an_x_size_spelled_out_is_still_that_size(raw, expected):
+    """Nobody writes their size as "X-L", so nothing matched these.
+
+    12,017 variants in the live catalogue were sized "X-Large" or "X Large" and
+    normalised to forms no size filter would ever equal.
+    """
+    from pi.sources.base import normalize_size
+
+    assert normalize_size(raw) == expected
+
+
+def test_an_x_that_is_not_a_size_is_left_alone():
+    from pi.sources.base import normalize_size
+
+    assert normalize_size("Max Load") == "MAX LOAD"
+
+
 @respx.mock
 async def test_one_strict_shop_backs_itself_off_not_the_whole_sweep(shopify_payload):
     """Measured live: while a sweep was collecting 429s, kith.com and
