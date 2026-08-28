@@ -106,6 +106,57 @@ CREATE TABLE IF NOT EXISTS alerts (
 );
 CREATE INDEX IF NOT EXISTS ix_alerts_ts ON alerts(ts DESC);
 
+-- What is on offer right now, kept as it is found rather than searched for.
+--
+-- A run already scores every variant whose price moved and then throws away
+-- everything past the notification cap. Searching the whole database instead
+-- takes a minute or two, which is fine for `pi find` at a terminal and not fine
+-- for someone pressing a button in the bot. So the run writes down what it
+-- found: one row per variant that qualifies, replaced when that variant is
+-- scored again and deleted when it stops qualifying.
+--
+-- This is a cache with a clear rule for going stale: a deal is only true until
+-- its price moves, and a price moving is exactly when the row is rewritten.
+CREATE TABLE IF NOT EXISTS offers (
+    variant_id       INTEGER PRIMARY KEY REFERENCES variants(id) ON DELETE CASCADE,
+    product_id       INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+    found_at         TEXT    NOT NULL,   -- when this price was first seen, not when scored
+    checked_at       TEXT    NOT NULL,   -- when the shop last confirmed it
+    price_usd        REAL    NOT NULL,
+    reference_usd    REAL    NOT NULL,
+    reference_source TEXT    NOT NULL,
+    discount_pct     REAL    NOT NULL,
+    saving_usd       REAL    NOT NULL,
+    score            INTEGER NOT NULL,
+    all_time_low     INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS ix_offers_score ON offers(score DESC);
+CREATE INDEX IF NOT EXISTS ix_offers_product ON offers(product_id);
+
+-- Who is being shown things, and what they want shown. The split this table
+-- exists for: filters.toml says what counts as a discount — a fact about the
+-- product, the same for everyone — and this says what is worth putting in front
+-- of one person. Keeping them apart is what lets a second person be added
+-- without recomputing the first person's discounts.
+CREATE TABLE IF NOT EXISTS bot_users (
+    id          INTEGER PRIMARY KEY,       -- Telegram's user id
+    chat_id     TEXT    NOT NULL,
+    username    TEXT,
+    created_at  TEXT    NOT NULL,
+    -- Every filter below is NULL for "no opinion", which is not the same as
+    -- empty. A user who skipped the sizes question wants every size; a user who
+    -- answered it and then cleared the list is saying something else, and the
+    -- wizard never leaves them in that state.
+    genders     TEXT,                      -- 'men' and/or 'women', comma separated
+    kinds       TEXT,                      -- shoes / clothing / accessories
+    sizes       TEXT,                      -- normalised: EU44, US10.5, XL
+    brands      TEXT,                      -- brand families, comma separated
+    -- The wizard is resumable, because it runs over several messages and the
+    -- process holding it in memory can be restarted between two of them.
+    wizard_step TEXT,
+    onboarded   INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS runs (
     id             INTEGER PRIMARY KEY,
     started_at     TEXT    NOT NULL,

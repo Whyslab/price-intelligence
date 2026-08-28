@@ -850,3 +850,51 @@ class TestDegradationNotice:
         self._runs(conn, [1000] * 5, blocked=1)
         notice = pipeline.degradation_notice(conn)
         assert "квота" in notice
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_a_run_leaves_what_is_on_offer_on_the_shelf(config, shopify_payload):
+    """The bot reads this table; searching the database instead takes minutes."""
+    _mock_rates()
+    _mock_telegram()
+    respx.get("https://shop.example/products.json?limit=250").mock(
+        return_value=httpx.Response(200, json=shopify_payload)
+    )
+    conn = dbm.connect(config.db_path)
+    known_store(conn)
+    await pipeline.run(config, conn)
+
+    offers = conn.execute("SELECT COUNT(*) FROM offers").fetchone()[0]
+    sent = conn.execute("SELECT COUNT(*) FROM alerts WHERE sent = 1").fetchone()[0]
+    assert offers >= sent > 0, "everything announced is also on the shelf"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_an_offer_is_withdrawn_when_the_sale_ends(config, shopify_payload):
+    _mock_rates()
+    _mock_telegram()
+    respx.get("https://shop.example/products.json?limit=250").mock(
+        return_value=httpx.Response(200, json=shopify_payload)
+    )
+    conn = dbm.connect(config.db_path)
+    known_store(conn)
+    await pipeline.run(config, conn)
+    assert conn.execute("SELECT COUNT(*) FROM offers").fetchone()[0] > 0
+
+    # The shop puts its prices back up: same catalogue, no discount left.
+    full_price = json.loads(json.dumps(shopify_payload))
+    for product in full_price["products"]:
+        for variant in product["variants"]:
+            variant["compare_at_price"] = None
+            variant["price"] = f"{float(variant['price']) * 4:.2f}"
+    respx.get("https://shop.example/products.json?limit=250").mock(
+        return_value=httpx.Response(200, json=full_price)
+    )
+    make_due(conn)
+    await pipeline.run(config, conn)
+
+    assert conn.execute("SELECT COUNT(*) FROM offers").fetchone()[0] == 0, (
+        "a sale that ended must leave the shelf, or the bot shows prices that are gone"
+    )

@@ -410,6 +410,24 @@ def _one_alert_per_article(
     return kept
 
 
+def shelf_config(config: Config) -> Config:
+    """The same thresholds, with the personal filters taken back out.
+
+    Sizes and brands are facts about a reader, not about a discount, and the
+    shelf is read by every reader. Leaving them in makes the whole per-person
+    filter meaningless: the shelf would already contain nothing but one person's
+    sizes, so asking it for those sizes changes nothing — measured on the live
+    database, 7,938 offers became 7,938. It also makes "show me every size", the
+    thing the list exists for when buying a present, impossible to answer.
+
+    They still apply to notifications, which are addressed to somebody.
+    """
+    return replace(
+        config,
+        filters=replace(config.filters, sizes=(), brands_allow=(), brands_deny=()),
+    )
+
+
 def find_deals(
     conn: sqlite3.Connection,
     variant_ids: list[int],
@@ -694,7 +712,26 @@ async def run(
         watching = watched_products(conn, codes)
         if codes:
             log.info("watching %d article(s), matching %d product(s)", len(codes), len(watching))
-        candidates = find_deals(conn, scorable, config, watched=watching)
+        # Two passes over the same variants, because the two questions differ.
+        # The notification list is trimmed on purpose — capped per shop, one
+        # alert per article, nothing announced twice — while the browsable list
+        # is everything still on offer, including what was announced last week.
+        # Both share the market and trust indexes, which are what cost anything.
+        market = reference.build_market_index(conn)
+        trust = reference.store_trust(conn)
+        on_offer = find_deals(
+            conn, scorable, shelf_config(config), market=market, trust=trust,
+            cap_per_store=False, fold_duplicates=False, skip_alerted=False,
+            watched=watching,
+        )
+        written, withdrawn = dbm.record_offers(
+            conn, scorable, [deal for deal, _ in on_offer], dbm.utcnow()
+        )
+        log.info("%d offer(s) on the shelf, %d withdrawn", written, withdrawn)
+
+        candidates = find_deals(
+            conn, scorable, config, market=market, trust=trust, watched=watching
+        )
         cap = limit if limit is not None else config.filters.max_alerts_per_run
         selected = candidates[:cap]
         overflow = len(candidates) - len(selected)

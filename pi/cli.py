@@ -10,8 +10,8 @@ from dataclasses import replace
 from pathlib import Path
 from urllib.parse import urlparse
 
+from . import bot, pipeline, reference, taxonomy, tls
 from . import db as dbm
-from . import pipeline, reference, taxonomy, tls
 from .config import Config, load_config
 from .domains import same_host
 from .notify import Telegram
@@ -312,6 +312,20 @@ def cmd_reclassify(args, config: Config) -> int:
     return 0
 
 
+def cmd_bot(args, config: Config) -> int:
+    """Serve the Telegram bot until stopped.
+
+    Unlike every other command here this one does not finish: answering a button
+    press needs a process that is already running. It is the only long-lived part
+    of the project, and it collects nothing — it reads what the sweep left.
+    """
+    conn = dbm.connect(config.db_path)
+    try:
+        return asyncio.run(bot.serve(config, conn))
+    except KeyboardInterrupt:
+        return 0
+
+
 def cmd_prune(args, config: Config) -> int:
     conn = dbm.connect(config.db_path)
     before = config.db_path.stat().st_size if config.db_path.exists() else 0
@@ -408,6 +422,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--min-score", type=int)
     p.add_argument("--limit", type=int, default=25, help="rows to print (default 25)")
     p.set_defaults(func=cmd_find)
+
+    p = sub.add_parser("bot", help="serve the Telegram bot (runs until stopped)")
+    p.set_defaults(func=cmd_bot)
 
     p = sub.add_parser("health", help="collection health summary")
     p.add_argument("--send", action="store_true", help="send it to Telegram")

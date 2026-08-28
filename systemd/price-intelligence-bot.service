@@ -1,0 +1,25 @@
+[Unit]
+Description=Price Intelligence — Telegram bot
+Documentation=https://github.com/Whyslab/price-intelligence
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# The only long-lived part of the project. Everything else is a timer that
+# finishes; answering a button press needs a process that is already running.
+Type=simple
+WorkingDirectory=%h/Projects/price-intelligence
+ExecStart=%h/Projects/price-intelligence/.venv/bin/python -m pi bot
+Restart=always
+RestartSec=10
+Nice=10
+
+# It only needs its own directory and the network.
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/Projects/price-intelligence/data
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target
