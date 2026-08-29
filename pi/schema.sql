@@ -102,7 +102,22 @@ CREATE TABLE IF NOT EXISTS alerts (
     -- being one. Without this the summary reports tens of thousands of "alerts"
     -- that nobody ever received.
     sent         INTEGER NOT NULL DEFAULT 1,
-    UNIQUE (product_id, price_bucket)
+    -- Who was told. Telegram's user id, or 0 meaning everybody.
+    --
+    -- Deduplication has to be per reader or the second subscriber is silently
+    -- robbed: with one row per product the first person to be told closes the
+    -- news for everyone, and the more subscribers there are the less each of
+    -- them hears. So the key carries the reader.
+    --
+    -- 0 is not a user, it is a claim about all of them, and only two things
+    -- write it. `pi seed` records the discounts that were already running when
+    -- the bot arrived — those are what things cost, not news, and they are not
+    -- news for somebody who subscribes tomorrow either. And every row written
+    -- before this column existed, which was genuinely sent to the only reader
+    -- there was. Both mean "nobody needs to hear this", which is what
+    -- already_alerted asks.
+    user_id      INTEGER NOT NULL DEFAULT 0,
+    UNIQUE (user_id, product_id, price_bucket)
 );
 CREATE INDEX IF NOT EXISTS ix_alerts_ts ON alerts(ts DESC);
 
@@ -154,7 +169,13 @@ CREATE TABLE IF NOT EXISTS bot_users (
     -- The wizard is resumable, because it runs over several messages and the
     -- process holding it in memory can be restarted between two of them.
     wizard_step TEXT,
-    onboarded   INTEGER NOT NULL DEFAULT 0
+    onboarded   INTEGER NOT NULL DEFAULT 0,
+    -- Cleared when Telegram says this chat cannot be written to any more —
+    -- the reader blocked the bot, or deleted the chat. Without it every run
+    -- spends a request and a second of its notification budget on somebody who
+    -- left, and the log fills with a failure nobody can act on. Talking to the
+    -- bot again sets it back.
+    active      INTEGER NOT NULL DEFAULT 1
 );
 
 CREATE TABLE IF NOT EXISTS runs (
