@@ -96,7 +96,21 @@ async def probe(
             out["platform"] = "tls"
             out["error"] = f"certificate: {reason}"
             return out
-        out["platform"] = "tls" if "CERTIFICATE_VERIFY_FAILED" in detail else "dead"
+        if "CERTIFICATE_VERIFY_FAILED" in detail:
+            out["platform"] = "tls"
+            out["error"] = f"{type(exc).__name__}: {detail[:120]}"
+            return out
+        # Not answering at all is also how a shop refuses us. Blocking used to
+        # mean a 403, so that was the only thing a browser fingerprint was tried
+        # on; www.asos.com, www.mrporter.com and www.revolve.com simply let the
+        # connection hang instead and were written off as dead. All three answer
+        # 200 to Chrome's handshake. A timeout says nothing about whether the
+        # host is there, so it is worth the second request.
+        if allow_impersonation and impersonate.available():
+            verdict = await _probe_as_a_browser(client, domain, limiter, ca_cache)
+            if verdict is not None:
+                return verdict
+        out["platform"] = "dead"
         out["error"] = f"{type(exc).__name__}: {detail[:120]}"
         return out
 
