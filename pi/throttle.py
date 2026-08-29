@@ -15,11 +15,18 @@ that very moment. Parallel requests from one IP are what Shopify refuses, across
 its whole platform. So the limiter allows exactly one Shopify request in flight
 at a time (`slot()`), and paces those in-flight requests with a token bucket.
 
-*Once blocked, nothing helps but stopping.* Measured after a sweep tripped it:
-requests spaced two seconds apart, strictly one at a time, still returned 429
-from every shop — the same shape of request that had succeeded twenty minutes
-earlier. The block is platform-wide, outlasts twenty minutes, and cannot be
-negotiated down by going slower. Continuing to probe only feeds it.
+*Once blocked, nothing helps but stopping — but not for long.* Measured after a
+sweep tripped it: requests spaced two seconds apart, strictly one at a time,
+still returned 429 from every shop — the same shape of request that had
+succeeded moments earlier. The refusal is platform-wide and cannot be negotiated
+down by going slower.
+
+It is also short. Re-measured 29.08 with the sweep stopped: forty seconds of
+quiet was enough for /products.json to answer 200 again, and a fresh run of
+45 requests one at a time, half a second apart, drew no refusal at all. So the
+steady rate is not what trips it and the recovery costs a minute, not an
+afternoon. What the sweep must not do is treat the refusal as permanent: see
+`confirm_blocked`, which spends the wait testing rather than assuming.
 
 So the limiter trips a breaker. Refusals alone are not the signal: a healthy
 sweep of fifteen stores had three different shops rate-limit us within one
@@ -78,6 +85,11 @@ PLATFORM_WINDOW = 30.0
 # request every time, so a sweep whose opening requests land on them would
 # otherwise abandon all 138 stores two seconds in.
 MIN_ATTEMPTS_BEFORE_BLOCK = 12
+# How many requests must have gone out inside PLATFORM_WINDOW before their
+# failure means anything. Below this the sweep is not being refused, it is idle:
+# the shops that were refused are serving out their pauses and nothing is being
+# asked of anyone. Four is one per host the breaker needs to hear from.
+MIN_ATTEMPTS_IN_WINDOW = 4
 # A pause is stretched by a random factor in this range so that shops refused in
 # the same second do not all come back in the same second. Without it the retries
 # arrive as one volley, which looks exactly like the block it then causes us to
@@ -87,7 +99,17 @@ PAUSE_JITTER = (1.0, 1.6)
 # How long a suspected block is held as provisional. Requests that have not
 # started yet wait this out; a success from one already in flight cancels it.
 # Long enough for a jittered 60s penalty to come back and prove itself wrong.
-CONFIRM_WINDOW = 75.0
+CONFIRM_WINDOW = 120.0
+# How often one waiter is let through to test whether the platform is answering
+# again. Deliberately sparse: a probe is a request spent against the very quota
+# that is refusing us, so the window buys two chances, not a stream of them.
+# Measured 29.08, both halves of it. After a single sweep tripped the breaker,
+# forty seconds of quiet was enough to get 200 again — which is what makes
+# probing worth anything at all. But after three sweeps inside twenty minutes,
+# five probes spaced 20s apart over 100s were all refused: what this IP runs out
+# of is a rolling allowance of requests, not a rate, and once that is gone no
+# amount of asking politely brings it back inside a run.
+PROBE_EVERY = 40.0
 
 
 class _Bucket:
@@ -146,7 +168,11 @@ class RateLimiter:
         # in flight at once. One is what the measurement supports.
         self._inflight = asyncio.Semaphore(max_inflight)
         self._recent: deque[tuple[float, str]] = deque()
+        # When requests were actually made, so "nothing is getting through" can
+        # be told apart from "nothing was asked". See `penalise`.
+        self._tried: deque[float] = deque()
         self._last_success = 0.0
+        self._last_probe = 0.0
         self.attempts = 0
         self.penalties = 0
         self.successes = 0
@@ -178,18 +204,44 @@ class RateLimiter:
         Returns False the moment a request gets through — the sweep carries on.
         Returns True once CONFIRM_WINDOW has passed with nothing getting through,
         and then the caller should give up on Shopify for this run.
+
+        The waiting is punctuated, not silent. A block is revoked by a success
+        arriving, and while this method refuses every caller no request can be
+        made, so no success can arrive: the only candidate was whatever happened
+        to be in flight when the breaker tripped, and at one request in flight
+        that is usually nothing. Measured over every run of 28-29.08: the block
+        was declared thirteen times and revoked none, while the platform itself
+        was answering again inside a minute. So one caller is let through every
+        PROBE_EVERY seconds to ask. That is what turns the window into a test of
+        the hypothesis rather than a sentence.
         """
         while (started := self.blocked_at) is not None:
-            left = CONFIRM_WINDOW - (time.monotonic() - started)
-            if left <= 0:
+            now = time.monotonic()
+            if now - started >= CONFIRM_WINDOW:
                 self.abandoned += 1
                 return True
-            await asyncio.sleep(min(left, 0.5))
+            # Single-threaded and no await in between, so exactly one waiter
+            # claims each probe.
+            due = max(started, self._last_probe) + PROBE_EVERY
+            if now >= due:
+                self._last_probe = now
+                log.info(
+                    "testing whether the block has lifted (%.0fs in, %.0fs left)",
+                    now - started, started + CONFIRM_WINDOW - now,
+                )
+                return False
+            # Wake when the next probe falls due rather than on a fixed tick, so
+            # a recovery is noticed when it happens and not up to a tick later.
+            await asyncio.sleep(min(due - now, started + CONFIRM_WINDOW - now, 0.5))
         return False
 
     def note_attempt(self, host: str = "") -> None:
         """Record that a request was made, successful or not."""
         self.attempts += 1
+        now = time.monotonic()
+        while self._tried and now - self._tried[0] > PLATFORM_WINDOW:
+            self._tried.popleft()
+        self._tried.append(now)
 
     def note_success(self, host: str = "") -> None:
         """Record that a request got through.
@@ -255,7 +307,20 @@ class RateLimiter:
                     or now - self._last_success > PLATFORM_WINDOW
                 )
                 too_early = self.attempts < MIN_ATTEMPTS_BEFORE_BLOCK
-                if len(distinct) < PLATFORM_HOSTS or not nothing_working or too_early:
+                # "No successes" only means something if we were asking. When a
+                # convoy of shops is serving out its back-off nobody is asking at
+                # all, and the resulting silence used to read as a total refusal.
+                # Measured on a live sweep: six shops refused in the same second
+                # 16s in, every one of them sat out a 60-95s pause, and the
+                # breaker tripped during that quiet — yet all six then delivered
+                # their catalogues in full. Silence is not evidence.
+                unheard = len(self._tried) < MIN_ATTEMPTS_IN_WINDOW
+                if (
+                    len(distinct) < PLATFORM_HOSTS
+                    or not nothing_working
+                    or too_early
+                    or unheard
+                ):
                     log.info(
                         "%s is rate limiting us — backing off that shop for %.0fs", host, wait
                     )

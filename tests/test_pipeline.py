@@ -805,6 +805,22 @@ class TestAdaptiveBudget:
         self._run(conn, budget=45, blocked=0)
         assert pipeline._adaptive_budget(conn, ceiling=45) == 45
 
+    def test_a_hand_run_sweep_does_not_count_as_evidence(self, conn):
+        """`--stores` visits what it was told to, so its budget measures nothing.
+
+        Live 29.08: a `--stores` run of eight shops recorded a budget of 45, and
+        the next scheduled sweep read that back as forty-five shops having just
+        gone through cleanly and set off at full width into a quota that was
+        still exhausted.
+        """
+        self._run(conn, budget=10, blocked=1)
+        conn.execute(
+            "INSERT INTO runs (started_at, finished_at, shopify_budget, blocked, scope) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (ts(), ts(), 45, 0, "stores"),
+        )
+        assert pipeline._adaptive_budget(conn, ceiling=45) == pipeline.BUDGET_FLOOR
+
 
 class TestDegradationNotice:
     """Saying so when the collector quietly stops working."""
@@ -905,3 +921,65 @@ async def test_an_offer_is_withdrawn_when_the_sale_ends(config, shopify_payload)
     assert conn.execute("SELECT COUNT(*) FROM offers").fetchone()[0] == 0, (
         "a sale that ended must leave the shelf, or the bot shows prices that are gone"
     )
+
+
+class TestRecordingABlock:
+    """Being shut out has to be written down on every way out of a run.
+
+    It was not written down on the `--collect-only` path, which returns before
+    the bookkeeping. Live 29.08: a collect-only run lost 22 stores to the block
+    and still recorded `blocked = 0`, so the next sweep read the quota as healthy
+    and set off at full width.
+    """
+
+    @staticmethod
+    def _shut_out(monkeypatch):
+        class ShutOut(pipeline.RateLimiter):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.abandoned = 3
+
+        monkeypatch.setattr(pipeline, "RateLimiter", ShutOut)
+
+    @respx.mock
+    async def test_a_collect_only_run_still_records_it(
+        self, config, shopify_payload, monkeypatch
+    ):
+        _mock_rates()
+        respx.get("https://shop.example/products.json?limit=250").mock(
+            return_value=httpx.Response(200, json=shopify_payload)
+        )
+        self._shut_out(monkeypatch)
+
+        conn = dbm.connect(config.db_path)
+        known_store(conn)
+        await pipeline.run(config, conn, collect_only=True)
+
+        assert conn.execute("SELECT blocked FROM runs").fetchone()["blocked"] == 1
+
+    @respx.mock
+    async def test_a_full_run_records_it_too(self, config, shopify_payload, monkeypatch):
+        _mock_rates()
+        _mock_telegram()
+        respx.get("https://shop.example/products.json?limit=250").mock(
+            return_value=httpx.Response(200, json=shopify_payload)
+        )
+        self._shut_out(monkeypatch)
+
+        conn = dbm.connect(config.db_path)
+        known_store(conn)
+        await pipeline.run(config, conn)
+
+        assert conn.execute("SELECT blocked FROM runs").fetchone()["blocked"] == 1
+
+    @respx.mock
+    async def test_an_untroubled_run_records_nothing(self, config, shopify_payload):
+        _mock_rates()
+        respx.get("https://shop.example/products.json?limit=250").mock(
+            return_value=httpx.Response(200, json=shopify_payload)
+        )
+        conn = dbm.connect(config.db_path)
+        known_store(conn)
+        await pipeline.run(config, conn, collect_only=True)
+
+        assert conn.execute("SELECT blocked FROM runs").fetchone()["blocked"] == 0
