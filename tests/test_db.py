@@ -4,6 +4,7 @@ from __future__ import annotations
 import sqlite3
 
 from pi import db as dbm
+from pi import deals as dealm
 
 from .conftest import ts
 
@@ -266,3 +267,93 @@ class TestMigrationCoverage:
         migrated = dbm.connect(tmp_path / "old.db")
         assert migrated.execute("SELECT COUNT(*) FROM stores").fetchone()[0] == 1
         assert migrated.execute("PRAGMA user_version").fetchone()[0] == dbm.SCHEMA_VERSION
+
+
+class TestRecordingWhatIsOnOffer:
+    """The shelf's two dates both used to be the clock, and both were wrong.
+
+    A run scores the whole catalogue but reads a slice of it, so "now" is the
+    answer to neither "when did this price drop?" nor "when did the shop last
+    confirm it?".
+    """
+
+    @staticmethod
+    def _deal(variant_id, product_id, price=100.0, dropped_hours_ago=None):
+        return dealm.Deal(
+            variant_id=variant_id, product_id=product_id, price_usd=price,
+            reference_usd=200.0, reference_source="market", discount_pct=50.0,
+            saving_usd=100.0, score=70, all_time_low=False, fake_sale=False,
+            dropped_hours_ago=dropped_hours_ago, history_points=2,
+        )
+
+    @staticmethod
+    def _shop(conn, domain, last_ok):
+        store = dbm.upsert_store(
+            conn, domain, platform="shopify", currency="USD", last_ok=last_ok
+        )
+        product = dbm.upsert_product(conn, store, f"p-{domain}", "Air Max",
+                                     f"https://{domain}/p")
+        variant = dbm.upsert_variant(conn, product, f"v-{domain}", sku="SKU",
+                                     size="US 10", size_norm="US10")
+        return product, variant
+
+    def test_checked_at_is_when_the_shop_last_confirmed_it(self, conn):
+        """Not when we last scored it. A shop read on Tuesday says Tuesday.
+
+        allikestore.com's -93% Wotherspoon was stamped as checked minutes ago
+        while the shop had last been read the day before and the URL had since
+        started answering 404.
+        """
+        product, variant = self._shop(conn, "stale.example", last_ok=ts(4))
+        dbm.record_offers(conn, [variant], [self._deal(variant, product)], ts())
+
+        checked = conn.execute("SELECT checked_at FROM offers").fetchone()["checked_at"]
+        assert checked == ts(4), "the shop's last successful read, not the clock"
+
+    def test_a_shop_read_this_run_is_fresh(self, conn):
+        product, variant = self._shop(conn, "fresh.example", last_ok=ts(0))
+        dbm.record_offers(conn, [variant], [self._deal(variant, product)], ts())
+
+        checked = conn.execute("SELECT checked_at FROM offers").fetchone()["checked_at"]
+        assert checked == ts(0)
+
+    def test_a_shop_never_read_falls_back_to_the_run(self, conn):
+        """A first fill has no `last_ok` to go on, and saying nothing is worse."""
+        moment = ts()
+        product, variant = self._shop(conn, "new.example", last_ok=None)
+        dbm.record_offers(conn, [variant], [self._deal(variant, product)], moment)
+
+        checked = conn.execute("SELECT checked_at FROM offers").fetchone()["checked_at"]
+        assert checked == moment
+
+    def test_found_at_is_when_the_price_fell(self, conn):
+        """A month-old sale is not a fresh find."""
+        product, variant = self._shop(conn, "old.example", last_ok=ts(0))
+        dbm.record_offers(
+            conn, [variant],
+            [self._deal(variant, product, dropped_hours_ago=72)], ts(),
+        )
+        found = conn.execute("SELECT found_at FROM offers").fetchone()["found_at"]
+        assert found < ts(2), "three days ago, not now"
+
+    def test_confirming_the_same_price_does_not_make_it_new_again(self, conn):
+        product, variant = self._shop(conn, "same.example", last_ok=ts(2))
+        dbm.record_offers(
+            conn, [variant], [self._deal(variant, product, dropped_hours_ago=48)], ts())
+        first = conn.execute("SELECT found_at FROM offers").fetchone()["found_at"]
+
+        dbm.upsert_store(conn, "same.example", last_ok=ts(0))
+        dbm.record_offers(conn, [variant], [self._deal(variant, product)], ts())
+        row = conn.execute("SELECT found_at, checked_at FROM offers").fetchone()
+
+        assert row["found_at"] == first, "the same price is the same find"
+        assert row["checked_at"] == ts(0), "but it has been confirmed since"
+
+    def test_a_sale_that_ended_leaves_the_shelf(self, conn):
+        product, variant = self._shop(conn, "gone.example", last_ok=ts(0))
+        dbm.record_offers(conn, [variant], [self._deal(variant, product)], ts())
+        assert conn.execute("SELECT COUNT(*) FROM offers").fetchone()[0] == 1
+
+        written, withdrawn = dbm.record_offers(conn, [variant], [], ts())
+        assert (written, withdrawn) == (0, 1)
+        assert conn.execute("SELECT COUNT(*) FROM offers").fetchone()[0] == 0

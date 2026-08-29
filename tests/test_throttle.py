@@ -342,3 +342,94 @@ class TestConfirmingABlock:
     async def test_nothing_to_confirm_when_there_is_no_block(self):
         limiter = RateLimiter(rate=1000.0, per_host_rate=1000.0)
         assert await limiter.confirm_blocked() is False
+
+
+class TestSilenceIsNotEvidence:
+    """A drought only counts if the sweep was actually asking.
+
+    Live evidence (29.08, run of eight shops): six of them refused inside one
+    second sixteen seconds in, each sat out a 60-95s pause, and during that quiet
+    the breaker declared the platform blocked. It had not been refused during the
+    quiet — it had asked nobody. All six then delivered their catalogues in full,
+    3,247 products, `stores ok 8 / failed 0`.
+    """
+
+    async def test_refusals_during_a_lull_do_not_trip_the_breaker(self):
+        limiter = RateLimiter(rate=1000.0, per_host_rate=1000.0, cooldown=0.001)
+        # Plenty of requests overall, but none of them recent: this is a sweep
+        # whose shops are all serving out their back-off.
+        give_it_a_sample(limiter)
+        limiter._tried.clear()
+        for n in range(6):
+            await limiter.penalise(host=f"shop{n}.example")
+        assert not limiter.blocked, "nobody was asking, so nobody was refused"
+
+    async def test_refusals_while_the_sweep_is_asking_still_trip_it(self):
+        limiter = RateLimiter(rate=1000.0, per_host_rate=1000.0, cooldown=0.001)
+        give_it_a_sample(limiter)
+        for n in range(4):
+            limiter.note_attempt(f"shop{n}.example")
+            await limiter.penalise(host=f"shop{n}.example")
+        assert limiter.blocked, "asked four hosts, refused by four hosts"
+
+
+class TestTheWindowProbes:
+    """A suspected block is a hypothesis, and the window is where it is tested.
+
+    Before this, `confirm_blocked` refused every caller for the whole window, so
+    the success that would revoke the block could only come from a request
+    already in flight — and at one request in flight, usually none was. Measured
+    over 28-29.08: thirteen blocks declared, none revoked, while /products.json
+    was answering 200 again inside a minute.
+    """
+
+    async def test_a_waiter_is_let_through_to_ask(self, monkeypatch):
+        monkeypatch.setattr("pi.throttle.CONFIRM_WINDOW", 5.0)
+        monkeypatch.setattr("pi.throttle.PROBE_EVERY", 0.05)
+        limiter = RateLimiter(rate=1000.0, per_host_rate=1000.0, cooldown=0.001)
+        give_it_a_sample(limiter)
+        for n in range(4):
+            limiter.note_attempt(f"shop{n}.example")
+            await limiter.penalise(host=f"shop{n}.example")
+        assert limiter.blocked
+
+        start = time.monotonic()
+        assert await limiter.confirm_blocked() is False, "let through to try"
+        assert time.monotonic() - start < 1.0
+        assert limiter.blocked, "and the block still stands until one gets through"
+        assert limiter.abandoned == 0, "being sent to ask is not giving up"
+
+    async def test_only_one_waiter_probes_per_interval(self, monkeypatch):
+        """Ten stores waiting must not all charge at a platform that may really
+        be refusing — that is the volley the breaker exists to stop."""
+        monkeypatch.setattr("pi.throttle.CONFIRM_WINDOW", 30.0)
+        monkeypatch.setattr("pi.throttle.PROBE_EVERY", 0.3)
+        limiter = RateLimiter(rate=1000.0, per_host_rate=1000.0, cooldown=0.001)
+        give_it_a_sample(limiter)
+        for n in range(4):
+            limiter.note_attempt(f"shop{n}.example")
+            await limiter.penalise(host=f"shop{n}.example")
+
+        tasks = [asyncio.create_task(limiter.confirm_blocked()) for _ in range(10)]
+        done, pending = await asyncio.wait(tasks, timeout=0.5)
+        for task in pending:
+            task.cancel()
+        assert [t.result() for t in done] == [False], "one prober in one interval"
+
+    async def test_a_successful_probe_frees_the_whole_sweep(self, monkeypatch):
+        monkeypatch.setattr("pi.throttle.CONFIRM_WINDOW", 5.0)
+        monkeypatch.setattr("pi.throttle.PROBE_EVERY", 0.05)
+        limiter = RateLimiter(rate=1000.0, per_host_rate=1000.0, cooldown=0.001)
+        give_it_a_sample(limiter)
+        for n in range(4):
+            limiter.note_attempt(f"shop{n}.example")
+            await limiter.penalise(host=f"shop{n}.example")
+
+        async def the_prober():
+            assert await limiter.confirm_blocked() is False
+            limiter.note_success("shop0.example")   # the platform is answering
+
+        waiters = [limiter.confirm_blocked() for _ in range(5)]
+        results = await asyncio.gather(the_prober(), *waiters)
+        assert results[1:] == [False] * 5, "everyone carries on"
+        assert limiter.abandoned == 0, "and no store was given up on"

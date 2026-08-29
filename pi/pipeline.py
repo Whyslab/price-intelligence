@@ -128,10 +128,14 @@ BUDGET_RETREAT = 0.66
 
 def _adaptive_budget(conn: sqlite3.Connection, ceiling: int) -> int:
     """How many Shopify shops to attempt, learned from how the last run went."""
+    # Only full sweeps count. A `--stores` run visits whatever was named, so its
+    # budget is a label rather than a measurement: reading it back taught the
+    # next sweep that 45 shops had just gone through fine when nobody had tried.
     row = conn.execute(
         """
         SELECT shopify_budget, blocked FROM runs
          WHERE finished_at IS NOT NULL AND shopify_budget IS NOT NULL
+           AND scope = 'sweep'
          ORDER BY id DESC LIMIT 1
         """
     ).fetchone()
@@ -141,6 +145,31 @@ def _adaptive_budget(conn: sqlite3.Connection, ceiling: int) -> int:
     if row["blocked"]:
         return max(BUDGET_FLOOR, int(previous * BUDGET_RETREAT))
     return min(ceiling, previous + BUDGET_STEP)
+
+
+def _record_block(conn: sqlite3.Connection, run_id: int, limiter) -> None:
+    """Write down whether Shopify shut this run out, and say so in the log.
+
+    Every exit from a run goes through here, `--collect-only` included. When it
+    did not, a collect-only run that had been cut off still recorded `blocked =
+    0`, and the next sweep read that as proof the quota was healthy and raised
+    its budget on the strength of it.
+
+    Counted off `abandoned`, not `limiter.blocked`: a success late in the sweep
+    lifts the block, and a run that had already given up on nineteen stores
+    would then report a clean sheet.
+    """
+    if limiter.abandoned:
+        conn.execute("UPDATE runs SET blocked = 1 WHERE id = ?", (run_id,))
+        log.error(
+            "Shopify blocked this IP part-way through; %d store(s) waited it out and "
+            "were skipped, and will be collected on the next run", limiter.abandoned,
+        )
+    elif limiter.penalties:
+        log.warning(
+            "individual shops rate limited us %d time(s); lower PI_SHOPIFY_HOST_RATE "
+            "if this persists", limiter.penalties,
+        )
 
 
 def _take_shopify_slice(
@@ -732,6 +761,7 @@ async def run(
             taxonomy.classify(conn, classified)
 
         if collect_only:
+            _record_block(conn, run_id, limiter)
             _finish_run(conn, run_id, stats)
             return stats
 
@@ -816,20 +846,7 @@ async def run(
                     )
                 await asyncio.sleep(1.0)  # Telegram allows ~30 messages/second; be calm
 
-    if limiter.abandoned:
-        # Counted, not read off `limiter.blocked`: a success late in the sweep
-        # lifts the block, and a run that had already given up on nineteen stores
-        # would then report a clean sheet.
-        conn.execute("UPDATE runs SET blocked = 1 WHERE id = ?", (run_id,))
-        log.error(
-            "Shopify blocked this IP part-way through; %d store(s) waited it out and "
-            "were skipped, and will be collected on the next run", limiter.abandoned,
-        )
-    elif limiter.penalties:
-        log.warning(
-            "individual shops rate limited us %d time(s); lower PI_SHOPIFY_HOST_RATE "
-            "if this persists", limiter.penalties,
-        )
+    _record_block(conn, run_id, limiter)
     _finish_run(conn, run_id, stats)
     # Last, because the notice is about the run just recorded — including
     # whether it was blocked, which is only known a few lines above this.

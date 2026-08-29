@@ -417,3 +417,74 @@ class TestFinishingACatalogueOverSeveralRuns:
         assert result.ok, "one good page is still a result"
         assert result.next_cursor == 2
         assert result.products
+
+
+class TestWhichOptionIsTheSize:
+    """option1 is not always the size, and reading it as one loses the shop.
+
+    Shopify does not type its options: a shop names them itself, and `option1`
+    is simply whichever it put first. Measured across the live catalogue, 19
+    shops holding 234,000 variants put the colour first — www.bananabenz.it,
+    undefeated.com, www.fatbuddhastore.com among them — so their sizes read as
+    NERO, BLU, BIANCO and matched nobody's size.
+    """
+
+    @staticmethod
+    def _product(options, option1, option2):
+        return {
+            "id": 1, "handle": "thing", "title": "Thing", "options": options,
+            "variants": [{
+                "id": 11, "price": "50.00", "available": True, "sku": "X",
+                "option1": option1, "option2": option2,
+            }],
+        }
+
+    def _parse(self, options, option1, option2):
+        payload = {"products": [self._product(options, option1, option2)]}
+        return shopify.parse_products(payload, "https://shop.example")[0].variants[0]
+
+    def test_the_colour_first_shop_is_read_by_name(self):
+        variant = self._parse(
+            [{"name": "Color", "position": 1}, {"name": "Size", "position": 2}],
+            "NERO", "EU 42",
+        )
+        assert variant.size == "EU 42"
+        assert variant.color == "NERO"
+
+    def test_the_ordinary_shop_is_unchanged(self):
+        variant = self._parse(
+            [{"name": "Size", "position": 1}, {"name": "Color", "position": 2}],
+            "EU 42", "NERO",
+        )
+        assert variant.size == "EU 42"
+        assert variant.color == "NERO"
+
+    @pytest.mark.parametrize("name", ["Taglia", "Größe", "Pointure", "Rozmiar", "Talla"])
+    def test_a_size_is_a_size_in_any_language(self, name):
+        """The list is not an English-speaking one: half of it is Italian."""
+        variant = self._parse(
+            [{"name": "Colore", "position": 1}, {"name": name, "position": 2}],
+            "NERO", "EU 42",
+        )
+        assert variant.size == "EU 42"
+
+    def test_naming_only_the_colour_still_says_where_the_size_is_not(self):
+        variant = self._parse(
+            [{"name": "Colour", "position": 1}], "NERO", "EU 42",
+        )
+        assert variant.size == "EU 42", "not the slot the colour was found in"
+        assert variant.color == "NERO"
+
+    def test_an_unrecognised_name_falls_back_to_the_old_order(self):
+        """Most shops are right about position, so a shrug keeps the guess."""
+        variant = self._parse(
+            [{"name": "Style", "position": 1}, {"name": "Fit", "position": 2}],
+            "EU 42", "NERO",
+        )
+        assert variant.size == "EU 42"
+        assert variant.color == "NERO"
+
+    def test_no_options_at_all_falls_back_too(self):
+        variant = self._parse(None, "EU 42", "NERO")
+        assert variant.size == "EU 42"
+        assert variant.color == "NERO"

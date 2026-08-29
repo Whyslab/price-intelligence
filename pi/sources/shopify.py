@@ -146,6 +146,57 @@ def _image_for(product: dict, variant: dict) -> str | None:
     return None
 
 
+# What shops call the two options that matter, in the languages the list uses.
+# Shopify does not type its options — a shop names them itself and the names are
+# all it publishes about which is which.
+_SIZE_NAMES = {
+    "size", "sizes", "shoe size", "taglia", "taglie", "größe", "grösse", "grosse",
+    "talla", "tallas", "taille", "pointure", "maat", "rozmiar", "storlek",
+    "størrelse", "koko", "méret", "velikost", "mărime", "размер",
+}
+_COLOUR_NAMES = {
+    "color", "colour", "colors", "colours", "colore", "colori", "farbe", "kleur",
+    "couleur", "kolor", "färg", "farve", "väri", "szín", "barva", "culoare", "цвет",
+}
+
+
+def _option_slots(raw: dict) -> tuple[int, int]:
+    """Which option holds the size and which the colour, as 0-based positions.
+
+    Shopify variants carry option1/2/3 with no indication of what they mean, and
+    reading option1 as the size is a guess that a lot of shops break: measured
+    across the live catalogue, 19 shops holding 234,000 variants put the colour
+    first, so their sizes read as NERO, BLU, BIANCO. Nothing then matches a size
+    filter, and the bot offers a shoe in "MULTICOLORE".
+
+    The product's own `options` array names them, so ask it. Positions are the
+    fallback for a shop that names nothing recognisable — the old behaviour, kept
+    because for most shops it is right.
+    """
+    size = colour = None
+    for option in raw.get("options") or []:
+        if not isinstance(option, dict):
+            continue
+        name = str(option.get("name") or "").strip().lower()
+        try:
+            slot = int(option.get("position", 0)) - 1
+        except (TypeError, ValueError):
+            continue
+        if slot < 0:
+            continue
+        if size is None and name in _SIZE_NAMES:
+            size = slot
+        elif colour is None and name in _COLOUR_NAMES:
+            colour = slot
+    if size is None:
+        # Never hand back the slot the colour was found in: a shop that names
+        # only its colour has still told us where the size is not.
+        size = 1 if colour == 0 else 0
+    if colour is None:
+        colour = 1 if size != 1 else 0
+    return size, colour
+
+
 def parse_products(payload: dict, base: str) -> list[ScrapedProduct]:
     """Turn one /products.json body into our own shapes. Pure — no I/O, easy to test."""
     out: list[ScrapedProduct] = []
@@ -153,6 +204,8 @@ def parse_products(payload: dict, base: str) -> list[ScrapedProduct]:
         handle = raw.get("handle") or ""
         variants: list[ScrapedVariant] = []
         image = None
+        size_slot, colour_slot = _option_slots(raw)
+        options = ("option1", "option2", "option3")
         for rv in raw.get("variants") or []:
             price = _money(rv.get("price"))
             if price is None:
@@ -169,8 +222,8 @@ def parse_products(payload: dict, base: str) -> list[ScrapedProduct]:
                     compare_at=compare,
                     in_stock=bool(rv.get("available", True)),
                     sku=(rv.get("sku") or None),
-                    size=(rv.get("option1") or None),
-                    color=(rv.get("option2") or None),
+                    size=(rv.get(options[size_slot]) or None) if size_slot < 3 else None,
+                    color=(rv.get(options[colour_slot]) or None) if colour_slot < 3 else None,
                 )
             )
         if not variants:

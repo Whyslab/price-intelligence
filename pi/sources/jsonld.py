@@ -90,6 +90,13 @@ def _text(value) -> str | None:
         return None
     if isinstance(value, str):
         return html.unescape(value).strip() or None
+    # Article numbers and sizes are quoted by most shops and left bare by some,
+    # and a bare one is not a reason to lose the field: 43einhalb publishes
+    # "sku": 40272, which used to read as no SKU at all.
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return str(value)
     if isinstance(value, dict):
         return _text(value.get("name") or value.get("@id") or value.get("url"))
     if isinstance(value, list):
@@ -153,64 +160,135 @@ def iter_ld_products(page: str):
                 yield node
 
 
+def _priced_offer(node: dict) -> tuple[float, str, bool] | None:
+    """(price, currency, in stock) off a node's Offer, or None if it has none."""
+    offers = node.get("offers")
+    if isinstance(offers, list):
+        offers = next((o for o in offers if isinstance(o, dict)), None)
+    if not isinstance(offers, dict):
+        return None
+
+    price = _price(offers.get("price"))
+    currency = _text(offers.get("priceCurrency"))
+    if price is None or not currency:
+        # Some shops put both inside priceSpecification instead of on the Offer.
+        spec = offers.get("priceSpecification")
+        if isinstance(spec, list):
+            spec = next((s for s in spec if isinstance(s, dict)), None)
+        if isinstance(spec, dict):
+            price = price if price is not None else _price(spec.get("price"))
+            currency = currency or _text(spec.get("priceCurrency"))
+    if price is None or not currency:
+        return None
+
+    availability = (_text(offers.get("availability")) or "instock").rsplit("/", 1)[-1]
+    return price, currency.upper(), availability.lower().replace(" ", "") in AVAILABLE
+
+
+def _image_of(node: dict, url: str) -> str | None:
+    image = node.get("image")
+    if isinstance(image, dict):
+        image = image.get("url") or image.get("contentUrl")
+    elif isinstance(image, list):
+        image = next(
+            (i if isinstance(i, str) else (i or {}).get("url") for i in image if i), None
+        )
+    return urljoin(url, html.unescape(image).strip()) if isinstance(image, str) else None
+
+
+def _variants_of(node: dict) -> tuple[list[ScrapedVariant], str] | None:
+    """The sizes of a ProductGroup, or None if this is not one.
+
+    schema.org's newer way of saying "one shoe, nine sizes": the page carries a
+    ProductGroup whose `hasVariant` holds a Product per size, each with its own
+    Offer and its own availability. The older shape puts a single Offer on the
+    Product itself and says nothing about sizes at all.
+
+    Worth reading properly rather than skipping. A sizeless product cannot be
+    matched against anyone's size, so the whole point of the shelf — "is it in
+    mine?" — is lost for that shop; and per-size availability is the difference
+    between a find and a sold-out listing.
+    """
+    variants = node.get("hasVariant")
+    if not isinstance(variants, list):
+        return None
+    found: list[ScrapedVariant] = []
+    currency = None
+    for item in variants:
+        if not isinstance(item, dict):
+            continue
+        priced = _priced_offer(item)
+        if priced is None:
+            continue
+        price, item_currency, in_stock = priced
+        currency = currency or item_currency
+        sku = _text(item.get("sku"))
+        size = _text(item.get("size"))
+        # Not every group varies by size. `variesBy` is colour at footlocker,
+        # champssports and cruisefashion, and those variants carry `color` where
+        # a sized one carries `size` — worth keeping either way, because the
+        # colourway is part of what the thing is.
+        colour = _text(item.get("color"))
+        found.append(
+            ScrapedVariant(
+                external_id=sku or size or colour or f"variant{len(found)}",
+                price=price,
+                compare_at=None,  # schema.org has no struck-through price
+                in_stock=in_stock,
+                sku=sku,
+                size=size,
+                color=colour,
+            )
+        )
+    if not found or not currency:
+        return None
+    return found, currency
+
+
 def parse_product(page: str, url: str) -> tuple[ScrapedProduct, str] | None:
     """Extract the first usable Product from a page. Pure — no I/O.
 
     Returns (product, currency) or None when the page carries no priced product.
     """
     for node in iter_ld_products(page):
-        offers = node.get("offers")
-        if isinstance(offers, list):
-            offers = next((o for o in offers if isinstance(o, dict)), None)
-        if not isinstance(offers, dict):
-            continue
-
-        price = _price(offers.get("price"))
-        currency = _text(offers.get("priceCurrency"))
-        if price is None or not currency:
-            # Some shops put both inside priceSpecification instead of on the Offer.
-            spec = offers.get("priceSpecification")
-            if isinstance(spec, list):
-                spec = next((s for s in spec if isinstance(s, dict)), None)
-            if isinstance(spec, dict):
-                price = price if price is not None else _price(spec.get("price"))
-                currency = currency or _text(spec.get("priceCurrency"))
-        if price is None or not currency:
-            continue
-
-        availability = (_text(offers.get("availability")) or "instock").rsplit("/", 1)[-1]
         title = _text(node.get("name"))
         if not title:
             continue
         sku = _text(node.get("sku")) or _text(node.get("mpn"))
 
-        image = node.get("image")
-        if isinstance(image, dict):
-            image = image.get("url") or image.get("contentUrl")
-        elif isinstance(image, list):
-            image = next(
-                (i if isinstance(i, str) else (i or {}).get("url") for i in image if i), None
-            )
-        image = urljoin(url, html.unescape(image).strip()) if isinstance(image, str) else None
-
-        product = ScrapedProduct(
-            external_id=sku or url,
-            title=title,
-            url=_text(node.get("url")) or url,
-            brand=_text(node.get("brand")),
-            image_url=image,
-            category=_text(node.get("category")),
-            variants=[
+        grouped = _variants_of(node)
+        if grouped is not None:
+            variants, currency = grouped
+        else:
+            priced = _priced_offer(node)
+            if priced is None:
+                continue
+            price, currency, in_stock = priced
+            variants = [
                 ScrapedVariant(
                     external_id=sku or "default",
                     price=price,
-                    compare_at=None,  # schema.org has no struck-through price
-                    in_stock=availability.lower().replace(" ", "") in AVAILABLE,
+                    compare_at=None,
+                    in_stock=in_stock,
                     sku=sku,
+                    # A single-offer page can still say what size it is —
+                    # highsnobiety.com puts it on the Product node — and a size
+                    # we were given is not one to throw away.
+                    size=_text(node.get("size")),
+                    color=_text(node.get("color")),
                 )
-            ],
+            ]
+
+        product = ScrapedProduct(
+            external_id=_text(node.get("productGroupID")) or sku or url,
+            title=title,
+            url=_text(node.get("url")) or url,
+            brand=_text(node.get("brand")),
+            image_url=_image_of(node, url),
+            category=_text(node.get("category")),
+            variants=variants,
         )
-        return product, currency.upper()
+        return product, currency
     return None
 
 
