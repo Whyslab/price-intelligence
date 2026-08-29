@@ -438,3 +438,29 @@ class TestLandedPrice:
         rules = landed.load_rules(tmp_path / "absent.toml")
         assert not rules.enabled
         assert landed.landed_all(rules, 100.0, "shoes", "s.com", "US") == []
+
+
+class TestTheShelfButton:
+    """The way out of the chat and into the whole shelf."""
+
+    def test_no_address_means_no_button(self):
+        """A link to a machine the reader is not sitting at is worse than none."""
+        assert bot.shelf_button(None) is None
+        assert bot.shelf_button("") is None
+
+    def test_https_opens_inside_telegram(self):
+        [button] = bot.shelf_button("https://shelf.example")
+        assert button["web_app"] == {"url": "https://shelf.example"}
+
+    def test_plain_http_becomes_an_ordinary_link(self):
+        """Telegram will not run a page inside itself without TLS."""
+        [button] = bot.shelf_button("http://127.0.0.1:8000")
+        assert button["url"] == "http://127.0.0.1:8000"
+        assert "web_app" not in button
+
+    def test_the_menu_carries_it_only_when_there_is_one(self, conn):
+        user = dbm.upsert_bot_user(conn, 1, "42", "someone")
+        without = bot.menu_keyboard(user, None)["inline_keyboard"]
+        with_it = bot.menu_keyboard(user, "https://shelf.example")["inline_keyboard"]
+        assert len(with_it) == len(without) + 1
+        assert any("web_app" in b for row in with_it for b in row)

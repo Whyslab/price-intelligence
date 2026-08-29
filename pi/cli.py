@@ -10,7 +10,7 @@ from dataclasses import replace
 from pathlib import Path
 from urllib.parse import urlparse
 
-from . import bot, pipeline, reference, taxonomy, tls
+from . import bot, pipeline, reference, taxonomy, tls, web
 from . import db as dbm
 from .config import Config, load_config
 from .domains import same_host
@@ -134,6 +134,21 @@ def cmd_run(args, config: Config) -> int:
     )
     for domain, error in stats.failures[:15]:
         print(f"  ! {domain}: {error}")
+    return 0
+
+
+def cmd_web(args, config: Config) -> int:
+    """Serve the shelf as a page. Blocks until interrupted."""
+    if not config.db_path.exists():
+        print(f"no database at {config.db_path} — run `pi run` first", file=sys.stderr)
+        return 1
+    if args.host != "127.0.0.1":
+        print(
+            f"serving on {args.host}: there is no login on this page, so put it "
+            "behind something that has one",
+            file=sys.stderr,
+        )
+    web.serve(config.db_path, host=args.host, port=args.port)
     return 0
 
 
@@ -425,6 +440,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("bot", help="serve the Telegram bot (runs until stopped)")
     p.set_defaults(func=cmd_bot)
+
+    p = sub.add_parser("web", help="browse the shelf in a browser")
+    p.add_argument("--host", default="127.0.0.1", help="default: this machine only")
+    p.add_argument("--port", type=int, default=8000)
+    p.set_defaults(func=cmd_web)
 
     p = sub.add_parser("health", help="collection health summary")
     p.add_argument("--send", action="store_true", help="send it to Telegram")

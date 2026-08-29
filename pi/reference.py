@@ -269,13 +269,57 @@ class MarketIndex:
                     tags[other] = tag
         if not prices:
             return Market()
+        agreed = agreeing_prices(list(prices.values()))
+        if not agreed:
+            return Market()
         return Market(
-            median_usd=round(statistics.median(prices.values()), 2),
-            low_usd=round(min(prices.values()), 2),
-            shops=len(prices),
+            median_usd=round(statistics.median(agreed), 2),
+            low_usd=round(min(agreed), 2),
+            shops=len(agreed),
             msrp_usd=mode_price(list(tags.values())),
             msrp_shops=len(tags),
         )
+
+
+# How far two shops may be apart and still be talking about the same thing.
+# Four is loose on purpose — the same shoe really is $90 in a sale and $220 at
+# full price, and a reference that rejected that would reject most of the
+# market. What it does reject is $61 against $3,824.
+MAX_SPREAD = 4.0
+
+
+def agreeing_prices(prices: list[float]) -> list[float]:
+    """The prices that are plausibly for the same article, or nothing.
+
+    Article matching is a claim, and a wrong claim is invisible until it prices
+    something. Measured on the live index, 3.9% of matched articles have one
+    shop asking ten times what another does — because shops put things in the
+    SKU field that are not article numbers. `8.625` is a skateboard's width;
+    `SN8-020325` is somebody's internal batch code covering three different Vans
+    models; `DIME` and `POLAR` are brand names, and 413 unrelated products share
+    the first of them.
+
+    The damage is not subtle. sneakers123.com lists a Vans Authentic at $3,824
+    against another shop's $60.99; the median of two is their average, so the
+    shelf showed a real $46 shoe as 98% off $1,942 — at the very top, sorted
+    there by the size of the lie.
+
+    Two shops that disagree by more than MAX_SPREAD are not corroborating each
+    other, they are describing different things, and there is no way to tell
+    which one is right: the honest answer is that this product has no market
+    price. With three or more, the median is a stable enough middle to measure
+    from, so the outliers are dropped and the rest still count.
+    """
+    if len(prices) < 2:
+        return prices
+    ordered = sorted(prices)
+    if len(prices) == 2:
+        low, high = ordered
+        return [] if low <= 0 or high / low > MAX_SPREAD else ordered
+    middle = statistics.median(ordered)
+    if middle <= 0:
+        return []
+    return [p for p in ordered if middle / MAX_SPREAD <= p <= middle * MAX_SPREAD]
 
 
 def build_market_index(conn: sqlite3.Connection) -> MarketIndex:
