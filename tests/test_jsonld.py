@@ -543,3 +543,60 @@ async def test_a_sitemap_of_static_pages_is_not_the_end_of_the_search():
     assert urls == ["https://shop.example/products/air-max-90"], (
         "a marked product outranks a plausible-looking static page from an earlier sitemap"
     )
+
+
+class TestProductGroups:
+    """One product, many sizes — schema.org's newer shape.
+
+    A ProductGroup carries no Offer of its own; the prices and the stock live in
+    `hasVariant`, one Product per size. Reading only the old shape cost the whole
+    shop: www.43einhalb.com had been failing with "no schema.org/Product markup
+    found" since it migrated, and reads 395 products once this is understood.
+    """
+
+    def _parsed(self):
+        page = (FIXTURES / "product_group_page.html").read_text(encoding="utf-8")
+        return jsonld.parse_product(page, "https://shop.example/en/p/cap-40271")
+
+    def test_every_size_becomes_its_own_variant(self):
+        parsed = self._parsed()
+        assert parsed is not None
+        product, currency = parsed
+        assert currency == "EUR"
+        assert product.title == "x 43einhalb R3D Anniversary - Fitted Cap"
+        assert product.brand == "New Era"
+        assert [v.size for v in product.variants] == ["EU 42", "EU 43"]
+
+    def test_a_size_without_a_price_is_left_out(self):
+        """Not guessed at from its neighbours: an unpriced size is not on sale."""
+        product, _ = self._parsed()
+        assert all(v.price > 0 for v in product.variants)
+        assert "EU 44" not in [v.size for v in product.variants]
+
+    def test_stock_is_read_per_size_not_per_product(self):
+        """The difference between a find and a sold-out listing."""
+        product, _ = self._parsed()
+        by_size = {v.size: v for v in product.variants}
+        assert by_size["EU 42"].in_stock is False
+        assert by_size["EU 43"].in_stock is True
+        assert by_size["EU 43"].price == 39.00
+
+    def test_a_bare_numeric_sku_is_still_an_sku(self):
+        """43einhalb publishes "sku": 40272 unquoted, which used to read as none."""
+        product, _ = self._parsed()
+        assert [v.sku for v in product.variants] == ["40272", "40273"]
+
+    def test_the_group_id_identifies_the_product(self):
+        """`productGroupID` is stable across the sizes; a variant sku is not."""
+        product, _ = self._parsed()
+        assert product.external_id == "10000045122"
+
+    def test_the_old_single_offer_shape_still_works(self):
+        """The shops that never migrated must not be broken by this."""
+        page = (FIXTURES / "product_page.html").read_text(encoding="utf-8")
+        parsed = jsonld.parse_product(page, "https://shop.example/adilette.html")
+        assert parsed is not None
+        product, currency = parsed
+        assert currency == "PLN"
+        assert len(product.variants) == 1
+        assert product.variants[0].price == 129.99
