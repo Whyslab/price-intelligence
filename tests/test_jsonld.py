@@ -292,6 +292,28 @@ async def test_the_standard_paths_are_still_tried_without_robots_txt():
     assert urls == ["https://shop.example/product/one.html"]
 
 
+class TestTellingAProductFromAnArticleAboutOne:
+    """The positive hints are loose on purpose, which lets prose in."""
+
+    def test_a_help_article_about_products_is_not_a_product(self):
+        """www.nike.com's entire sitemap is 44 pages shaped like this."""
+        for path in (
+            "https://www.nike.com/help/a/product-discount",
+            "https://www.nike.com/help/a/product-availability",
+            "https://shop.example/support/product-care",
+            "https://shop.example/customer-service/product-returns",
+        ):
+            assert not jsonld._is_product_url(path), path
+
+    def test_a_real_product_url_still_passes(self):
+        for path in (
+            "https://shop.example/products/air-max-90",
+            "https://shop.example/p/12345",
+            "https://shop.example/mens/footwear/nike-air-max-90/",
+        ):
+            assert jsonld._is_product_url(path), path
+
+
 class TestCrawlingWhenTheSitemapIsUseless:
     """36 live stores reported "no product URLs in sitemap".
 
