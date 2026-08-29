@@ -95,6 +95,7 @@ def offer_json(row: sqlite3.Row) -> dict:
     hides: a listing that four days ago was 60% off may simply be gone.
     """
     return {
+        "id": row["product_id"],
         "title": row["title"],
         "url": row["url"],
         "image": row["image_url"],
@@ -114,6 +115,56 @@ def offer_json(row: sqlite3.Row) -> dict:
         "all_time_low": bool(row["all_time_low"]),
         "found_at": row["found_at"],
         "checked_at": row["checked_at"],
+    }
+
+
+def product_page(conn: sqlite3.Connection, product_id: int) -> dict:
+    """One product, and what everyone else charges for the same article.
+
+    The comparison is the point. A shop's own struck-through price is a claim;
+    another shop asking twice as much for the same article is evidence, and a
+    third asking less is the answer to the only question that matters. 82% of
+    the shelf has nobody to compare against and says so rather than implying it.
+    """
+    row = conn.execute(
+        """
+        SELECT o.*, v.size_norm, v.size, v.sku,
+               p.title, p.url, p.image_url, p.brand, p.brand_norm, p.brand_family,
+               p.gender, p.kind, s.domain, s.name AS store_name, s.country, s.currency
+          FROM offers o
+          JOIN variants v ON v.id = o.variant_id
+          JOIN products p ON p.id = o.product_id
+          JOIN stores   s ON s.id = p.store_id
+         WHERE o.product_id = ?
+        """,
+        (product_id,),
+    ).fetchone()
+    if row is None:
+        return {}
+
+    elsewhere = [
+        {
+            "shop": other["store_name"] or other["domain"],
+            "domain": other["domain"],
+            "country": other["country"],
+            "url": other["url"],
+            "title": other["title"],
+            "price": round(other["price_usd"], 2),
+            "checked_at": other["last_ok"],
+        }
+        for other in dbm.same_article(conn, product_id)
+    ]
+    cheaper = [o for o in elsewhere if o["price"] < row["price_usd"]]
+    return {
+        "ours": offer_json(row),
+        "sizes": [
+            {"size": size, "in_stock": bool(in_stock)}
+            for size, in_stock in dbm.sizes_in_stock(conn, product_id)
+        ],
+        "elsewhere": elsewhere,
+        # Said plainly, because a page that only ever flatters the offer it is
+        # showing is an advertisement. Sometimes the answer is "not here".
+        "cheapest_elsewhere": cheaper[0] if cheaper else None,
     }
 
 
@@ -205,6 +256,16 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path == "/api/facets":
                 with self._open() as conn:
                     self._json(dbm.shelf_facets(conn))
+                return
+            if parsed.path.startswith("/api/product/"):
+                try:
+                    product_id = int(parsed.path.rsplit("/", 1)[1])
+                except ValueError:
+                    self._json({"error": "not a product id"}, 400)
+                    return
+                with self._open() as conn:
+                    found = product_page(conn, product_id)
+                self._json(found or {"error": "not on the shelf"}, 200 if found else 404)
                 return
             if parsed.path == "/api/offers":
                 with self._open() as conn:

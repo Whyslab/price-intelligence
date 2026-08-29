@@ -9,6 +9,8 @@ from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from .domains import same_shop
+
 log = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 10
@@ -882,3 +884,87 @@ def shelf_facets(conn: sqlite3.Connection) -> dict:
         ),
         "total": conn.execute("SELECT COUNT(*) FROM offers").fetchone()[0],
     }
+
+
+# A key carried by more distinct products than this is not an article number.
+# Measured on the live catalogue: genuine ones top out around thirteen —
+# HF0794-600 is thirteen shops' worth of the same Foamposite — while `DIME` is
+# carried by 413 unrelated products, because that shop puts the brand in the SKU
+# field. Between those two numbers there is nothing, so the line is drawn wide.
+MAX_KEY_FANOUT = 40
+
+
+def same_article(conn: sqlite3.Connection, product_id: int) -> list[sqlite3.Row]:
+    """Every other shop selling what this product is, cheapest first.
+
+    This is the question a shelf cannot answer on its own. 82% of what is on
+    offer is on offer in one shop only, so for most things the honest answer is
+    "nothing to compare with" — and for the rest, the comparison is the whole
+    proof that a discount is real. A shop's own struck-through price is a claim;
+    another shop charging twice as much for the same article is evidence.
+
+    Only what is in stock right now, because a price nobody can pay is not a
+    price. One row per merchant, at their cheapest, since a chain agreeing with
+    itself across four countries is one opinion — see pi.domains.same_shop.
+    """
+    rows = conn.execute(
+        """
+        WITH mine AS (
+            SELECT key_type, key FROM product_keys WHERE product_id = :pid
+        ),
+        usable AS (
+            SELECT m.key_type, m.key FROM mine m
+             WHERE (
+                 SELECT COUNT(DISTINCT x.product_id) FROM product_keys x
+                  WHERE x.key_type = m.key_type AND x.key = m.key
+             ) <= :fanout
+        ),
+        siblings AS (
+            SELECT DISTINCT pk.product_id
+              FROM product_keys pk
+              JOIN usable u ON u.key_type = pk.key_type AND u.key = pk.key
+             WHERE pk.product_id <> :pid
+        ),
+        latest AS (
+            SELECT variant_id, price_usd, currency, price_native
+              FROM (
+                SELECT variant_id, price_usd, currency, price_native, in_stock,
+                       ROW_NUMBER() OVER (PARTITION BY variant_id ORDER BY ts DESC) AS rn
+                  FROM price_points
+                 WHERE variant_id IN (
+                     SELECT id FROM variants WHERE product_id IN (SELECT product_id FROM siblings)
+                 )
+              )
+             WHERE rn = 1 AND in_stock = 1
+        )
+        SELECT s.domain, s.name AS store_name, s.country, s.last_ok,
+               p.title, p.url, p.id AS product_id,
+               MIN(latest.price_usd) AS price_usd,
+               latest.currency, latest.price_native
+          FROM latest
+          JOIN variants v ON v.id = latest.variant_id
+          JOIN products p ON p.id = v.product_id
+          JOIN stores   s ON s.id = p.store_id
+         GROUP BY p.id
+         ORDER BY price_usd
+        """,
+        {"pid": product_id, "fanout": MAX_KEY_FANOUT},
+    ).fetchall()
+
+    ours = conn.execute(
+        "SELECT s.domain FROM products p JOIN stores s ON s.id = p.store_id WHERE p.id = ?",
+        (product_id,),
+    ).fetchone()
+    us = same_shop(ours["domain"]) if ours else ""
+
+    # Folded here rather than in SQL because "same merchant" is a judgement
+    # about hostnames, not a column. A shop listing the same shoe twice, or
+    # selling it in four countries, is one price to compare against.
+    best: dict[str, sqlite3.Row] = {}
+    for row in rows:
+        shop = same_shop(row["domain"])
+        if shop == us:
+            continue
+        if shop not in best or row["price_usd"] < best[shop]["price_usd"]:
+            best[shop] = row
+    return sorted(best.values(), key=lambda r: r["price_usd"])

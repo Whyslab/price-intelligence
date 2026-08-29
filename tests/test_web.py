@@ -131,6 +131,94 @@ class TestTheSeededPage:
         assert '<\\/script>' in html
 
 
+class TestOneProductAndEveryoneElse:
+    """The comparison is the point: 82% of the shelf has nobody to compare with."""
+
+    _seq = 0
+
+    @classmethod
+    def _sell(cls, conn, domain, sku, price, on_shelf=False, title="Yeezy Slide Azure"):
+        """One shop's listing of an article. Its own row even in a shop that
+        already has one, because a shop listing the same shoe twice is exactly
+        the case that must not count as corroboration."""
+        cls._seq += 1
+        store = dbm.upsert_store(conn, domain, platform="shopify", currency="USD")
+        product = dbm.upsert_product(
+            conn, store, f"ext{cls._seq}", title, f"https://{domain}/p{cls._seq}",
+            brand="adidas",
+        )
+        dbm.set_product_keys(conn, product, {("sku", sku)})
+        variant = dbm.upsert_variant(conn, product, f"v{cls._seq}", sku=sku, size_norm="US10")
+        dbm.record_price(
+            conn, variant, price, None, True, "USD", price, 1.0, ts=dbm.utcnow()
+        )
+        if on_shelf:
+            conn.execute(
+                """
+                INSERT INTO offers (variant_id, product_id, found_at, checked_at,
+                                    price_usd, reference_usd, reference_source,
+                                    discount_pct, saving_usd, score, all_time_low)
+                VALUES (?, ?, ?, ?, ?, ?, 'market', 47.0, 70.0, 80, 0)
+                """,
+                (variant, product, ts(1), ts(0), price, 150.0),
+            )
+        return product
+
+    def test_it_lists_every_other_shop_holding_the_article(self, conn):
+        mine = self._sell(conn, "ours.example", "GX6138", 80.0, on_shelf=True)
+        self._sell(conn, "pricey.example", "GX6138", 170.0)
+        self._sell(conn, "middle.example", "GX6138", 125.0)
+
+        page = web.product_page(conn, mine)
+        assert [o["price"] for o in page["elsewhere"]] == [125.0, 170.0]
+        assert page["cheapest_elsewhere"] is None, "nobody beats us"
+
+    def test_it_says_so_when_somebody_is_cheaper(self, conn):
+        """A page that only ever flatters what it is showing is an advertisement."""
+        mine = self._sell(conn, "ours.example", "IF4396", 146.97, on_shelf=True)
+        self._sell(conn, "cheaper.example", "IF4396", 105.0)
+
+        page = web.product_page(conn, mine)
+        assert page["cheapest_elsewhere"]["price"] == 105.0
+        assert page["cheapest_elsewhere"]["domain"] == "cheaper.example"
+
+    def test_the_same_merchant_in_two_countries_appears_once(self, conn):
+        mine = self._sell(conn, "ours.example", "GX6138", 80.0, on_shelf=True)
+        self._sell(conn, "chain.com", "GX6138", 150.0)
+        self._sell(conn, "chain.de", "GX6138", 140.0)
+
+        page = web.product_page(conn, mine)
+        assert len(page["elsewhere"]) == 1
+        assert page["elsewhere"][0]["price"] == 140.0, "the merchant's cheaper one"
+
+    def test_our_own_shop_is_never_evidence_about_itself(self, conn):
+        mine = self._sell(conn, "ours.example", "GX6138", 80.0, on_shelf=True)
+        self._sell(conn, "ours.example", "GX6138", 200.0, title="Yeezy Slide Azure 2")
+
+        assert web.product_page(conn, mine)["elsewhere"] == []
+
+    def test_a_junk_key_does_not_drag_in_unrelated_things(self, conn):
+        """`DIME` is a brand name in a SKU field, shared by 413 products."""
+        mine = self._sell(conn, "ours.example", "DIME", 80.0, on_shelf=True)
+        for n in range(dbm.MAX_KEY_FANOUT + 2):
+            self._sell(conn, f"other{n}.example", "DIME", 20.0 + n, title=f"Thing {n}")
+
+        assert web.product_page(conn, mine)["elsewhere"] == []
+
+    def test_something_out_of_stock_elsewhere_is_not_a_price(self, conn):
+        mine = self._sell(conn, "ours.example", "GX6138", 80.0, on_shelf=True)
+        gone = self._sell(conn, "sold-out.example", "GX6138", 40.0)
+        conn.execute(
+            "UPDATE price_points SET in_stock = 0 WHERE variant_id IN"
+            " (SELECT id FROM variants WHERE product_id = ?)", (gone,),
+        )
+
+        assert web.product_page(conn, mine)["elsewhere"] == []
+
+    def test_a_product_that_left_the_shelf_is_not_found(self, conn):
+        assert web.product_page(conn, 999999) == {}
+
+
 class TestFacets:
     def test_filters_are_offered_only_for_what_is_actually_on_offer(self, conn):
         """A filter that returns an empty page is worse than no filter."""
