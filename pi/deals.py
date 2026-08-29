@@ -285,12 +285,20 @@ def evaluate(
     )
 
 
-def already_alerted(conn: sqlite3.Connection, deal: Deal) -> bool:
+def already_alerted(conn: sqlite3.Connection, deal: Deal, user_id: int = 0) -> bool:
     """True unless the price has fallen a further RE_ALERT_DROP below the best
-    price we have already announced for this product.
+    price we have already announced for this product *to this reader*.
 
     Keyed on the product rather than the variant, so a shoe discounted in eight
     sizes is announced once instead of eight times.
+
+    Keyed on the reader as well, because news is news to each person separately.
+    Asking only "was this product announced" was right while there was one
+    reader and quietly wrong the moment there were two: whoever the run reached
+    first would close the story for everybody behind them, so the more people
+    subscribed the less each of them heard. Rows carrying user 0 still count for
+    everyone — see the note on the column — which is what makes `pi seed` and
+    everything announced before this existed apply to a reader who joins today.
 
     Compared on price rather than on bucket: two prices 1.7% apart can still fall
     either side of a bucket edge, and that boundary artefact would let a
@@ -298,7 +306,8 @@ def already_alerted(conn: sqlite3.Connection, deal: Deal) -> bool:
     backstop in the table, which is about races, not about judgement.
     """
     best = conn.execute(
-        "SELECT MIN(price_usd) FROM alerts WHERE product_id = ?", (deal.product_id,)
+        "SELECT MIN(price_usd) FROM alerts WHERE product_id = ? AND user_id IN (0, ?)",
+        (deal.product_id, user_id),
     ).fetchone()[0]
     if best is None:
         return False
@@ -306,22 +315,24 @@ def already_alerted(conn: sqlite3.Connection, deal: Deal) -> bool:
 
 
 def record_alert(
-    conn: sqlite3.Connection, deal: Deal, ts: str, sent: bool = True
+    conn: sqlite3.Connection, deal: Deal, ts: str, sent: bool = True, user_id: int = 0
 ) -> bool:
     """Persist the alert. Returns False if it was already there (race-safe).
 
     `sent=False` is for `pi seed`, which records deals in order to suppress a
-    notification rather than to report one.
+    notification rather than to report one. It leaves `user_id` at 0, because
+    what it is recording is true of every reader.
     """
     cur = conn.execute(
         """
         INSERT OR IGNORE INTO alerts
-            (product_id, variant_id, ts, price_usd, price_bucket, discount_pct, score, sent)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            (product_id, variant_id, ts, price_usd, price_bucket, discount_pct,
+             score, sent, user_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             deal.product_id, deal.variant_id, ts, deal.price_usd,
-            deal.bucket, deal.discount_pct, deal.score, int(sent),
+            deal.bucket, deal.discount_pct, deal.score, int(sent), user_id,
         ),
     )
     return cur.rowcount > 0

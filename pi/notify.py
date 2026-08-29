@@ -173,6 +173,26 @@ class Telegram:
         self.chat_id = chat_id
         self._client = client
         self._owned = client is None
+        # Why the last send failed, so a caller can tell a chat that is gone
+        # from one that was merely busy. Retrying the first one forever costs a
+        # request and a place in the queue on every run, for a reader who left.
+        self.last_error = ''
+
+    # What Telegram says when a chat cannot be written to again, as opposed to
+    # not right now. Matched loosely because the wording carries the bot's name
+    # and has changed before.
+    GONE = (
+        "bot was blocked",
+        "user is deactivated",
+        "chat not found",
+        "bot can't initiate conversation",
+        "peer_id_invalid",
+    )
+
+    @property
+    def chat_is_gone(self) -> bool:
+        reason = self.last_error.lower()
+        return any(phrase in reason for phrase in self.GONE)
 
     async def __aenter__(self) -> Telegram:
         if self._client is None:
@@ -204,9 +224,11 @@ class Telegram:
                 return False, f"HTTP {resp.status_code}, non-JSON reply"
 
             if body.get("ok"):
+                self.last_error = ""
                 return True, "ok"
 
             description = str(body.get("description", "unknown error"))
+            self.last_error = description
             if resp.status_code == 429 and attempt < MAX_RETRIES:
                 wait = float(body.get("parameters", {}).get("retry_after", 2**attempt))
                 log.info("telegram rate limit, waiting %.0fs", wait)

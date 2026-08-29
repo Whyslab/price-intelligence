@@ -462,34 +462,37 @@ def shelf_config(config: Config) -> Config:
     )
 
 
-def find_deals(
+def _resolve_indexes(
+    conn: sqlite3.Connection,
+    market: reference.MarketIndex | None,
+    trust: dict[int, reference.Trust] | None,
+) -> tuple[reference.MarketIndex, dict[int, reference.Trust]]:
+    if market is None:
+        market = reference.build_market_index(conn)
+    if trust is None:
+        trust = reference.store_trust(conn)
+        reference.record_trust(conn, trust)
+    return market, trust
+
+
+def score_variants(
     conn: sqlite3.Connection,
     variant_ids: list[int],
     config: Config,
     market: reference.MarketIndex | None = None,
     trust: dict[int, reference.Trust] | None = None,
-    cap_per_store: bool = True,
-    fold_duplicates: bool = True,
-    skip_alerted: bool = True,
     watched: set[int] | None = None,
-    rank: Callable[[dealm.Deal, sqlite3.Row], float | None] | None = None,
 ) -> list[tuple[dealm.Deal, sqlite3.Row]]:
-    """Score the variants that moved, returning the ones worth announcing.
+    """Every variant that qualifies as a discount, unfolded and addressed to nobody.
 
-    `cap_per_store` and `fold_duplicates` are what `seed` turns off. Both exist
-    so one shop's promotion, or one shoe stocked everywhere, cannot fill a
-    notification run — but seeding is not a run. It has to account for every
-    qualifying deal, or the ones it trimmed come back as news on the next sweep.
+    This is the expensive half of finding deals — reading each variant's price
+    history and judging it against a reference — and none of it depends on who
+    is going to be told. Separating it from `arrange_for` is what stops a run
+    with twenty subscribers reading two million price points twenty times.
 
-    `skip_alerted` is what `pi find` turns off: a search of what is on offer
-    right now should show a deal whether or not it was announced last week.
-
-    `rank` is the second scale — how much *this reader* should care, as opposed
-    to how good the discount is. It orders the result and can drop a find below
-    that reader's bar by returning None. It runs before folding and capping, so
-    the trimming happens on the list the reader would actually be sent. Without
-    it the order is the discount's own score, which is what seeding and `pi find`
-    want.
+    Unfolded on purpose. Which variant of a product is the one worth announcing
+    depends on what has already been said to a particular reader, so folding
+    here would decide it once for everybody.
     """
     if not variant_ids:
         return []
@@ -497,13 +500,9 @@ def find_deals(
     rows = _candidates(conn, variant_ids, config, watched)
     if not rows:
         return []
-    if market is None:
-        market = reference.build_market_index(conn)
-    if trust is None:
-        trust = reference.store_trust(conn)
-        reference.record_trust(conn, trust)
+    market, trust = _resolve_indexes(conn, market, trust)
 
-    best_per_product: dict[int, tuple[dealm.Deal, sqlite3.Row]] = {}
+    scored: list[tuple[dealm.Deal, sqlite3.Row]] = []
     for variant_id, history in _histories(conn):
         row = rows.get(variant_id)
         if row is None:
@@ -521,7 +520,32 @@ def find_deals(
             trust=trust.get(row["store_id"]),
             watched=row["product_id"] in watched,
         )
-        if deal is None or (skip_alerted and dealm.already_alerted(conn, deal)):
+        if deal is not None:
+            scored.append((deal, row))
+    return scored
+
+
+def arrange_for(
+    conn: sqlite3.Connection,
+    scored: list[tuple[dealm.Deal, sqlite3.Row]],
+    config: Config,
+    market: reference.MarketIndex,
+    *,
+    user_id: int = 0,
+    rank: Callable[[dealm.Deal, sqlite3.Row], float | None] | None = None,
+    cap_per_store: bool = True,
+    fold_duplicates: bool = True,
+    skip_alerted: bool = True,
+) -> list[tuple[dealm.Deal, sqlite3.Row]]:
+    """One reader's list, out of deals already scored. The cheap half.
+
+    Everything here is a question about the reader rather than about the price:
+    what they have already been told, how much they should care, and how much of
+    it they can stand in one hour. Run once per subscriber.
+    """
+    best_per_product: dict[int, tuple[dealm.Deal, sqlite3.Row]] = {}
+    for deal, row in scored:
+        if skip_alerted and dealm.already_alerted(conn, deal, user_id):
             continue
         # One notification per product: the same hoodie discounted in six sizes
         # is one thing worth knowing, so keep only its best-scoring variant.
@@ -545,6 +569,49 @@ def find_deals(
     if cap_per_store:
         found = _cap_per_store(found, config.filters.max_alerts_per_store)
     return found
+
+
+def find_deals(
+    conn: sqlite3.Connection,
+    variant_ids: list[int],
+    config: Config,
+    market: reference.MarketIndex | None = None,
+    trust: dict[int, reference.Trust] | None = None,
+    cap_per_store: bool = True,
+    fold_duplicates: bool = True,
+    skip_alerted: bool = True,
+    watched: set[int] | None = None,
+    rank: Callable[[dealm.Deal, sqlite3.Row], float | None] | None = None,
+    user_id: int = 0,
+) -> list[tuple[dealm.Deal, sqlite3.Row]]:
+    """Score the variants that moved, returning the ones worth announcing.
+
+    Both halves in one call, for everything that has a single answer in mind:
+    `pi find`, `pi seed`, and the tests. A sweep with subscribers calls
+    `score_variants` once and `arrange_for` per reader instead.
+
+    `cap_per_store` and `fold_duplicates` are what `seed` turns off. Both exist
+    so one shop's promotion, or one shoe stocked everywhere, cannot fill a
+    notification run — but seeding is not a run. It has to account for every
+    qualifying deal, or the ones it trimmed come back as news on the next sweep.
+
+    `skip_alerted` is what `pi find` turns off: a search of what is on offer
+    right now should show a deal whether or not it was announced last week.
+
+    `rank` is the second scale — how much *this reader* should care, as opposed
+    to how good the discount is. It orders the result and can drop a find below
+    that reader's bar by returning None. It runs before folding and capping, so
+    the trimming happens on the list the reader would actually be sent. Without
+    it the order is the discount's own score, which is what seeding and `pi find`
+    want.
+    """
+    market, trust = _resolve_indexes(conn, market, trust)
+    scored = score_variants(conn, variant_ids, config, market, trust, watched)
+    return arrange_for(
+        conn, scored, config, market, user_id=user_id, rank=rank,
+        cap_per_store=cap_per_store, fold_duplicates=fold_duplicates,
+        skip_alerted=skip_alerted,
+    )
 
 
 def seed_alerts(conn: sqlite3.Connection, config: Config, dry_run: bool = False) -> int:
@@ -781,10 +848,16 @@ async def run(
         # Both share the market and trust indexes, which are what cost anything.
         market = reference.build_market_index(conn)
         trust = reference.store_trust(conn)
-        on_offer = find_deals(
+        # Scored once. Whether a price is a good price is a fact about the
+        # product, identical for every reader, and it is the expensive half —
+        # two million price points. What follows per reader is arrangement.
+        scored = score_variants(
             conn, scorable, shelf_config(config), market=market, trust=trust,
-            cap_per_store=False, fold_duplicates=False, skip_alerted=False,
             watched=watching,
+        )
+        on_offer = arrange_for(
+            conn, scored, shelf_config(config), market,
+            cap_per_store=False, fold_duplicates=False, skip_alerted=False,
         )
         written, withdrawn = dbm.record_offers(
             conn, scorable, [deal for deal, _ in on_offer], dbm.utcnow()
@@ -796,36 +869,57 @@ async def run(
         # rather than cutting it: a shoe in somebody else's size still arrives
         # when it is properly cheap, and a brand nobody named still arrives at
         # all — a hard list fails exactly on what is not in it.
-        reader = personal.reader_for(conn, config.chat_id, config.filters)
+        readers = personal.subscribers(conn, config.chat_id, config.filters)
         shipping = landed.load_rules()
         eur = rates.to_usd(1.0, "EUR")
         eur_usd = eur[0] if eur else None
-        candidates = find_deals(
-            conn, scorable, shelf_config(config), market=market, trust=trust,
-            watched=watching,
-            rank=personal.ranker(reader, config.filters.min_score, shipping, eur_usd),
-        )
         cap = limit if limit is not None else config.filters.max_alerts_per_run
-        selected = candidates[:cap]
-        overflow = len(candidates) - len(selected)
-        log.info("%d deals found, sending %d", len(candidates), len(selected))
-        if overflow:
-            # Deals past the cap are not recorded, and the next run only scores
-            # variants whose price moved — so without this they would be lost
-            # for good rather than merely delayed. Mark the run so the next one
-            # reconsiders everything.
-            log.warning(
-                "%d deal(s) over the cap of %d were not sent; the next run will "
-                "reconsider them (raise max_alerts_per_run to see them sooner)",
-                overflow, cap,
+        if len(readers) > 1:
+            log.info("%d readers", len(readers))
+
+        queues: list[tuple[personal.Subscriber, list[tuple[dealm.Deal, sqlite3.Row]]]] = []
+        capped_anyone = False
+        for reader in readers:
+            candidates = arrange_for(
+                conn, scored, shelf_config(config), market, user_id=reader.user_id,
+                rank=personal.ranker(
+                    reader.reader, config.filters.min_score, shipping, eur_usd
+                ),
             )
+            selected = candidates[:cap]
+            overflow = len(candidates) - len(selected)
+            log.info(
+                "%s: %d deals found, sending %d",
+                reader.label, len(candidates), len(selected),
+            )
+            if overflow:
+                # Deals past the cap are not recorded, and the next run only
+                # scores variants whose price moved — so without this they would
+                # be lost for good rather than merely delayed. Mark the run so
+                # the next one reconsiders everything.
+                log.warning(
+                    "%s: %d deal(s) over the cap of %d were not sent; the next run "
+                    "will reconsider them (raise max_alerts_per_run to see them "
+                    "sooner)",
+                    reader.label, overflow, cap,
+                )
+                capped_anyone = True
+            queues.append((reader, selected))
+        if capped_anyone:
             conn.execute("UPDATE runs SET capped = 1 WHERE id = ?", (run_id,))
 
         if dry_run:
-            for deal, row in selected:
-                print("-" * 60)
-                print(caption_for(deal, row, conn, shipping, eur_usd))
-                print(f"[score {deal.score} · image {'yes' if row['image_url'] else 'no'}]")
+            for reader, selected in queues:
+                if len(queues) > 1:
+                    print("=" * 60)
+                    print(f"=== {reader.label} ({len(selected)})")
+                for deal, row in selected:
+                    print("-" * 60)
+                    print(caption_for(deal, row, conn, shipping, eur_usd))
+                    print(
+                        f"[score {deal.score} · image "
+                        f"{'yes' if row['image_url'] else 'no'}]"
+                    )
             _finish_run(conn, run_id, stats)
             return stats
 
@@ -834,21 +928,10 @@ async def run(
             _finish_run(conn, run_id, stats)
             return stats
 
-        async with Telegram(config.bot_token, config.chat_id, client) as telegram:
-            for deal, row in selected:
-                # Claim the alert first: a crash mid-send must not cause a repeat.
-                if not dealm.record_alert(conn, deal, dbm.utcnow()):
-                    continue
-                if await telegram.send_deal(
-                    caption_for(deal, row, conn, shipping, eur_usd), row["image_url"]
-                ):
-                    stats.alerts_sent += 1
-                else:
-                    conn.execute(
-                        "DELETE FROM alerts WHERE product_id = ? AND price_bucket = ?",
-                        (deal.product_id, deal.bucket),
-                    )
-                await asyncio.sleep(1.0)  # Telegram allows ~30 messages/second; be calm
+        for reader, selected in queues:
+            stats.alerts_sent += await _send_to(
+                conn, config, client, reader, selected, shipping, eur_usd
+            )
 
     _record_block(conn, run_id, limiter)
     _finish_run(conn, run_id, stats)
@@ -856,6 +939,49 @@ async def run(
     # whether it was blocked, which is only known a few lines above this.
     await _warn_if_degraded(conn, config, dry_run=dry_run)
     return stats
+
+
+async def _send_to(
+    conn: sqlite3.Connection,
+    config: Config,
+    client: httpx.AsyncClient,
+    reader: personal.Subscriber,
+    selected: list[tuple[dealm.Deal, sqlite3.Row]],
+    shipping: landed.Rules,
+    eur_usd: float | None,
+) -> int:
+    """Write one reader's queue to their chat. Returns how many arrived."""
+    sent = 0
+    async with Telegram(config.bot_token, reader.chat_id, client) as telegram:
+        for deal, row in selected:
+            # Claim the alert first: a crash mid-send must not cause a repeat.
+            if not dealm.record_alert(
+                conn, deal, dbm.utcnow(), user_id=reader.user_id
+            ):
+                continue
+            if await telegram.send_deal(
+                caption_for(deal, row, conn, shipping, eur_usd), row["image_url"]
+            ):
+                sent += 1
+            else:
+                conn.execute(
+                    "DELETE FROM alerts "
+                    " WHERE user_id = ? AND product_id = ? AND price_bucket = ?",
+                    (reader.user_id, deal.product_id, deal.bucket),
+                )
+                if telegram.chat_is_gone:
+                    # Not a bad hour, a reader who left. Everything still queued
+                    # for them would fail the same way, and so would every run
+                    # after this one.
+                    log.warning(
+                        "%s is no longer reachable (%s) — not writing to them again "
+                        "until they talk to the bot",
+                        reader.label, telegram.last_error,
+                    )
+                    personal.deactivate(conn, reader.chat_id)
+                    break
+            await asyncio.sleep(1.0)  # Telegram allows ~30 messages/second; be calm
+    return sent
 
 
 async def _warn_if_degraded(conn: sqlite3.Connection, config: Config, dry_run: bool) -> None:

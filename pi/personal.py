@@ -166,11 +166,10 @@ def ranker(
 
 
 def reader_for(conn: sqlite3.Connection, chat_id: str | None, filters: Filters) -> Reader:
-    """Whose preferences the notifications follow.
+    """Whose preferences the notifications follow, for one chat.
 
-    One reader today: the chat the collector was configured to write to. The
-    lookup is by chat rather than by user because that is what `.env` knows, and
-    it is the same question a second reader would ask with their own chat.
+    The lookup is by chat rather than by user because that is what `.env` knows,
+    and it is the same question every other reader asks with their own chat.
     """
     if chat_id:
         row = conn.execute(
@@ -183,3 +182,79 @@ def reader_for(conn: sqlite3.Connection, chat_id: str | None, filters: Filters) 
         if row is not None and Reader.from_profile(row).has_opinions:
             return Reader.from_profile(row)
     return Reader.from_filters(filters)
+
+
+@dataclass(frozen=True, slots=True)
+class Subscriber:
+    """One person the run writes to, and what they want.
+
+    `user_id` is Telegram's, and it is what deduplication is keyed on. It is 0
+    only for the owner in a database where they have never spoken to the bot —
+    a fresh install writing to the chat id in `.env` and nothing else. That
+    collides deliberately with the "everybody" rows described on alerts.user_id:
+    before anyone has a profile there is exactly one reader, and treating what
+    was sent to them as sent to everybody is what it meant at the time.
+    """
+
+    user_id: int
+    chat_id: str
+    reader: Reader
+    label: str
+
+
+def subscribers(
+    conn: sqlite3.Connection, owner_chat_id: str | None, filters: Filters
+) -> list[Subscriber]:
+    """Everyone this run should write to, the owner first.
+
+    Anyone who has spoken to the bot and not blocked it is a reader, whether or
+    not they finished the wizard: somebody who pressed /start and skipped the
+    questions is saying they want everything, not that they want nothing.
+
+    The owner is always included even with no profile of their own, because the
+    chat id in `.env` is what a fresh install has instead of a subscriber list,
+    and a run that wrote to nobody would look exactly like a run that found
+    nothing.
+    """
+    out: list[Subscriber] = []
+    seen: set[str] = set()
+    owner = str(owner_chat_id) if owner_chat_id else None
+
+    rows = conn.execute(
+        "SELECT * FROM bot_users WHERE active = 1 ORDER BY created_at, id"
+    ).fetchall()
+    # The owner goes first so that a cap or a rate limit bites the newest
+    # subscriber rather than the person who runs the thing.
+    rows = sorted(rows, key=lambda r: str(r["chat_id"]) != owner)
+    for row in rows:
+        chat_id = str(row["chat_id"])
+        if chat_id in seen:
+            continue
+        seen.add(chat_id)
+        reader = Reader.from_profile(row)
+        if not reader.has_opinions and chat_id == owner:
+            # The owner's sizes may still only exist in filters.toml.
+            reader = Reader.from_filters(filters)
+        out.append(
+            Subscriber(
+                user_id=int(row["id"]),
+                chat_id=chat_id,
+                reader=reader,
+                label=row["username"] or chat_id,
+            )
+        )
+
+    if owner and owner not in seen:
+        out.insert(
+            0,
+            Subscriber(
+                user_id=0, chat_id=owner, reader=Reader.from_filters(filters),
+                label=owner,
+            ),
+        )
+    return out
+
+
+def deactivate(conn: sqlite3.Connection, chat_id: str) -> None:
+    """Stop writing to a chat Telegram has told us is closed to us."""
+    conn.execute("UPDATE bot_users SET active = 0 WHERE chat_id = ?", (str(chat_id),))

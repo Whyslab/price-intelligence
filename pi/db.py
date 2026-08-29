@@ -11,7 +11,7 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 SCHEMA_SQL = Path(__file__).with_name("schema.sql")
 
 
@@ -59,6 +59,8 @@ def migrate(conn: sqlite3.Connection) -> None:
         _migrate_4_to_5(conn)
     if current in (1, 2, 3, 4, 5):
         _migrate_5_to_6(conn)
+    if current < 10:
+        _migrate_9_to_10(conn)
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
 
@@ -201,6 +203,72 @@ def _declared_columns(sql: str) -> dict[str, dict[str, str]]:
                 columns[found.group(1)] = found.group(2).strip()
         tables[match.group(1)] = columns
     return tables
+
+
+def _migrate_9_to_10(conn: sqlite3.Connection) -> None:
+    """Give the alerts key a reader, so a second subscriber is not robbed.
+
+    The column itself arrives by ALTER in `_add_columns`. What cannot arrive
+    that way is the UNIQUE constraint: it used to be (product_id, price_bucket),
+    meaning one announcement of a product in the whole world, and SQLite has no
+    way to redefine a constraint in place. So the table is rebuilt.
+
+    Existing rows keep user_id 0, which is exactly right for them. They were
+    sent to the only reader there was, and `pi seed` wrote the rest to say a
+    discount was already running before the bot existed. Both mean nobody needs
+    to hear it now.
+    """
+    for row in conn.execute("PRAGMA index_list(alerts)"):
+        if not row["unique"]:
+            continue
+        columns = [c["name"] for c in conn.execute(f"PRAGMA index_info({row['name']})")]
+        if columns == ["product_id", "price_bucket"]:
+            break
+    else:
+        return  # already rebuilt, or a database created fresh from schema.sql
+
+    log.info("rebuilding alerts so notifications are deduplicated per reader")
+    # Foreign keys off for the rebuild, as SQLite's own instructions for
+    # redefining a table require. The copy re-validates every product_id against
+    # products, and one orphan — a row whose product was deleted by some earlier
+    # surgery — would abort the migration. That does not fail a query, it fails
+    # `connect`, which means the collector does not start at all. A rebuild that
+    # can be stopped by a row it is only moving is not one to run on somebody's
+    # live database.
+    conn.execute("PRAGMA foreign_keys = OFF")
+    try:
+        _rebuild_alerts(conn)
+    finally:
+        conn.execute("PRAGMA foreign_keys = ON")
+
+
+def _rebuild_alerts(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE alerts_new (
+            id           INTEGER PRIMARY KEY,
+            product_id   INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+            variant_id   INTEGER NOT NULL REFERENCES variants(id) ON DELETE CASCADE,
+            ts           TEXT    NOT NULL,
+            price_usd    REAL    NOT NULL,
+            price_bucket INTEGER NOT NULL,
+            discount_pct REAL    NOT NULL,
+            score        INTEGER NOT NULL,
+            sent         INTEGER NOT NULL DEFAULT 1,
+            user_id      INTEGER NOT NULL DEFAULT 0,
+            UNIQUE (user_id, product_id, price_bucket)
+        );
+        INSERT INTO alerts_new
+            (id, product_id, variant_id, ts, price_usd, price_bucket,
+             discount_pct, score, sent, user_id)
+        SELECT id, product_id, variant_id, ts, price_usd, price_bucket,
+               discount_pct, score, sent, 0
+          FROM alerts;
+        DROP TABLE alerts;
+        ALTER TABLE alerts_new RENAME TO alerts;
+        CREATE INDEX IF NOT EXISTS ix_alerts_ts ON alerts(ts DESC);
+        """
+    )
 
 
 def _add_columns(conn: sqlite3.Connection) -> None:
@@ -619,12 +687,18 @@ def get_bot_user(conn: sqlite3.Connection, user_id: int) -> sqlite3.Row | None:
 def upsert_bot_user(
     conn: sqlite3.Connection, user_id: int, chat_id: str, username: str | None = None, **fields
 ) -> sqlite3.Row:
-    """Create the row on first contact, then update only what was passed."""
+    """Create the row on first contact, then update only what was passed.
+
+    Talking to the bot marks the reader reachable again. A run gives up on a
+    chat Telegram calls closed, and the only evidence that it reopened is the
+    person turning up in it — which is exactly this.
+    """
     conn.execute(
         """
         INSERT INTO bot_users (id, chat_id, username, created_at) VALUES (?, ?, ?, ?)
         ON CONFLICT (id) DO UPDATE SET chat_id = excluded.chat_id,
-                                       username = excluded.username
+                                       username = excluded.username,
+                                       active = 1
         """,
         (user_id, chat_id, username, utcnow()),
     )
