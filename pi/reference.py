@@ -250,7 +250,13 @@ class MarketIndex:
 
         Excluding the shop itself is the point: a price confirmed by
         `bdgastore.com` and `shop.bdgastore.com` is one shop agreeing with itself.
+
+        `shop` is canonicalised here rather than trusted, because the failure of
+        passing a raw hostname is silent and in the wrong direction — the shop
+        stops matching its own key, so its own price is counted as somebody
+        else's opinion of it, and a lone shop looks corroborated.
         """
+        shop = same_shop(shop)
         prices: dict[str, float] = {}
         tags: dict[str, float] = {}
         for key in self._keys_by_product.get(product_id, ()):

@@ -74,6 +74,12 @@ _NON_PRODUCT_HINTS = (
     "/brand", "/manufacturer", "/customer", "/account", "/cart", "/checkout",
     "/search", "/sitemap", "/policies", "/pictures", "/picutres", "/about",
     "/contact", "/terms", "/privacy", "/faq", "/login", "/register", "/wishlist",
+    # A help article is never a product, and www.nike.com's are called
+    # /help/a/product-discount, /help/a/product-availability, /help/a/
+    # product-vouchers — which the "/product" hint below happily accepts. Its
+    # whole sitemap is 44 such pages, so the crawl read customer-service prose
+    # and reported that the shop publishes no prices.
+    "/help", "/support", "/customer-service",
 )
 
 AVAILABLE = {"instock", "in_stock", "limitedavailability", "onlineonly", "presale", "backorder"}

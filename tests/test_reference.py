@@ -139,6 +139,31 @@ class TestDomains:
     def test_different_shops_stay_different(self):
         assert same_shop("kith.com") != same_shop("feature.com")
 
+    def test_a_chain_in_four_countries_is_one_opinion_not_four(self):
+        """Foot Locker's own pricing must not corroborate Foot Locker."""
+        theirs = {same_shop(d) for d in (
+            "www.footlocker.com", "www.footlocker.de",
+            "www.footlocker.fr", "www.footlocker.it",
+        )}
+        assert len(theirs) == 1
+
+    def test_a_chain_trading_under_another_name_abroad_is_still_one_shop(self):
+        assert same_shop("www.snipesusa.com") == same_shop("www.snipes.com")
+
+    def test_a_two_label_country_suffix_is_not_mistaken_for_the_name(self):
+        """size.co.uk is "size", not "size.co" — otherwise nothing would merge."""
+        assert same_shop("www.size.co.uk") == "size"
+        assert same_shop("m.size.co.uk") == same_shop("www.size.co.uk")
+        assert same_shop("www.jdsports.co.uk") == same_shop("www.jdsports.com")
+
+    def test_unrelated_shops_are_still_told_apart(self):
+        """Dropping the country must not start merging everyone."""
+        distinct = [
+            "kith.com", "feature.com", "www.ssense.com", "sneakerpolitics.com",
+            "extrabutterny.com", "www.slamjam.com", "shop.ccs.com",
+        ]
+        assert len({same_shop(d) for d in distinct}) == len(distinct)
+
 
 class TestMarketIndex:
     """What everybody else is charging, read out of the database."""

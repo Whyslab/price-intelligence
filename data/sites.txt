@@ -55,6 +55,7 @@ phenomglobal.com
 premiumgoods.com
 pricespy.co.uk
 psandqs.com
+representclo.com
 requestboutique.com
 reupsneakers.com
 riotskateshop.fr
@@ -66,17 +67,19 @@ shoelosophy.it
 shop.bdgastore.com
 shop.ccs.com
 shop.doverstreetmarket.com
+shop.simon.com
+shop.sneakersummit.com
+shopnewrepublic.com
 shopnicekicks.com
 shopoverload.com
-shop.sneakersummit.com
 smoothitalia.com
+sneaker-surgery.com
 sneakerbarnewyork.com
 sneakerjunkiesusa.com
 sneakerpolitics.com
-sneakers123.com
 sneakers-id.fr
+sneakers123.com
 sneakerstudio.pl
-sneaker-surgery.com
 snkrsroom.com
 solestreetau.com
 sotostore.com
@@ -106,11 +109,11 @@ wishatl.com
 wunder.com.tr
 www.152store.com
 www.43einhalb.com
+www.a-ma-maniere.com
 www.academyandco.com
 www.addictmiami.com
 www.afew-store.com
 www.ageha.it
-www.a-ma-maniere.com
 www.antonioli.eu
 www.apbstore.com
 www.atmosusa.com
@@ -131,6 +134,7 @@ www.brunarosso.com
 www.brutalzapas.com
 www.bstn.com
 www.californiaskateshop.pl
+www.calvinklein.us
 www.champssports.com
 www.citadium.com
 www.civilistberlin.com
@@ -160,6 +164,9 @@ www.fleetfeet.com
 www.flightclub.com
 www.focuspocus.co.uk
 www.footlocker.com
+www.footlocker.de
+www.footlocker.fr
+www.footlocker.it
 www.footpatrol.com
 www.gate194.berlin
 www.gloryholeshop.com
@@ -171,8 +178,8 @@ www.harlem-stores.de
 www.highsnobiety.com
 www.holypopstore.com
 www.idealo.co.uk
-www.jdsports.com
 www.jdsports.co.uk
+www.jdsports.com
 www.kennel-schmenger.com
 www.kickz.com
 www.kickzr4us.com
@@ -183,8 +190,10 @@ www.laferramenta.org
 www.lapstoneandhammer.com
 www.ldrs1354.com
 www.legitsneakerhouse.com
+www.levi.com
 www.likelihood.us
 www.luisaviaroma.com
+www.macys.com
 www.majordc.com
 www.manorphx.com
 www.mrsneaker.com
@@ -192,6 +201,7 @@ www.mumbaiskate.com
 www.nationalstandard.fr
 www.nativeskatestore.co.uk
 www.natterjacks.com
+www.nike.com
 www.noteshop.co.uk
 www.novoidplus.com
 www.numbersneakers.com
@@ -218,13 +228,14 @@ www.shinzo.paris
 www.shoebedo.de
 www.shoepalace.com
 www.shoezgallery.com
+www.shopbop.com
 www.shopwss.com
 www.showroom.pl
 www.sivasdescalzo.com
 www.size.co.uk
 www.sizeofficial.de
-www.skatedeluxe.com
 www.skate-polska.pl
+www.skatedeluxe.com
 www.slamcity.com
 www.slamjam.com
 www.sneakerbaas.com
@@ -238,6 +249,7 @@ www.sneakervista.com
 www.sneaksup.com
 www.snipes.com
 www.snipes.pl
+www.snipesusa.com
 www.snowbitch.pl
 www.socialstatuspgh.com
 www.sold-out.io
@@ -256,8 +268,8 @@ www.standout.co.uk
 www.starcowparis.com
 www.stash1250.com
 www.stickabush.com
-www.superga.com
 www.superga.co.uk
+www.superga.com
 www.suppastore.com
 www.tactics.com
 www.tessabit.com
@@ -267,6 +279,7 @@ www.thedousedshop.com
 www.theroombarcelona.com
 www.thesneakcity.com
 www.thesneakerone.com
+www.toddsnyder.com
 www.triplebasket.it
 www.unknwn.com
 www.urbanindustry.co.uk
@@ -274,6 +287,7 @@ www.urbanjunglestore.com
 www.urbanoutfitters.com
 www.urbanstaroma.com
 www.vaditim.com
+www.vans.com
 www.vinicioboutique.com
 www.vooberlin.com
 www.vrients.com
@@ -285,7 +299,6 @@ www.workingclassheroes.co.uk
 www.xhibition.co
 xclusivearrivals.com
 zalando.pl
-
 # --- unreachable when the list was built (2026-08-24) ---
 # 0519-store.com
 # five0-shop.com
@@ -347,3 +360,20 @@ www.ln-cc.com
 # www.sneakscloud.com
 # www.snowbeach.com
 # www.upriseskateboards.com
+
+# --- добавлено 29.08.2026, читаются, но обходчик не находит их товаров ---
+# www.macys.com, www.nike.com, www.shopbop.com, www.calvinklein.us остаются в
+# базе: проба нашла у них разметку с ценой, а карта сайта ведёт не туда —
+# у Nike это 44 справочные статьи, у Macy's витрины разделов, у двух других
+# карта пуста. Вернуться к ним, когда будет починен поиск страниц товаров.
+#
+# www.vans.com собирается с австрийской витрины /de-at/ — цены в евро и
+# названия по-немецки. Данные честные (валюта берётся со страницы), но это не
+# американский магазин, который был в списке.
+#
+# --- добавлено 29.08.2026, проба показала, что читать нечего ---
+# www.amazon.com, www.nordstromrack.com — страниц товаров не найти ни в карте сайта, ни обходом
+# www.jomashop.com — цена рисуется джаваскриптом, в HTML её нет
+# www.asos.com, www.mrporter.com, www.revolve.com — не отвечают вовсе, таймаут
+# www.joesnewbalanceoutlet.com, www.zalando.de — HTTP 403
+# oneblockdown.com — тот же каталог, что уже собирается с it.oneblockdown.it
