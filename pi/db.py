@@ -360,6 +360,13 @@ def record_offers(
 
     It also survives a rewrite: overwriting it each time the shop confirms the
     same price would reset it on every run.
+
+    `checked_at` is the shop's `last_ok`, not the clock. Scoring happens over the
+    whole catalogue while a run reads a slice of it, so stamping "now" said every
+    offer had just been confirmed when most had not been looked at for days —
+    and a dead listing from a shop last read on Tuesday sat at the top of the
+    shelf looking like this morning's find. allikestore.com's -93% Wotherspoon
+    was one: last read 28.08, and the URL now answers 404.
     """
     now = datetime.fromisoformat(ts)
 
@@ -393,7 +400,13 @@ def record_offers(
                 (SELECT MIN(ts) FROM price_points WHERE variant_id = ?),
                 ?
             ),
-            ?, ?, ?, ?, ?, ?, ?, ?
+            COALESCE(
+                (SELECT s.last_ok FROM stores s
+                   JOIN products p ON p.store_id = s.id
+                  WHERE p.id = ?),
+                ?
+            ),
+            ?, ?, ?, ?, ?, ?, ?
         )
         ON CONFLICT (variant_id) DO UPDATE SET
             checked_at       = excluded.checked_at,
@@ -412,8 +425,9 @@ def record_offers(
         [
             (
                 deal.variant_id, deal.product_id,
-                dropped_at(deal), deal.variant_id, ts,   # the COALESCE above
-                ts, deal.price_usd,
+                dropped_at(deal), deal.variant_id, ts,   # found_at's COALESCE
+                deal.product_id, ts,                     # checked_at's COALESCE
+                deal.price_usd,
                 deal.reference_usd, deal.reference_source, deal.discount_pct,
                 deal.saving_usd, deal.score, int(deal.all_time_low),
             )

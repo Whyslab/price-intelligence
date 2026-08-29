@@ -224,14 +224,20 @@ def _variants_of(node: dict) -> tuple[list[ScrapedVariant], str] | None:
         currency = currency or item_currency
         sku = _text(item.get("sku"))
         size = _text(item.get("size"))
+        # Not every group varies by size. `variesBy` is colour at footlocker,
+        # champssports and cruisefashion, and those variants carry `color` where
+        # a sized one carries `size` — worth keeping either way, because the
+        # colourway is part of what the thing is.
+        colour = _text(item.get("color"))
         found.append(
             ScrapedVariant(
-                external_id=sku or size or f"variant{len(found)}",
+                external_id=sku or size or colour or f"variant{len(found)}",
                 price=price,
                 compare_at=None,  # schema.org has no struck-through price
                 in_stock=in_stock,
                 sku=sku,
                 size=size,
+                color=colour,
             )
         )
     if not found or not currency:
@@ -265,6 +271,11 @@ def parse_product(page: str, url: str) -> tuple[ScrapedProduct, str] | None:
                     compare_at=None,
                     in_stock=in_stock,
                     sku=sku,
+                    # A single-offer page can still say what size it is —
+                    # highsnobiety.com puts it on the Product node — and a size
+                    # we were given is not one to throw away.
+                    size=_text(node.get("size")),
+                    color=_text(node.get("color")),
                 )
             ]
 
