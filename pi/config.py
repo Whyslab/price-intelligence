@@ -87,6 +87,11 @@ class Config:
     # Article numbers to be told about whatever the thresholds say. A missing
     # file simply means nothing is being watched, which is the usual case.
     watchlist_file: Path = ROOT / "data" / "watchlist.txt"
+    # Where `pi web` can be reached from a phone, if anywhere. Unset by default
+    # and the bot then simply has no button for it: the server binds to
+    # localhost, and offering a link to a machine the reader is not sitting at
+    # is worse than offering nothing.
+    web_url: str | None = None
     filters: Filters = field(default_factory=Filters)
 
     @property
@@ -127,6 +132,7 @@ def load_config(env_file: Path | None = None) -> Config:
         watchlist_file=_resolve(os.getenv("PI_WATCHLIST_FILE", "data/watchlist.txt")),
         bot_token=os.getenv("TELEGRAM_BOT_TOKEN") or None,
         chat_id=os.getenv("TELEGRAM_CHAT_ID") or None,
+        web_url=(os.getenv("PI_WEB_URL") or "").strip().rstrip("/") or None,
         concurrency=int(os.getenv("PI_CONCURRENCY", "8")),
         shopify_rate=float(os.getenv("PI_SHOPIFY_RATE", "2.0")),
         shopify_host_rate=float(os.getenv("PI_SHOPIFY_HOST_RATE", "0.5")),

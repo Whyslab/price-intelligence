@@ -216,16 +216,35 @@ def card_keyboard(row: sqlite3.Row, page: int) -> dict:
     }
 
 
-def menu_keyboard(user: sqlite3.Row) -> dict:
-    return {
-        "inline_keyboard": [
-            [{"text": "💰 Смотреть скидки", "callback_data": "p:0"}],
-            [{"text": "👤 Пол", "callback_data": "ask:genders"},
-             {"text": "👟 Тип", "callback_data": "ask:kinds"}],
-            [{"text": "📏 Размеры", "callback_data": "ask:sizes"},
-             {"text": "🏷 Марки", "callback_data": "ask:brands"}],
-        ]
-    }
+def shelf_button(web_url: str | None) -> list[dict] | None:
+    """The button that opens the whole shelf, or nothing if there is nowhere to open.
+
+    Telegram will only run a page inside itself over HTTPS, so an http:// address
+    — which is what `pi web` serves until somebody puts it behind a tunnel —
+    becomes an ordinary link instead. That still works when the reader is at the
+    machine, and it is honest about being a link away rather than pretending to
+    be part of the bot.
+    """
+    if not web_url:
+        return None
+    label = "🗂 Все скидки"
+    if web_url.startswith("https://"):
+        return [{"text": label, "web_app": {"url": web_url}}]
+    return [{"text": label, "url": web_url}]
+
+
+def menu_keyboard(user: sqlite3.Row, web_url: str | None = None) -> dict:
+    rows = [[{"text": "💰 Смотреть скидки", "callback_data": "p:0"}]]
+    shelf = shelf_button(web_url)
+    if shelf:
+        rows.append(shelf)
+    rows += [
+        [{"text": "👤 Пол", "callback_data": "ask:genders"},
+         {"text": "👟 Тип", "callback_data": "ask:kinds"}],
+        [{"text": "📏 Размеры", "callback_data": "ask:sizes"},
+         {"text": "🏷 Марки", "callback_data": "ask:brands"}],
+    ]
+    return {"inline_keyboard": rows}
 
 
 def gender_keyboard() -> dict:
@@ -426,7 +445,7 @@ class Bot:
         await self.send(
             chat_id,
             "⚙️ <b>Что показывать</b>\n\n" + describe_profile(user),
-            menu_keyboard(user),
+            menu_keyboard(user, self.config.web_url),
         )
 
     # -- the wizard --
@@ -486,10 +505,11 @@ class Bot:
                 "показываю то, что действительно подешевело.\n\n"
                 "Можно настроить подборку под себя — четыре вопроса, — "
                 "или сразу посмотреть всё.",
-                {"inline_keyboard": [[
-                    {"text": "Настроить", "callback_data": "wizard"},
-                    {"text": "Показать всё", "callback_data": "p:0"},
-                ]]},
+                {"inline_keyboard": [
+                    [{"text": "Настроить", "callback_data": "wizard"},
+                     {"text": "Показать всё", "callback_data": "p:0"}],
+                    *([shelf] if (shelf := shelf_button(self.config.web_url)) else []),
+                ]},
             )
             return
         if text.startswith(("/settings", "/menu")):

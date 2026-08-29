@@ -1,0 +1,231 @@
+"""A browsable shelf, because notifications are not a catalogue.
+
+Telegram is right for news and wrong for browsing. It has no filters, no way
+back to yesterday, and it only ever shows what was new enough to be worth
+interrupting somebody about — which on this database is 665 of the 20,934
+discounts standing right now. The rest were suppressed by `pi seed` as "already
+running when the bot arrived", which is true and is also the reason nobody has
+ever seen them.
+
+So the same shelf is served as a page: everything on offer, filtered by the
+things a person actually decides on — their size, what kind of thing it is, who
+it is for — and ordered by how good the discount is rather than by when we
+happened to notice it.
+
+Deliberately small. The stdlib's HTTP server is enough for a shelf that is read
+far more often than it changes, and adding a framework for one page and two
+JSON endpoints would be a dependency to maintain for no answer this cannot give.
+
+Bound to localhost by default. There is no login: anything reachable from
+outside this machine has to get its authentication first, and pretending
+otherwise by binding to 0.0.0.0 with a comment about it would be worse than
+requiring the flag.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import sqlite3
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+from . import db as dbm
+
+log = logging.getLogger(__name__)
+
+PAGE = Path(__file__).with_name("shelf.html")
+PAGE_SIZE = 60
+MAX_PAGE_SIZE = 200
+
+# Which orderings the page may ask for, and what each means in SQL. A map
+# rather than a string from the query: the value lands in an ORDER BY.
+SORTS = {
+    "score": "o.score DESC, o.discount_pct DESC",
+    "discount": "o.discount_pct DESC, o.score DESC",
+    "saving": "o.saving_usd DESC",
+    "cheapest": "o.price_usd ASC",
+    "newest": "o.found_at DESC",
+    "freshest": "o.checked_at DESC",
+}
+DEFAULT_SORT = "score"
+
+
+def _list(query: dict, name: str) -> list[str]:
+    """One repeated or comma-separated parameter, as a clean list."""
+    out: list[str] = []
+    for raw in query.get(name, []):
+        out += [part.strip() for part in raw.split(",") if part.strip()]
+    return out
+
+
+def _int(query: dict, name: str, default: int, low: int, high: int) -> int:
+    try:
+        value = int(query.get(name, [default])[0])
+    except (TypeError, ValueError):
+        return default
+    return max(low, min(high, value))
+
+
+def read_query(raw: str) -> dict:
+    """Turn a query string into the arguments the shelf query takes.
+
+    Split out from the request handling so it can be tested without a socket,
+    and because everything that can go wrong with a URL goes wrong here.
+    """
+    query = parse_qs(raw)
+    sort = (query.get("sort", [DEFAULT_SORT])[0] or DEFAULT_SORT).lower()
+    return {
+        "genders": _list(query, "gender"),
+        "kinds": _list(query, "kind"),
+        "sizes": [s.upper() for s in _list(query, "size")],
+        "brands": _list(query, "brand"),
+        "search": (query.get("q", [""])[0] or "").strip(),
+        "sort": sort if sort in SORTS else DEFAULT_SORT,
+        "limit": _int(query, "limit", PAGE_SIZE, 1, MAX_PAGE_SIZE),
+        "page": _int(query, "page", 0, 0, 10_000),
+    }
+
+
+def offer_json(row: sqlite3.Row) -> dict:
+    """One card's worth of an offer.
+
+    `checked_at` is on every card on purpose. It is the difference between a
+    shelf and a graveyard, and it is the one thing a page like this normally
+    hides: a listing that four days ago was 60% off may simply be gone.
+    """
+    return {
+        "title": row["title"],
+        "url": row["url"],
+        "image": row["image_url"],
+        "brand": row["brand_family"] or row["brand"],
+        "shop": row["store_name"] or row["domain"],
+        "domain": row["domain"],
+        "country": row["country"],
+        "price": round(row["price_usd"], 2),
+        "was": round(row["reference_usd"], 2),
+        "source": row["reference_source"],
+        "discount": round(row["discount_pct"]),
+        "saving": round(row["saving_usd"], 2),
+        "score": row["score"],
+        "size": row["size_norm"] or row["size"],
+        "kind": row["kind"],
+        "gender": row["gender"],
+        "all_time_low": bool(row["all_time_low"]),
+        "found_at": row["found_at"],
+        "checked_at": row["checked_at"],
+    }
+
+
+def shelf_page(conn: sqlite3.Connection, args: dict) -> dict:
+    """One page of the shelf, with enough around it to render the controls."""
+    rows, total = dbm.offers_for(
+        conn,
+        genders=args["genders"] or None,
+        kinds=args["kinds"] or None,
+        sizes=args["sizes"] or None,
+        brands=args["brands"] or None,
+        limit=args["limit"],
+        offset=args["page"] * args["limit"],
+        order_by=SORTS[args["sort"]],
+        search=args["search"] or None,
+    )
+    return {
+        "total": total,
+        "page": args["page"],
+        "pages": max(1, -(-total // args["limit"])),
+        "offers": [offer_json(row) for row in rows],
+    }
+
+
+def render_page(conn: sqlite3.Connection, args: dict) -> bytes:
+    """The page with its first screenful already in it.
+
+    Sending an empty shell and letting it ask twice puts two round trips between
+    opening the link and seeing anything, which on a phone is the whole
+    impression the page makes. The markup is unchanged; only the seed differs,
+    and a page served without one behaves identically.
+    """
+    seed = json.dumps(
+        {"seed": {"facets": dbm.shelf_facets(conn), "offers": shelf_page(conn, args)}},
+        ensure_ascii=False,
+    )
+    # A JSON string may contain "</script>"; inside a script element that ends
+    # it. Escaping the slash is invisible to JSON.parse and not to the parser.
+    seed = seed.replace("</", "<\\/")
+    return (
+        PAGE.read_text(encoding="utf-8")
+        .replace('{"seed": null}', seed, 1)
+        .encode("utf-8")
+    )
+
+
+class Handler(BaseHTTPRequestHandler):
+    """One request. A connection per request, because the server is threaded."""
+
+    db_path: Path = Path("data/pi.db")
+    server_version = "price-intelligence"
+
+    def log_message(self, fmt: str, *args) -> None:
+        log.debug("%s - %s", self.address_string(), fmt % args)
+
+    def _send(self, code: int, body: bytes, content_type: str) -> None:
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        # The page is the only thing allowed to script this origin, and it
+        # carries no third-party anything.
+        self.send_header("Content-Security-Policy", "default-src 'self' 'unsafe-inline' data: https:")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def _json(self, payload: dict, code: int = 200) -> None:
+        self._send(
+            code,
+            json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            "application/json; charset=utf-8",
+        )
+
+    def _open(self) -> sqlite3.Connection:
+        # Read-only: this process must never be the reason a sweep cannot write.
+        conn = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True, timeout=10)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def do_GET(self) -> None:
+        parsed = urlparse(self.path)
+        try:
+            if parsed.path in ("/", "/index.html"):
+                with self._open() as conn:
+                    body = render_page(conn, read_query(parsed.query))
+                self._send(200, body, "text/html; charset=utf-8")
+                return
+            if parsed.path == "/api/facets":
+                with self._open() as conn:
+                    self._json(dbm.shelf_facets(conn))
+                return
+            if parsed.path == "/api/offers":
+                with self._open() as conn:
+                    self._json(shelf_page(conn, read_query(parsed.query)))
+                return
+            self._json({"error": "not found"}, 404)
+        except Exception as exc:  # a browsable page must not take the process down
+            log.exception("%s failed", self.path)
+            self._json({"error": f"{type(exc).__name__}: {exc}"}, 500)
+
+    do_HEAD = do_GET
+
+
+def serve(db_path: Path, host: str = "127.0.0.1", port: int = 8000) -> None:
+    """Run until interrupted."""
+    handler = type("BoundHandler", (Handler,), {"db_path": Path(db_path)})
+    server = ThreadingHTTPServer((host, port), handler)
+    log.info("shelf on http://%s:%d — Ctrl-C to stop", host, port)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()

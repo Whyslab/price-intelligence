@@ -165,6 +165,62 @@ class TestDomains:
         assert len({same_shop(d) for d in distinct}) == len(distinct)
 
 
+class TestWitnessesThatDisagree:
+    """Article matching is a claim, and a wrong claim is invisible until it prices something."""
+
+    def test_two_shops_far_apart_are_not_corroborating_each_other(self):
+        """sneakers123.com asked $3,824 for a Vans another shop sold at $60.99.
+
+        The median of two is their average, so the shelf showed a real $46 shoe
+        as 98% off $1,942 — at the very top, sorted there by the size of the lie.
+        """
+        assert reference.agreeing_prices([60.99, 3824.0]) == []
+
+    def test_two_shops_merely_one_on_sale_still_count(self):
+        """The same shoe really is $90 in a sale and $220 at full price."""
+        assert reference.agreeing_prices([90.0, 220.0]) == [90.0, 220.0]
+
+    def test_a_third_shop_makes_the_middle_knowable_and_the_outlier_droppable(self):
+        assert reference.agreeing_prices([60.0, 70.0, 3824.0]) == [60.0, 70.0]
+
+    def test_a_lone_shop_is_left_alone(self):
+        assert reference.agreeing_prices([100.0]) == [100.0]
+
+    def test_a_free_listing_cannot_become_the_market(self):
+        """A zero divides, and a shop that lists something at nothing is wrong."""
+        assert reference.agreeing_prices([0.0, 120.0]) == []
+
+    @staticmethod
+    def _stock(conn, domain, sku, price):
+        store = dbm.upsert_store(conn, domain, platform="shopify", currency="USD")
+        product = dbm.upsert_product(conn, store, sku, f"Shoe {sku}", f"https://{domain}/p")
+        dbm.set_product_keys(conn, product, reference.keys_for("Nike", f"Shoe {sku}", [sku]))
+        variant = dbm.upsert_variant(conn, product, "v1", sku=sku)
+        dbm.record_price(
+            conn, variant, price, None, True, "USD", price, 1.0, ts=dbm.utcnow()
+        )
+        return product
+
+    def test_the_market_disappears_rather_than_being_invented(self, conn):
+        """End to end: the shelf must have no reference at all here."""
+        mine = self._stock(conn, "mine.example", "CW2288-111", 46.0)
+        self._stock(conn, "junk.example", "CW2288-111", 3824.0)
+        self._stock(conn, "sane.example", "CW2288-111", 61.0)
+
+        market = reference.build_market_index(conn).look_up(mine, "mine.example")
+        assert market.shops == 0
+        assert market.median_usd is None
+
+    def test_a_shop_agreeing_with_another_still_prices_the_thing(self, conn):
+        mine = self._stock(conn, "mine.example", "CW2288-111", 46.0)
+        self._stock(conn, "one.example", "CW2288-111", 120.0)
+        self._stock(conn, "two.example", "CW2288-111", 100.0)
+
+        market = reference.build_market_index(conn).look_up(mine, "mine.example")
+        assert market.shops == 2
+        assert market.median_usd == 110.0
+
+
 class TestMarketIndex:
     """What everybody else is charging, read out of the database."""
 

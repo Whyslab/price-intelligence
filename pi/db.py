@@ -718,6 +718,8 @@ def offers_for(
     brands: list[str] | None = None,
     limit: int = 10,
     offset: int = 0,
+    order_by: str = "o.score DESC, o.discount_pct DESC",
+    search: str | None = None,
 ) -> tuple[list[sqlite3.Row], int]:
     """What is on offer for one person, best first. Returns (page, total).
 
@@ -729,6 +731,10 @@ def offers_for(
     Gender allows NULL through whenever men are wanted. 87% of the catalogue
     never states a gender, so excluding the unknown would hide almost everything;
     asking for women is the narrow, clean filter, and that one does exclude it.
+
+    `order_by` is interpolated, so it must never be built from anything a
+    caller was handed: pi.web picks it out of a fixed map by key, which is the
+    only way it is meant to be chosen.
     """
     where = ["1 = 1"]
     params: list = []
@@ -748,6 +754,11 @@ def offers_for(
             "(" + " OR ".join(["lower(p.brand_family) = ?"] * len(brands)) + ")"
         )
         params += [b.lower() for b in brands]
+    if search:
+        # Title and brand together, because people search for both in the same
+        # box — "carhartt" and "cargo pant" are the same gesture.
+        where.append("(p.title LIKE ? OR p.brand_family LIKE ? OR p.brand LIKE ?)")
+        params += [f"%{search}%"] * 3
     clause = " AND ".join(where)
 
     total = conn.execute(
@@ -770,7 +781,7 @@ def offers_for(
           JOIN products p ON p.id = o.product_id
           JOIN stores s   ON s.id = p.store_id
          WHERE {clause}
-         ORDER BY o.score DESC, o.discount_pct DESC
+         ORDER BY {order_by}
          LIMIT ? OFFSET ?
         """,
         [*params, limit, offset],
@@ -821,3 +832,53 @@ def _size_order(label: str) -> tuple:
     if match:
         return (1, 0.0, match.group(1), float(match.group(2)))
     return (2, 0.0, label)
+
+
+def shelf_facets(conn: sqlite3.Connection) -> dict:
+    """What the shelf actually contains, for building filters out of.
+
+    Offered rather than hardcoded because a filter listing a size nothing is on
+    sale in is worse than no filter: it invites a click that returns an empty
+    page and says nothing about why. Counts come along for the same reason —
+    "EU44 (312)" is a decision, "EU44" is a guess.
+    """
+    def tally(sql: str) -> list[dict]:
+        return [
+            {"value": row[0], "count": row[1]}
+            for row in conn.execute(sql).fetchall()
+            if row[0]
+        ]
+
+    return {
+        "kinds": tally(
+            """
+            SELECT p.kind, COUNT(*) FROM offers o
+              JOIN products p ON p.id = o.product_id
+             GROUP BY p.kind ORDER BY 2 DESC
+            """
+        ),
+        "genders": tally(
+            """
+            SELECT p.gender, COUNT(*) FROM offers o
+              JOIN products p ON p.id = o.product_id
+             GROUP BY p.gender ORDER BY 2 DESC
+            """
+        ),
+        # Ordered by how much is on offer, not alphabetically: the sizes a
+        # person scans for are the ones with anything behind them.
+        "sizes": tally(
+            """
+            SELECT v.size_norm, COUNT(*) FROM offers o
+              JOIN variants v ON v.id = o.variant_id
+             GROUP BY v.size_norm ORDER BY 2 DESC LIMIT 60
+            """
+        ),
+        "brands": tally(
+            """
+            SELECT p.brand_family, COUNT(*) FROM offers o
+              JOIN products p ON p.id = o.product_id
+             GROUP BY p.brand_family ORDER BY 2 DESC LIMIT 80
+            """
+        ),
+        "total": conn.execute("SELECT COUNT(*) FROM offers").fetchone()[0],
+    }
