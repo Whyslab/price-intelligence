@@ -51,6 +51,31 @@ main{display:grid;gap:10px;padding:12px;
 .then{color:var(--dim);text-decoration:line-through;font-size:12px}
 .meta{display:flex;justify-content:space-between;gap:6px;font-size:11px;color:var(--dim)}
 .stale{color:var(--hot)}
+dialog{border:none;border-radius:14px;padding:0;max-width:560px;width:calc(100% - 24px);
+       background:var(--card);color:var(--ink)}
+dialog::backdrop{background:rgba(0,0,0,.55)}
+.sheet{padding:16px 18px 18px}
+.sheet h2{margin:0 0 2px;font-size:17px;line-height:1.25}
+.sheet .brand{margin-bottom:10px}
+.hero{display:flex;gap:12px;margin-bottom:12px}
+.hero img{width:104px;height:104px;object-fit:cover;border-radius:9px;background:var(--chip);flex:0 0 auto}
+.big{font-size:22px;font-weight:700}
+.verdict{margin:10px 0 12px;padding:9px 11px;border-radius:9px;font-size:13px;line-height:1.4}
+.verdict.best{background:color-mix(in srgb,var(--accent) 14%,transparent)}
+.verdict.beaten{background:color-mix(in srgb,var(--hot) 14%,transparent)}
+.verdict.alone{background:var(--chip);color:var(--dim)}
+table{width:100%;border-collapse:collapse;font-size:13px}
+td{padding:6px 2px;border-top:1px solid var(--line);vertical-align:baseline}
+td.p{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+tr.us{font-weight:700}
+tr.cheap td.p{color:var(--accent)}
+.sizes{display:flex;flex-wrap:wrap;gap:5px;margin:10px 0 4px}
+.sz{border:1px solid var(--line);border-radius:6px;padding:3px 8px;font-size:12px}
+.sz.out{opacity:.35;text-decoration:line-through}
+.go{display:block;text-align:center;margin-top:14px;padding:11px;border-radius:10px;
+    background:var(--ink);color:var(--bg);text-decoration:none;font-weight:600}
+.close{position:absolute;top:8px;right:10px;border:none;background:none;
+       color:var(--dim);font-size:26px;line-height:1;cursor:pointer}
 #more{display:block;margin:16px auto 40px;padding:11px 26px;font:inherit;
       background:var(--card);color:inherit;border:1px solid var(--line);border-radius:10px}
 .empty{padding:48px 16px;text-align:center;color:var(--dim);grid-column:1/-1}
@@ -82,6 +107,8 @@ main{display:grid;gap:10px;padding:12px;
 <script type="application/json" id="seed">{"seed": null}</script>
 <main id="grid"></main>
 <button id="more" hidden>Показать ещё</button>
+<dialog id="sheet"><button class="close" id="x" aria-label="Закрыть">×</button>
+  <div class="sheet" id="sheet-body"></div></dialog>
 
 <script>
 // The Telegram bridge may not have arrived yet, and may never arrive: this
@@ -140,6 +167,9 @@ function params(){
 function card(o){
   const a = document.createElement("a");
   a.className = "card"; a.href = o.url; a.target = "_blank"; a.rel = "noopener";
+  // The link is real, so middle-click and "open in new tab" still work; the
+  // click is intercepted only to show what everyone else charges first.
+  a.onclick = e => { e.preventDefault(); open_sheet(o.id); };
   const f = freshness(o.checked_at);
   a.innerHTML = `
     <div class="thumb">
@@ -173,6 +203,67 @@ async function load(append){
   render(await (await fetch("/api/offers?" + params())).json(), append);
 }
 
+function shop_row(o, mine, cheapest){
+  const cls = o === mine ? "us" : (cheapest && o.price === cheapest.price ? "cheap" : "");
+  const where = o.shop + (o.country ? " · " + o.country : "");
+  return `<tr class="${cls}"><td>${o === mine ? "здесь — " : ""}${where}</td>
+          <td class="p">${money(o.price)}</td></tr>`;
+}
+
+async function open_sheet(id){
+  const d = el("sheet");
+  el("sheet-body").innerHTML = "<p style='color:var(--dim)'>Смотрю, у кого ещё это есть…</p>";
+  d.showModal();
+  const r = await fetch("/api/product/" + id);
+  if (!r.ok) { el("sheet-body").innerHTML = "<p>Это предложение уже сняли с полки.</p>"; return; }
+  const {ours, sizes, elsewhere, cheapest_elsewhere: cheap} = await r.json();
+
+  let verdict;
+  if (!elsewhere.length)
+    verdict = `<div class="verdict alone">Этот артикул больше нигде не найден —
+               сравнить не с чем. Скидка посчитана от ${ours.source === "tag"
+               ? "перечёркнутой цены магазина" : "прежней цены"}.</div>`;
+  else if (cheap)
+    verdict = `<div class="verdict beaten">Дешевле в ${cheap.shop}:
+               <b>${money(cheap.price)}</b> — на ${money(ours.price - cheap.price)} меньше.</div>`;
+  else if (elsewhere[0].price <= ours.price)
+    // Nobody is cheaper, but somebody matches. "Cheapest here" would be a
+    // shade stronger than the truth, and the page is only worth anything if
+    // it never is.
+    verdict = `<div class="verdict best">Столько же в ${elsewhere[0].shop}.
+               Дороже нигде не нашлось меньше — всего ${elsewhere.length}
+               магазин(ов) с этим артикулом.</div>`;
+  else
+    verdict = `<div class="verdict best">Дешевле всего здесь: следующая цена —
+               ${money(elsewhere[0].price)} в ${elsewhere[0].shop}, это на
+               ${money(elsewhere[0].price - ours.price)} больше.</div>`;
+
+  const all = [...elsewhere, ours].sort((a, b) => a.price - b.price);
+  const have = sizes.filter(s => s.in_stock), gone = sizes.filter(s => !s.in_stock);
+
+  el("sheet-body").innerHTML = `
+    <div class="hero">
+      ${ours.image ? `<img src="${ours.image}" alt="">` : ""}
+      <div>
+        <div class="brand">${ours.brand || ""}</div>
+        <h2>${ours.title}</h2>
+        <div class="prices"><span class="big">${money(ours.price)}</span>
+          <span class="then">${money(ours.was)}</span>
+          <span class="badge" style="position:static">−${ours.discount}%</span></div>
+      </div>
+    </div>
+    ${verdict}
+    ${have.length || gone.length ? `<div class="sizes">
+      ${have.map(s => `<span class="sz">${s.size}</span>`).join("")}
+      ${gone.map(s => `<span class="sz out">${s.size}</span>`).join("")}
+    </div>` : ""}
+    ${elsewhere.length ? `<table>${all.map(o => shop_row(o, ours, cheap)).join("")}</table>` : ""}
+    <a class="go" href="${ours.url}" target="_blank" rel="noopener">Открыть в ${ours.shop}</a>`;
+}
+
+el("x").onclick = () => el("sheet").close();
+el("sheet").onclick = e => { if (e.target === el("sheet")) el("sheet").close(); };
+
 function reload(){ state.page = 0; load(false); }
 
 el("more").onclick = () => { state.page++; load(true); };
@@ -192,6 +283,10 @@ function paint(facets, data){
 }
 
 (function start(){
+  // ?product=N opens straight onto one thing, so a find can be sent to
+  // somebody as a link rather than as a description of where to look.
+  const wanted = new URLSearchParams(location.search).get("product");
+  if (wanted) open_sheet(wanted);
   const seed = JSON.parse(el("seed").textContent).seed;
   if (seed) { paint(seed.facets, seed.offers); return; }
   Promise.all([
