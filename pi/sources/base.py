@@ -29,6 +29,17 @@ class ScrapedProduct:
     image_url: str | None = None
     category: str | None = None
     variants: list[ScrapedVariant] = field(default_factory=list)
+    # Set only when this product's own page named a currency that need not be
+    # the shop's usual one. www.ssense.com serves 4,300 products under /en-us/
+    # and 700 under /en-ca/ — different products, not translations — so one
+    # currency for the whole shop priced the Canadian 700 as if the figures were
+    # dollars. A 125 CAD bottle went onto the shelf at $125 instead of $91,
+    # which does not merely mislabel it: an inflated price is compared against
+    # what other shops charge for the same article, so the shop looks expensive
+    # and its genuine discounts never clear the threshold. None means "whatever
+    # the shop's currency is", which is the right answer for Shopify, where
+    # /products.json is one catalogue in one currency.
+    currency: str | None = None
 
 
 @dataclass(slots=True)

@@ -14,6 +14,7 @@ from pi import deals as dealm
 from pi import pipeline, reference
 from pi.config import Config, Filters
 from pi.fx import Rates
+from pi.sources import jsonld
 from pi.sources.base import FetchResult, ScrapedProduct, ScrapedVariant
 
 from .conftest import ts
@@ -733,6 +734,113 @@ class TestStoreResult:
         assert written == 0
         assert changed == []
         assert len(products) == 1  # still touched, still worth classifying
+
+
+class TestAProductInItsOwnCurrency:
+    """A shop need not price its whole catalogue in one currency."""
+
+    @staticmethod
+    def _mixed():
+        """One shop, two currencies — the shape www.ssense.com actually serves."""
+        return FetchResult(
+            domain="ssense.test",
+            currency="USD",  # what the shop is usually in, and what it says on the store row
+            products=[
+                ScrapedProduct(
+                    external_id="us", title="Sweatshirt", url="https://ssense.test/en-us/us",
+                    currency="USD",
+                    variants=[ScrapedVariant(external_id="v1", price=100.0)],
+                ),
+                ScrapedProduct(
+                    external_id="ca", title="Bottle", url="https://ssense.test/en-ca/ca",
+                    currency="CAD",
+                    variants=[ScrapedVariant(external_id="v2", price=100.0)],
+                ),
+            ],
+        )
+
+    @staticmethod
+    def _rates():
+        return Rates({"USD": 1.0, "CAD": 1.37}, fetched_at=datetime.now(UTC), source="test")
+
+    def test_each_product_is_priced_in_the_currency_its_page_named(self, conn):
+        store_id = dbm.upsert_store(conn, "ssense.test")
+        pipeline.store_result(conn, store_id, self._mixed(), self._rates())
+        rows = dict(
+            conn.execute(
+                """
+                SELECT p.external_id, pp.currency FROM price_points pp
+                  JOIN variants v ON v.id = pp.variant_id
+                  JOIN products p ON p.id = v.product_id
+                """
+            ).fetchall()
+        )
+        assert rows == {"us": "USD", "ca": "CAD"}
+
+    def test_the_canadian_price_is_converted_not_taken_at_face_value(self, conn):
+        """The whole point: 100 CAD is not 100 dollars, and the shelf compares dollars."""
+        store_id = dbm.upsert_store(conn, "ssense.test")
+        pipeline.store_result(conn, store_id, self._mixed(), self._rates())
+        usd = dict(
+            conn.execute(
+                """
+                SELECT p.external_id, pp.price_usd FROM price_points pp
+                  JOIN variants v ON v.id = pp.variant_id
+                  JOIN products p ON p.id = v.product_id
+                """
+            ).fetchall()
+        )
+        assert usd["us"] == pytest.approx(100.0)
+        assert usd["ca"] == pytest.approx(100.0 / 1.37, rel=1e-3)
+
+    def test_a_product_that_named_nothing_falls_back_to_the_shop(self, conn):
+        """Shopify sets no per-product currency, and must keep working unchanged."""
+        store_id = dbm.upsert_store(conn, "shopify.test")
+        result = FetchResult(
+            domain="shopify.test", currency="GBP",
+            products=[
+                ScrapedProduct(
+                    external_id="p", title="Tee", url="https://shopify.test/p",
+                    variants=[ScrapedVariant(external_id="v", price=50.0)],
+                )
+            ],
+        )
+        rates = Rates({"USD": 1.0, "GBP": 0.8}, fetched_at=datetime.now(UTC), source="test")
+        pipeline.store_result(conn, store_id, result, rates)
+        assert conn.execute("SELECT currency FROM price_points").fetchone()[0] == "GBP"
+
+
+class TestRetiringAHopelessShop:
+    """The pipeline drops shops that will never publish a price — if it recognises them."""
+
+    def test_the_adapter_and_the_pipeline_agree_on_the_wording(self):
+        """They kept separate copies of these strings, and the copies drifted apart."""
+        assert jsonld.NO_PRODUCT_URLS in pipeline.HOPELESS_ERRORS
+        assert jsonld.NO_MARKUP in pipeline.HOPELESS_ERRORS
+
+    def test_a_shop_with_no_product_urls_is_set_aside(self, conn):
+        """www.pace-sneakers.de is a one-page site. It was crawled hourly for a week."""
+        known_store(conn, "one-pager.test", last_ok=None)
+        conn.execute(
+            "UPDATE stores SET platform = 'jsonld', last_error = ?, last_ok = NULL",
+            (jsonld.NO_PRODUCT_URLS,),
+        )
+        stores = dbm.get_stores(conn, platforms=("shopify", "jsonld"))
+        kept, dropped = pipeline._drop_hopeless(stores)
+        assert dropped == 1
+        assert kept == []
+
+    def test_a_shop_that_once_worked_is_kept(self, conn):
+        """One bad sweep must not retire a shop that has produced prices before."""
+        known_store(conn, "was-fine.test", last_ok=ts(1))
+        conn.execute(
+            "UPDATE stores SET platform = 'jsonld', last_error = ?",
+            (jsonld.NO_PRODUCT_URLS,),
+        )
+        stores = dbm.get_stores(conn, platforms=("shopify", "jsonld"))
+        kept, dropped = pipeline._drop_hopeless(stores)
+        assert dropped == 0
+        assert len(kept) == 1
 
 
 class TestUnevenQueue:
