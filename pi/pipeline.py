@@ -197,7 +197,8 @@ def _take_shopify_slice(
 
 
 # A store's own markup is a durable fact about it, unlike a network hiccup.
-HOPELESS_ERRORS = ("no schema.org/Product markup found", "no product URLs in sitemap")
+# Taken from the adapter rather than spelled out again — see the note there.
+HOPELESS_ERRORS = (jsonld.NO_MARKUP, jsonld.NO_PRODUCT_URLS)
 
 
 def _drop_hopeless(stores: list[sqlite3.Row]) -> tuple[list[sqlite3.Row], int]:
@@ -254,10 +255,13 @@ def store_result(
     written = 0
     changed: list[int] = []
     touched: list[int] = []
-    currency = (result.currency or "USD").upper()
+    fallback = (result.currency or "USD").upper()
     ts = dbm.utcnow()
 
     for product in result.products:
+        # A product that named its own currency is priced in that one. Only a
+        # product that named none falls back to the shop's.
+        currency = (product.currency or fallback).upper()
         product_id = dbm.upsert_product(
             conn, store_id, product.external_id, product.title, product.url,
             brand=product.brand, image_url=product.image_url, category=product.category,

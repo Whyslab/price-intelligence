@@ -42,6 +42,17 @@ log = logging.getLogger(__name__)
 # their sitemaps. Overridable with --jsonld-budget or PI_JSONLD_BUDGET.
 DEFAULT_BUDGET = 400
 PER_HOST_CONCURRENCY = 4
+# Two failures that say something durable about the shop rather than about the
+# network, so the pipeline retires a store that has only ever produced one of
+# them. The exact wording is therefore part of the contract between the two
+# modules and must not be typed out twice: pipeline.py held its own copy reading
+# "no product URLs in sitemap", the message here grew the words "the" and "or by
+# crawling", and the two stopped matching. Nobody noticed, because the failure
+# mode is silent — three shops that will never publish a price went on being
+# crawled every hour for a week.
+NO_PRODUCT_URLS = "no product URLs in the sitemap or by crawling"
+NO_MARKUP = "no schema.org/Product markup found"
+
 SITEMAP_CANDIDATES = ("/sitemap.xml", "/sitemap_index.xml", "/sitemap/products.xml")
 # robots.txt is where a site is supposed to declare its sitemap, and plenty put
 # it somewhere none of the guesses above would find: /shop/sitemapindex.xml,
@@ -552,7 +563,7 @@ async def fetch(
     urls = await discover_product_urls(client, base)
     if not urls:
         return FetchResult(
-            domain=domain, error="no product URLs in the sitemap or by crawling"
+            domain=domain, error=NO_PRODUCT_URLS
         )
 
     start = cursor % len(urls)
@@ -572,6 +583,9 @@ async def fetch(
         if parsed is None:
             return
         product, found_currency = parsed
+        # What this page said, kept on the product. `dominant` below is only a
+        # summary for the store row; it must not be what the prices are read in.
+        product.currency = found_currency
         products.append(product)
         currencies[found_currency] = currencies.get(found_currency, 0) + 1
 
@@ -579,7 +593,7 @@ async def fetch(
 
     if not products:
         return FetchResult(
-            domain=domain, error="no schema.org/Product markup found", next_cursor=next_cursor
+            domain=domain, error=NO_MARKUP, next_cursor=next_cursor
         )
 
     dominant = currency or max(currencies, key=currencies.get)
