@@ -722,6 +722,9 @@ def offers_for(
     offset: int = 0,
     order_by: str = "o.score DESC, o.discount_pct DESC",
     search: str | None = None,
+    min_price: float | None = None,
+    max_price: float | None = None,
+    min_discount: float | None = None,
 ) -> tuple[list[sqlite3.Row], int]:
     """What is on offer for one person, best first. Returns (page, total).
 
@@ -756,6 +759,18 @@ def offers_for(
             "(" + " OR ".join(["lower(p.brand_family) = ?"] * len(brands)) + ")"
         )
         params += [b.lower() for b in brands]
+    # Price and discount are the two things a person narrows by before anything
+    # else — "nothing over two hundred", "only real cuts" — and they are the two
+    # the shelf could not express at all.
+    if min_price is not None:
+        where.append("o.price_usd >= ?")
+        params.append(min_price)
+    if max_price is not None:
+        where.append("o.price_usd <= ?")
+        params.append(max_price)
+    if min_discount is not None:
+        where.append("o.discount_pct >= ?")
+        params.append(min_discount)
     if search:
         # Title and brand together, because people search for both in the same
         # box — "carhartt" and "cargo pant" are the same gesture.
@@ -883,6 +898,42 @@ def shelf_facets(conn: sqlite3.Connection) -> dict:
             """
         ),
         "total": conn.execute("SELECT COUNT(*) FROM offers").fetchone()[0],
+        # Where the prices actually start and stop, so a range control has ends
+        # rather than guesses. Rounded outwards: a slider that cannot reach the
+        # cheapest thing on the shelf is a bug people report as missing stock.
+        "price": dict(
+            zip(
+                ("min", "max"),
+                conn.execute(
+                    "SELECT COALESCE(MIN(price_usd), 0), COALESCE(MAX(price_usd), 0)"
+                    " FROM offers"
+                ).fetchone(),
+                strict=True,
+            )
+        ),
+        # The owner's own profile, so the page can open on their sizes instead
+        # of on whatever the catalogue happens to have most of — which is
+        # women's EU36, and is nobody's idea of a first screen.
+        "mine": _owner_profile(conn),
+    }
+
+
+def _owner_profile(conn: sqlite3.Connection) -> dict:
+    """Sizes, kinds and genders of the first reader, if there is one."""
+    row = conn.execute(
+        "SELECT genders, kinds, sizes FROM bot_users WHERE active = 1"
+        " ORDER BY created_at, id LIMIT 1"
+    ).fetchone()
+    if row is None:
+        return {}
+
+    def split(value: str | None) -> list[str]:
+        return [part.strip() for part in (value or "").split(",") if part.strip()]
+
+    return {
+        "genders": split(row["genders"]),
+        "kinds": split(row["kinds"]),
+        "sizes": split(row["sizes"]),
     }
 
 
