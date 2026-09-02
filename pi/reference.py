@@ -272,12 +272,23 @@ class MarketIndex:
         agreed = agreeing_prices(list(prices.values()))
         if not agreed:
             return Market()
+        # Only the shops that survived `agreeing_prices` may speak, and they
+        # speak once — about the price and about the tag alike. A shop dropped
+        # for asking $3,824 where others ask $60 was dropped because it is not
+        # holding this article; its struck-through price is then a claim about
+        # something else, and counting it towards the recommended price reads
+        # the same rejected evidence a second time. `agreeing_prices` returns a
+        # contiguous run of the sorted prices, so its ends bound exactly who is
+        # still in.
+        low, high = min(agreed), max(agreed)
+        kept = {shop for shop, price in prices.items() if low <= price <= high}
+        agreed_tags = [tag for shop, tag in tags.items() if shop in kept]
         return Market(
             median_usd=round(statistics.median(agreed), 2),
-            low_usd=round(min(agreed), 2),
+            low_usd=round(low, 2),
             shops=len(agreed),
-            msrp_usd=mode_price(list(tags.values())),
-            msrp_shops=len(tags),
+            msrp_usd=mode_price(agreed_tags),
+            msrp_shops=len(agreed_tags),
         )
 
 
