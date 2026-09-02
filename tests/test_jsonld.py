@@ -1,6 +1,7 @@
 """The generic schema.org adapter that covers everything not on Shopify."""
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import httpx
@@ -622,3 +623,97 @@ class TestProductGroups:
         assert currency == "PLN"
         assert len(product.variants) == 1
         assert product.variants[0].price == 129.99
+
+
+def a_page(offers, **product) -> str:
+    """A plain Product page whose `offers` is whatever a test needs it to be."""
+    node = {"@context": "https://schema.org", "@type": "Product",
+            "name": "Nike Air Max 1/97 Sean Wotherspoon", "sku": "AJ4219-400", **product}
+    node["offers"] = offers
+    return f'<html><script type="application/ld+json">{json.dumps(node)}</script></html>'
+
+
+def offer(price, *, sku=None, size=None, in_stock=True):
+    node = {"@type": "Offer", "price": str(price), "priceCurrency": "EUR",
+            "availability": "https://schema.org/" + ("InStock" if in_stock else "OutOfStock")}
+    if sku:
+        node["sku"] = sku
+    if size:
+        node["size"] = size
+    return node
+
+
+class TestAProductThatListsAnOfferPerSize:
+    """schema.org's older shape for the same statement `hasVariant` makes.
+
+    Nine sizes in stock are nine Offers under one Product. Reading only the
+    first read whichever size the shop's template led with, and both ends of
+    that list are wrong: allikestore.com priced a Sean Wotherspoon at EUR 47.99
+    off a leftover child's size while other shops asked $500-$1,500.
+    """
+
+    @staticmethod
+    def sizes() -> list[dict]:
+        return [
+            offer(47.99, sku="AJ4219-400-36", size="EU 36"),
+            offer(699.0, sku="AJ4219-400-42", size="EU 42"),
+            offer(719.0, sku="AJ4219-400-44", size="EU 44"),
+        ]
+
+    def test_every_size_becomes_its_own_variant(self):
+        product, currency = jsonld.parse_product(a_page(self.sizes()), "https://shop.example/p")
+        assert currency == "EUR"
+        assert [v.size for v in product.variants] == ["EU 36", "EU 42", "EU 44"]
+        assert [v.price for v in product.variants] == [47.99, 699.0, 719.0]
+
+    def test_the_order_of_the_sizes_does_not_decide_the_price(self):
+        """The bug this replaces: the first Offer won, whatever it was."""
+        forwards, _ = jsonld.parse_product(a_page(self.sizes()), "https://shop.example/p")
+        backwards, _ = jsonld.parse_product(
+            a_page(list(reversed(self.sizes()))), "https://shop.example/p"
+        )
+        assert sorted(v.price for v in forwards.variants) == sorted(
+            v.price for v in backwards.variants
+        )
+
+    def test_stock_is_read_per_size(self):
+        offers = [
+            offer(699.0, sku="a", size="EU 42", in_stock=False),
+            offer(719.0, sku="b", size="EU 44", in_stock=True),
+        ]
+        product, _ = jsonld.parse_product(a_page(offers), "https://shop.example/p")
+        assert [v.in_stock for v in product.variants] == [False, True]
+
+    def test_sizes_that_cannot_be_told_apart_collapse_to_the_middle(self):
+        """No sku and no size is nothing stable to call a variant by, so the
+        product keeps one price — the median, which a reorder cannot move."""
+        offers = [offer(47.99), offer(699.0), offer(719.0)]
+        product, _ = jsonld.parse_product(a_page(offers), "https://shop.example/p")
+        assert len(product.variants) == 1
+        assert product.variants[0].price == 699.0, "not 47.99, which led the list"
+
+    def test_the_collapsed_price_is_the_same_whatever_the_order(self):
+        prices = [47.99, 699.0, 719.0]
+        seen = set()
+        for order in ([0, 1, 2], [2, 1, 0], [1, 0, 2]):
+            page = a_page([offer(prices[i]) for i in order])
+            product, _ = jsonld.parse_product(page, "https://shop.example/p")
+            seen.add(product.variants[0].price)
+        assert seen == {699.0}
+
+    def test_a_collapsed_product_is_in_stock_if_any_size_is(self):
+        """A shop with one size left still has the shoe."""
+        offers = [offer(699.0, in_stock=False), offer(719.0, in_stock=True)]
+        product, _ = jsonld.parse_product(a_page(offers), "https://shop.example/p")
+        assert product.variants[0].in_stock is True
+
+    def test_a_single_offer_in_a_list_still_reads_as_one_price(self):
+        product, _ = jsonld.parse_product(a_page([offer(129.99)]), "https://shop.example/p")
+        assert [v.price for v in product.variants] == [129.99]
+
+    def test_an_unpriced_offer_among_priced_ones_is_left_out(self):
+        offers = [{"@type": "Offer", "sku": "x", "size": "EU 40"},
+                  offer(699.0, sku="a", size="EU 42"),
+                  offer(719.0, sku="b", size="EU 44")]
+        product, _ = jsonld.parse_product(a_page(offers), "https://shop.example/p")
+        assert [v.size for v in product.variants] == ["EU 42", "EU 44"]
