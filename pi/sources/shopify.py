@@ -60,9 +60,43 @@ _COUNTRY_CURRENCY = {
 async def detect_currency(
     client: httpx.AsyncClient, base: str, limiter: RateLimiter | NullLimiter | None = None
 ) -> str | None:
-    """Read the shop's real currency from the storefront, then /meta.json."""
+    """Which currency /products.json is denominated in.
+
+    `/meta.json` is asked first because it is the shop's own statement of its
+    base currency, and that is what /products.json quotes. The storefront names
+    something else: with Shopify Markets on, `Shopify.currency.active` is the
+    currency chosen for *this visitor*, converted from the base for display, and
+    which one that is depends on where the request appeared to come from.
+
+    Reading the display currency and pricing the base-currency catalogue with it
+    multiplies the whole shop by an exchange rate. Measured: www.slamcity.com
+    quotes GBP and was recorded as NOK, so its Adidas Glenburn skate shoes went
+    in at $6.96 instead of about $88 — and eleven shops were carrying a currency
+    that does not belong to their country. It does not stay local either: those
+    prices are what other shops are measured against through the market index,
+    and slamcity disagreed with the consensus on 323 of 323 shared articles,
+    more than any other shop in the catalogue.
+
+    The storefront is still read, because a shop that answers no /meta.json
+    still has to be priced somehow, and a display currency is right whenever
+    the shop has no second market.
+    """
     limiter = limiter or NullLimiter()
     host = urlparse(base).netloc
+    try:
+        async with limiter.slot(host):
+            resp = await client.get(f"{base}/meta.json")
+        if resp.status_code == 200:
+            meta = resp.json() or {}
+            stated = str(meta.get("currency") or "").strip().upper()
+            if len(stated) == 3 and stated.isalpha():
+                return stated
+            country = meta.get("country")
+            if country:
+                return _COUNTRY_CURRENCY.get(str(country).upper())
+    except (httpx.HTTPError, json.JSONDecodeError) as exc:
+        log.debug("%s: meta.json unreadable (%s)", base, exc)
+
     try:
         async with limiter.slot(host):
             resp = await client.get(base, follow_redirects=True)
@@ -74,16 +108,6 @@ async def detect_currency(
                     return found.group(1).upper()
     except httpx.HTTPError as exc:
         log.debug("%s: storefront unreadable for currency (%s)", base, exc)
-
-    try:
-        async with limiter.slot(host):
-            resp = await client.get(f"{base}/meta.json")
-        if resp.status_code == 200:
-            country = (resp.json() or {}).get("country")
-            if country:
-                return _COUNTRY_CURRENCY.get(str(country).upper())
-    except (httpx.HTTPError, json.JSONDecodeError) as exc:
-        log.debug("%s: meta.json unreadable (%s)", base, exc)
     return None
 
 
