@@ -308,6 +308,15 @@ def _borrow_gender_from_stored(
 
     Used when only a slice is being classified: scanning 2.26 million keys to
     settle a few thousand products is the wrong way round.
+
+    A product is not among its own witnesses. It reached this function precisely
+    because its own title says nothing, so the only gender it could contribute
+    is one it borrowed on an earlier run — and counting that is the same shop
+    corroborating itself, which every other reading here refuses. It also gets
+    the answer wrong in the one case that matters: when the shop that named the
+    gender corrects itself, the stale value disagrees with the new one, the
+    article is dropped as contested, and a product that should have followed the
+    correction loses its gender instead.
     """
     borrowed: dict[int, str] = {}
     for start in range(0, len(product_ids), 900):
@@ -319,6 +328,7 @@ def _borrow_gender_from_stored(
               FROM product_keys mine
               JOIN product_keys sibling
                 ON sibling.key = mine.key AND sibling.key_type = mine.key_type
+               AND sibling.product_id <> mine.product_id
               JOIN products theirs ON theirs.id = sibling.product_id
              WHERE mine.product_id IN ({placeholders})
                AND mine.key_type IN ('sku', 'style')

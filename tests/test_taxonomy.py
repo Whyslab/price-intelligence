@@ -140,6 +140,26 @@ class TestClassify:
         ).fetchone()[0]
         assert gender == "women"
 
+    def test_a_product_is_not_its_own_witness(self, conn, shops):
+        """The shop that named the gender corrects itself, and the borrower
+        follows the correction rather than being blanked by its own stale vote."""
+        named = add_product(conn, shops[0], "a", "Wmns Air Force 1 CW2288-111")
+        dbm.set_product_keys(conn, named, [("style", "CW2288-111")])
+        silent = add_product(conn, shops[1], "b", "Air Force 1 CW2288-111")
+        dbm.set_product_keys(conn, silent, [("style", "CW2288-111")])
+        taxonomy.classify(conn)
+        assert conn.execute(
+            "SELECT gender FROM products WHERE id = ?", (silent,)
+        ).fetchone()[0] == "women"
+
+        conn.execute("UPDATE products SET title = ? WHERE id = ?",
+                     ("Mens Air Force 1 CW2288-111", named))
+        taxonomy.classify(conn, [named])
+        taxonomy.classify(conn, [silent])
+        assert conn.execute(
+            "SELECT gender FROM products WHERE id = ?", (silent,)
+        ).fetchone()[0] == "men", "the correction reaches it, rather than blanking it"
+
 
 class TestItalianSizing:
     """Where the two size systems collide: 46, 48, 50 is a jacket, 44, 45, 46 is a shoe."""
