@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import replace
 from datetime import UTC, datetime
 
@@ -1091,3 +1092,39 @@ class TestRecordingABlock:
         await pipeline.run(config, conn, collect_only=True)
 
         assert conn.execute("SELECT blocked FROM runs").fetchone()["blocked"] == 0
+
+
+class TestTheJournalKeepsErrorsForThingsThatNeedSomebody:
+    """A platform block happens on every sweep and the design absorbs it: the
+    skipped shops head the next run's queue, and 143 of the 146 Shopify shops
+    are still read within a day. Logged at ERROR it filled the journal a hundred
+    lines at a time and buried the failures that do need a person."""
+
+    def test_a_shopify_block_is_a_warning_not_an_error(self, conn, caplog):
+        class Blocked:
+            abandoned = 7
+            penalties = 0
+
+        run_id = conn.execute(
+            "INSERT INTO runs (started_at) VALUES (?)", (dbm.utcnow(),)
+        ).lastrowid
+        with caplog.at_level(logging.DEBUG, logger="pi.pipeline"):
+            pipeline._record_block(conn, run_id, Blocked())
+
+        said = [r for r in caplog.records if "blocked this IP" in r.getMessage()]
+        assert said, "the block is still reported"
+        assert [r.levelno for r in said] == [logging.WARNING]
+
+    def test_the_run_is_still_recorded_as_blocked(self, conn):
+        """The level changed; the bookkeeping the next run adapts from did not."""
+        class Blocked:
+            abandoned = 7
+            penalties = 0
+
+        run_id = conn.execute(
+            "INSERT INTO runs (started_at) VALUES (?)", (dbm.utcnow(),)
+        ).lastrowid
+        pipeline._record_block(conn, run_id, Blocked())
+        assert conn.execute(
+            "SELECT blocked FROM runs WHERE id = ?", (run_id,)
+        ).fetchone()[0] == 1
