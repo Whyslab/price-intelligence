@@ -192,7 +192,7 @@ def evaluate(
 
     market_native = to_native(market.median_usd) if market.priced(filters.market_min_shops) else None
     msrp_native = to_native(market.msrp_usd) if market.has_msrp(filters.msrp_min_shops) else None
-    low_native = to_native(market.low_usd)
+    low_native = to_native(market.low_usd) if market.priced(filters.market_min_shops) else None
 
     # Veto: whatever it is marked down from, a price above what other shops are
     # asking for the same article is not a discount.

@@ -287,3 +287,49 @@ class TestAnInflatedReferencePrice:
         deal = deals.evaluate(1, 1, 98.0, 163.0, True, history, filters, trust=honest)
         assert deal is not None
         assert deal.reference_source == "tag"
+
+
+class TestTheMarketIsBelievedAtOneStrength:
+    """The market either counts or it does not, and the same threshold decides.
+
+    `market_min_shops` exists because two shops agreeing is a coincidence and
+    five is a price. Every use of the market has to respect it, including the
+    +15 for undercutting the market — the largest single bonus in the score.
+    Trusting a figure for the bonus after refusing it for the reference is
+    reading the same weak evidence twice, and the second read is the one that
+    sends the notification.
+    """
+
+    def test_a_market_too_small_to_price_is_too_small_to_credit(self, filters):
+        """One other shop cannot make a tag-priced deal into a market-beating one.
+
+        Its 30% comes entirely from the struck-through price, which is what the
+        market was supposed to check rather than corroborate.
+        """
+        history = make_history([(140.0, 200.0, 0)])
+        thin = Market(median_usd=145.0, low_usd=145.0, shops=1)
+        assert deals.evaluate(1, 1, 140.0, 200.0, True, history, filters, market=thin) is None
+
+    def test_more_shops_never_turn_a_silent_run_loud(self, filters):
+        """Evidence may only cost a deal its notification, never buy one.
+
+        With three shops the median is the reference and the price is 3.4% under
+        it — not a discount. Any smaller market has to reach the same verdict or
+        a quieter one, or the shops nobody found are worth more than the shops
+        somebody did.
+        """
+        history = make_history([(140.0, 200.0, 0)])
+        for shops in (0, 1, 2, 3, 5):
+            market = (
+                Market(median_usd=145.0, low_usd=145.0, shops=shops) if shops else Market()
+            )
+            deal = deals.evaluate(1, 1, 140.0, 200.0, True, history, filters, market=market)
+            assert deal is None, f"{shops} other shop(s) should not produce an alert"
+
+    def test_a_market_big_enough_still_earns_the_credit(self, filters):
+        """The guard must not silence the signal it is guarding."""
+        history = make_history([(120.0, None, 0)])
+        market = Market(median_usd=200.0, low_usd=180.0, shops=6)
+        deal = deals.evaluate(1, 1, 120.0, None, True, history, filters, market=market)
+        assert deal is not None
+        assert deal.beats_market, "under the lowest of six shops"
