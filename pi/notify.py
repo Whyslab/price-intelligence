@@ -58,7 +58,7 @@ def _reference_phrase(deal: Deal) -> str:
     if deal.reference_source == "market":
         return f"в других магазинах {price}, по {deal.market_shops}"
     if deal.reference_source == "msrp":
-        return f"рекомендованная {price}, по {deal.market_shops} магазинам"
+        return f"рекомендованная {price}, по {deal.msrp_shops} магазинам"
     return f"зачёркнуто в магазине {price}"
 
 
