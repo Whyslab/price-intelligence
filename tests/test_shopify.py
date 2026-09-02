@@ -150,8 +150,9 @@ async def test_a_non_shopify_answer_is_an_error_not_an_empty_catalogue():
 
 
 @respx.mock
-async def test_currency_is_read_from_the_storefront_not_guessed():
+async def test_currency_is_read_from_the_shop_not_guessed():
     """A .com domain in Berlin still charges in euros."""
+    respx.get("https://shop.example/meta.json").mock(return_value=httpx.Response(404))
     respx.get("https://shop.example/").mock(
         return_value=httpx.Response(
             200, text='<script>var Shopify = {}; Shopify.currency = {"active":"EUR","rate":"1.0"};</script>'
@@ -162,7 +163,37 @@ async def test_currency_is_read_from_the_storefront_not_guessed():
 
 
 @respx.mock
+async def test_the_shops_own_base_currency_beats_what_the_storefront_shows():
+    """With Shopify Markets on, the storefront names the currency chosen for
+    this visitor; /products.json still quotes the base. Reading the first and
+    pricing the second multiplies the whole catalogue by an exchange rate —
+    www.slamcity.com quotes GBP, was recorded as NOK, and its skate shoes went
+    in at $6.96 instead of about $88."""
+    respx.get("https://shop.example/meta.json").mock(
+        return_value=httpx.Response(200, json={"name": "Slam", "country": "GB", "currency": "GBP"})
+    )
+    respx.get("https://shop.example/").mock(
+        return_value=httpx.Response(
+            200, text='<script>Shopify.currency = {"active":"NOK","rate":"12.6"};</script>'
+        )
+    )
+    async with httpx.AsyncClient() as client:
+        assert await shopify.detect_currency(client, "https://shop.example") == "GBP"
+
+
+@respx.mock
+async def test_a_meta_currency_that_is_not_a_currency_is_not_believed():
+    respx.get("https://shop.example/meta.json").mock(
+        return_value=httpx.Response(200, json={"country": "GB", "currency": ""})
+    )
+    respx.get("https://shop.example/").mock(return_value=httpx.Response(200, text="<html></html>"))
+    async with httpx.AsyncClient() as client:
+        assert await shopify.detect_currency(client, "https://shop.example") == "GBP"
+
+
+@respx.mock
 async def test_currency_falls_back_to_the_shops_country():
+    """An older shop whose /meta.json names a country and no currency."""
     respx.get("https://shop.example/").mock(return_value=httpx.Response(200, text="<html></html>"))
     respx.get("https://shop.example/meta.json").mock(
         return_value=httpx.Response(200, json={"name": "Shop", "country": "GB"})
