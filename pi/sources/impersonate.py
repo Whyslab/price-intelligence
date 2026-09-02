@@ -79,9 +79,26 @@ class ImpersonatingClient:
     async def aclose(self) -> None:
         await self._session.close()
 
-    async def get(self, url: str, follow_redirects: bool = True) -> httpx.Response:
+    async def get(
+        self,
+        url: str,
+        follow_redirects: bool = True,
+        headers: dict[str, str] | None = None,
+    ) -> httpx.Response:
+        """`headers` are merged over the session's, the way httpx merges them.
+
+        An adapter that asks a shop's own JSON API has to send a Referer and an
+        Accept with the request — httpx takes those per call, so a shim that
+        silently did not was a shim the adapters could not actually be unaware
+        of. It failed as a TypeError inside a probe that catches everything, so
+        ASOS came back classified "blocked" with nothing in the log to say why.
+        """
+        merged = httpx.Headers(self.headers)
+        merged.update(headers or {})
         try:
-            resp = await self._session.get(str(url), allow_redirects=follow_redirects)
+            resp = await self._session.get(
+                str(url), allow_redirects=follow_redirects, headers=dict(merged)
+            )
         except Exception as exc:  # curl_cffi raises its own hierarchy
             # Every caller in pi.sources catches httpx.HTTPError. Translating
             # here is what keeps the adapters unaware of which client they hold.

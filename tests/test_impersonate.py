@@ -49,3 +49,57 @@ class TestTheResponseItHandsBack:
         assert kept == {"X-Keep": "yes"}
         resp = httpx.Response(200, headers=kept, content=b"plain text")
         assert resp.text == "plain text", "readable because nothing claims it is gzipped"
+
+
+class TestPerRequestHeaders:
+    """An adapter asking a shop's own API has to send Accept and Referer.
+
+    The shim used to take headers only in its constructor, so `client.get(...,
+    headers=...)` — which is how every adapter talks to httpx — raised
+    TypeError. It surfaced as ASOS being recorded "blocked": a verdict about
+    the shop that was really a verdict about us.
+    """
+
+    async def test_a_call_may_add_headers_of_its_own(self):
+        client = impersonate.ImpersonatingClient(headers={"User-Agent": "pi"})
+        client._session = _Recorder()
+
+        await client.get("https://shop.example/api", headers={"Referer": "https://shop.example/"})
+
+        # httpx.Headers normalises names to lower case, which is what HTTP/2
+        # puts on the wire anyway.
+        assert client._session.seen["referer"] == "https://shop.example/"
+        assert client._session.seen["user-agent"] == "pi", (
+            "the headers the client was built with were being dropped entirely: "
+            "__init__ stored them and nothing ever read them again"
+        )
+
+    async def test_a_call_may_override_a_session_header(self):
+        client = impersonate.ImpersonatingClient(headers={"Accept": "text/html"})
+        client._session = _Recorder()
+
+        await client.get("https://shop.example/api", headers={"Accept": "application/json"})
+
+        assert client._session.seen["accept"] == "application/json"
+
+
+class _Recorder:
+    """The two methods the shim uses of curl_cffi's session."""
+
+    def __init__(self):
+        self.seen: dict[str, str] = {}
+
+    async def get(self, url, allow_redirects=True, headers=None):
+        self.seen = dict(headers or {})
+        return _Answer()
+
+    async def close(self):
+        pass
+
+
+class _Answer:
+    status_code = 200
+    content = b"{}"
+
+    def __init__(self):
+        self.headers: dict[str, str] = {}
