@@ -177,14 +177,8 @@ def iter_ld_products(page: str):
                 yield node
 
 
-def _priced_offer(node: dict) -> tuple[float, str, bool] | None:
-    """(price, currency, in stock) off a node's Offer, or None if it has none."""
-    offers = node.get("offers")
-    if isinstance(offers, list):
-        offers = next((o for o in offers if isinstance(o, dict)), None)
-    if not isinstance(offers, dict):
-        return None
-
+def _read_offer(offers: dict) -> tuple[float, str, bool] | None:
+    """(price, currency, in stock) off one Offer node."""
     price = _price(offers.get("price"))
     currency = _text(offers.get("priceCurrency"))
     if price is None or not currency:
@@ -200,6 +194,89 @@ def _priced_offer(node: dict) -> tuple[float, str, bool] | None:
 
     availability = (_text(offers.get("availability")) or "instock").rsplit("/", 1)[-1]
     return price, currency.upper(), availability.lower().replace(" ", "") in AVAILABLE
+
+
+def _priced_offer(node: dict) -> tuple[float, str, bool] | None:
+    """(price, currency, in stock) off a node's Offer, or None if it has none.
+
+    A node carrying several Offers is one product in several sizes. `_offers_of`
+    splits those into variants where they can be told apart; this is what is
+    left when they cannot, and it takes the middle price rather than the first.
+
+    The first was whichever size the shop's template emitted first, and both
+    ends of that list are wrong. Measured on the live database: allikestore.com
+    priced a Sean Wotherspoon at EUR 47.99 off a leftover child's size while
+    three other shops asked $500-$1,500, and sneakers123.com priced a Vans at
+    $3,824 off an odd size at the other end. Neither stayed local — a shop's
+    price is what other shops are measured against through the market index, so
+    one template's ordering became everyone else's reference price.
+
+    In stock if any of them is: a shop with one size left still has the shoe.
+    """
+    offers = node.get("offers")
+    if isinstance(offers, dict):
+        return _read_offer(offers)
+    if not isinstance(offers, list):
+        return None
+    read = []
+    for item in offers:
+        if isinstance(item, dict):
+            got = _read_offer(item)
+            if got is not None:
+                read.append(got)
+    if not read:
+        return None
+    read.sort(key=lambda got: got[0])
+    price, currency, _ = read[len(read) // 2]
+    return price, currency, any(in_stock for _, _, in_stock in read)
+
+
+def _offers_of(node: dict) -> tuple[list[ScrapedVariant], str] | None:
+    """The sizes of a Product that lists an Offer each, or None if it lists one.
+
+    The older way of saying what `hasVariant` says: a shop with nine sizes in
+    stock writes nine Offers under one Product, each with its own sku, its own
+    availability and its own price. Read as one product it loses everything the
+    shelf is for — which size is left, and what that size costs.
+
+    Only expanded when the offers can be told apart by a sku or a size. Without
+    one there is nothing stable to call a variant, and a positional id would
+    rename every size the moment the shop reordered its list, which reads as the
+    old sizes selling out and new ones arriving.
+    """
+    offers = node.get("offers")
+    if not isinstance(offers, list):
+        return None
+    priced: list[tuple[dict, tuple[float, str, bool]]] = []
+    for item in offers:
+        if not isinstance(item, dict):
+            continue
+        got = _read_offer(item)
+        if got is not None:
+            priced.append((item, got))
+    if len(priced) < 2:
+        return None
+    if not all(_text(item.get("sku")) or _text(item.get("size")) for item, _ in priced):
+        return None
+
+    found: list[ScrapedVariant] = []
+    currency = None
+    for item, (price, item_currency, in_stock) in priced:
+        currency = currency or item_currency
+        sku = _text(item.get("sku"))
+        size = _text(item.get("size"))
+        found.append(
+            ScrapedVariant(
+                external_id=sku or size,
+                price=price,
+                compare_at=None,  # schema.org has no struck-through price
+                in_stock=in_stock,
+                sku=sku,
+                size=size,
+                color=_text(item.get("color")),
+            )
+        )
+    return (found, currency) if currency else None
 
 
 def _image_of(node: dict, url: str) -> str | None:
@@ -273,7 +350,7 @@ def parse_product(page: str, url: str) -> tuple[ScrapedProduct, str] | None:
             continue
         sku = _text(node.get("sku")) or _text(node.get("mpn"))
 
-        grouped = _variants_of(node)
+        grouped = _variants_of(node) or _offers_of(node)
         if grouped is not None:
             variants, currency = grouped
         else:
