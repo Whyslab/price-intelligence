@@ -4,7 +4,7 @@ Description=Price Intelligence — drop old price history and reclaim disk space
 [Service]
 Type=oneshot
 WorkingDirectory=%h/Projects/price-intelligence
-ExecStart=%h/Projects/price-intelligence/.venv/bin/python -m pi prune --keep-days 180
+ExecStart=%h/Projects/price-intelligence/.venv/bin/python -m pi prune --keep-days 90
 TimeoutStartSec=30min
 Nice=15
 IOSchedulingClass=idle
