@@ -324,7 +324,7 @@ function card(o){
   a.className = "card"; a.href = o.url; a.target = "_blank"; a.rel = "noopener";
   // The link is real, so middle-click and "open in new tab" still work; the
   // click is intercepted only to show what everyone else charges first.
-  a.onclick = e => { e.preventDefault(); open_sheet(o.id); };
+  a.onclick = e => { e.preventDefault(); open_sheet(o.id, o.variant); };
   const f = freshness(o.checked_at);
   a.innerHTML = `
     <div class="thumb">
@@ -382,11 +382,11 @@ function shop_row(o, mine, cheap){
           <td class="p">${money(o.price)}</td></tr>`;
 }
 
-async function open_sheet(id){
+async function open_sheet(id, variant){
   const d = el("sheet");
   el("sheet-body").innerHTML = "<p style='color:var(--dim)'>Смотрю, у кого ещё это есть…</p>";
   if (!d.open) d.showModal();
-  const r = await fetch("/api/product/" + id);
+  const r = await fetch("/api/product/" + id + (variant ? "?variant=" + variant : ""));
   if (!r.ok){ el("sheet-body").innerHTML = "<p>Это предложение уже сняли с полки.</p>"; return; }
   const {ours, sizes, elsewhere, cheapest_elsewhere: cheap} = await r.json();
 
