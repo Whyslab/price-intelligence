@@ -195,3 +195,29 @@ class TestDelivery:
         async with notify.Telegram(TOKEN, CHAT) as tg:
             assert await tg.send_text("hi") is False
         assert route.call_count == notify.MAX_RETRIES
+
+
+class TestTheReferencePhraseNamesItsOwnEvidence:
+    """"было 300" reads the same whichever of four things the 300 is, so the
+    line names the source — and must name the count that belongs to it."""
+
+    def test_the_recommended_price_counts_shops_that_struck_one_through(self):
+        """Not shops that merely quote a price. `agreeing_prices` can keep a
+        shop's price while it shows no tag at all, so the two differ."""
+        deal = Deal(
+            variant_id=1, product_id=1, price_usd=120.0, reference_usd=200.0,
+            reference_source="msrp", discount_pct=40.0, saving_usd=80.0, score=70,
+            all_time_low=False, fake_sale=False, dropped_hours_ago=None,
+            history_points=1, market_shops=9, msrp_usd=200.0, msrp_shops=3,
+        )
+        assert "по 3 магазинам" in notify._reference_phrase(deal)
+        assert "по 9" not in notify._reference_phrase(deal)
+
+    def test_the_market_price_still_counts_shops_with_a_price(self):
+        deal = Deal(
+            variant_id=1, product_id=1, price_usd=120.0, reference_usd=200.0,
+            reference_source="market", discount_pct=40.0, saving_usd=80.0, score=70,
+            all_time_low=False, fake_sale=False, dropped_hours_ago=None,
+            history_points=1, market_shops=9, msrp_usd=200.0, msrp_shops=3,
+        )
+        assert "по 9" in notify._reference_phrase(deal)

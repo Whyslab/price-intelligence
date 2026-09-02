@@ -74,6 +74,9 @@ class Deal:
     market_median_usd: float | None = None
     beats_market: bool = False
     msrp_usd: float | None = None
+    # How many shops struck a price through, which is not how many quote one:
+    # the notification names this figure as its evidence and they differ.
+    msrp_shops: int = 0
     inflated_tag: bool = False
     rule_priced: bool = False
     blanket_pct: float | None = None
@@ -278,6 +281,7 @@ def evaluate(
         market_median_usd=market.median_usd,
         beats_market=beats_market,
         msrp_usd=market.msrp_usd if market.has_msrp(filters.msrp_min_shops) else None,
+        msrp_shops=market.msrp_shops if market.has_msrp(filters.msrp_min_shops) else 0,
         inflated_tag=inflated_tag,
         blanket_pct=trust.blanket_pct if rule_priced else None,
         rule_priced=rule_priced,
