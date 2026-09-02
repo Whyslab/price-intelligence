@@ -71,6 +71,14 @@ def _float(query: dict, name: str) -> float | None:
     return value if value >= 0 else None
 
 
+def read_variant(raw: str) -> int | None:
+    """Which size a product link was opened from. Absent is not zero."""
+    try:
+        return int((parse_qs(raw).get("variant", [""])[0] or "").strip())
+    except ValueError:
+        return None
+
+
 def _int(query: dict, name: str, default: int, low: int, high: int) -> int:
     try:
         value = int(query.get(name, [default])[0])
@@ -111,6 +119,9 @@ def offer_json(row: sqlite3.Row) -> dict:
     """
     return {
         "id": row["product_id"],
+        # Which size this card is, so opening it lands on the same row rather
+        # than on whichever one the database happened to return first.
+        "variant": row["variant_id"],
         "title": row["title"],
         "url": row["url"],
         "image": row["image_url"],
@@ -133,13 +144,23 @@ def offer_json(row: sqlite3.Row) -> dict:
     }
 
 
-def product_page(conn: sqlite3.Connection, product_id: int) -> dict:
+def product_page(
+    conn: sqlite3.Connection, product_id: int, variant_id: int | None = None
+) -> dict:
     """One product, and what everyone else charges for the same article.
 
     The comparison is the point. A shop's own struck-through price is a claim;
     another shop asking twice as much for the same article is evidence, and a
     third asking less is the answer to the only question that matters. 82% of
     the shelf has nobody to compare against and says so rather than implying it.
+
+    `offers` is keyed by variant, so a product on sale in several sizes has
+    several rows: 322 of the 23,934 products on the shelf, and 188 of those at
+    prices that differ between sizes — one of them $90 in one size and $180 in
+    another. Taking whichever row came back first meant a card showing one price
+    could open onto a different one. So the variant the card was built from is
+    passed back and wins; without one the best-scoring row does, which is at
+    least the same row every time.
     """
     row = conn.execute(
         """
@@ -151,8 +172,10 @@ def product_page(conn: sqlite3.Connection, product_id: int) -> dict:
           JOIN products p ON p.id = o.product_id
           JOIN stores   s ON s.id = p.store_id
          WHERE o.product_id = ?
+         ORDER BY (o.variant_id = ?) DESC, o.score DESC, o.price_usd ASC
+         LIMIT 1
         """,
-        (product_id,),
+        (product_id, -1 if variant_id is None else variant_id),
     ).fetchone()
     if row is None:
         return {}
@@ -282,7 +305,9 @@ class Handler(BaseHTTPRequestHandler):
                     self._json({"error": "not a product id"}, 400)
                     return
                 with self._open() as conn:
-                    found = product_page(conn, product_id)
+                    found = product_page(
+                        conn, product_id, read_variant(parsed.query)
+                    )
                 self._json(found or {"error": "not on the shelf"}, 200 if found else 404)
                 return
             if parsed.path == "/api/offers":

@@ -62,6 +62,12 @@ class TestReadingTheQuery:
         assert web.read_query("sort=; DROP TABLE offers")["sort"] == "score"
         assert web.read_query("sort=discount")["sort"] == "discount"
 
+    def test_a_link_says_which_size_it_was_opened_from(self):
+        assert web.read_variant("variant=4210") == 4210
+        assert web.read_variant("") is None
+        assert web.read_variant("variant=") is None
+        assert web.read_variant("variant=; DROP TABLE offers") is None
+
     def test_nonsense_paging_does_not_get_through(self):
         assert web.read_query("page=-5")["page"] == 0
         assert web.read_query("page=abc")["page"] == 0
@@ -233,3 +239,114 @@ class TestFacets:
         facets = dbm.shelf_facets(conn)
         assert facets["total"] == 0
         assert facets["kinds"] == []
+
+
+class TestNarrowingByPriceAndDiscount:
+    """The two things a person narrows by before anything else — "nothing over
+    two hundred", "only real cuts" — and the two the shelf could not express."""
+
+    def test_a_number_that_is_not_one_is_no_opinion_rather_than_zero(self):
+        """Read as zero, an unreadable ceiling would empty the shelf silently."""
+        assert web.read_query("")["min_price"] is None
+        assert web.read_query("max_price=")["max_price"] is None
+        assert web.read_query("max_price=abc")["max_price"] is None
+        assert web.read_query("min_price=-5")["min_price"] is None
+        assert web.read_query("max_price=199,90")["max_price"] == 199.90
+        assert web.read_query("min_discount=50")["min_discount"] == 50.0
+
+    def test_a_ceiling_leaves_out_what_costs_more(self, conn):
+        a_shelf(conn, 3)  # $100, $99, $98
+        assert web.shelf_page(conn, web.read_query("max_price=99"))["total"] == 2
+        assert web.shelf_page(conn, web.read_query("min_price=99"))["total"] == 2
+        assert web.shelf_page(conn, web.read_query("min_price=99&max_price=99"))["total"] == 1
+
+    def test_a_floor_under_the_discount_leaves_out_the_shallow_ones(self, conn):
+        a_shelf(conn, 3)  # 50%, 51%, 52%
+        assert web.shelf_page(conn, web.read_query("min_discount=51"))["total"] == 2
+        assert web.shelf_page(conn, web.read_query("min_discount=90"))["total"] == 0
+
+    def test_the_narrowing_survives_being_combined(self, conn):
+        a_shelf(conn, 3)
+        page = web.shelf_page(conn, web.read_query("max_price=99&min_discount=52&kind=shoes"))
+        assert page["total"] == 1
+
+
+class TestAProductOnSaleInSeveralSizes:
+    """`offers` is keyed by variant, so one product can hold several rows: 322
+    of the 23,934 on the shelf do, and 188 of those at prices that differ
+    between sizes — one of them $90 in one size against $180 in another."""
+
+    @staticmethod
+    def _two_sizes(conn):
+        store = dbm.upsert_store(conn, "shop.example", platform="shopify", currency="USD")
+        product = dbm.upsert_product(
+            conn, store, "p", "Salomon XT-6", "https://shop.example/p", brand="Salomon",
+        )
+        variants = {}
+        for size, price, discount, score in (("US10", 90.0, 69.0, 70), ("US11", 180.0, 37.0, 40)):
+            variant = dbm.upsert_variant(conn, product, f"v{size}", size=size, size_norm=size)
+            conn.execute(
+                """
+                INSERT INTO offers (variant_id, product_id, found_at, checked_at,
+                                    price_usd, reference_usd, reference_source,
+                                    discount_pct, saving_usd, score, all_time_low)
+                VALUES (?, ?, ?, ?, ?, 290.0, 'market', ?, ?, ?, 0)
+                """,
+                (variant, product, ts(1), ts(0), price, discount, 290.0 - price, score),
+            )
+            variants[size] = variant
+        return product, variants
+
+    def test_the_card_opens_on_the_size_it_was_built_from(self, conn):
+        """A card showing $180 opening onto $90 is the fastest way to be disbelieved."""
+        product, variants = self._two_sizes(conn)
+        assert web.product_page(conn, product, variants["US11"])["ours"]["price"] == 180.0
+        assert web.product_page(conn, product, variants["US10"])["ours"]["price"] == 90.0
+
+    def test_every_card_on_the_shelf_can_say_which_row_it_is(self, conn):
+        self._two_sizes(conn)
+        cards = web.shelf_page(conn, web.read_query(""))["offers"]
+        assert len(cards) == 2
+        for card in cards:
+            opened = web.product_page(conn, card["id"], card["variant"])
+            assert opened["ours"]["price"] == card["price"]
+            assert opened["ours"]["size"] == card["size"]
+
+    def test_a_link_without_a_size_is_at_least_the_same_row_every_time(self, conn):
+        """Before, it was whichever row the database happened to return."""
+        product, _ = self._two_sizes(conn)
+        assert {web.product_page(conn, product)["ours"]["price"] for _ in range(5)} == {90.0}
+
+    def test_a_size_that_left_the_shelf_falls_back_rather_than_failing(self, conn):
+        """The shop sold out of it between the page loading and the click."""
+        product, variants = self._two_sizes(conn)
+        conn.execute("DELETE FROM offers WHERE variant_id = ?", (variants["US11"],))
+        assert web.product_page(conn, product, variants["US11"])["ours"]["price"] == 90.0
+
+
+class TestWhatTheControlsAreBuiltFrom:
+    def test_the_range_control_reaches_both_ends_of_the_shelf(self, conn):
+        """A slider that cannot reach the cheapest thing on the shelf is a bug
+        people report as missing stock."""
+        a_shelf(conn, 3)
+        assert dbm.shelf_facets(conn)["price"] == {"min": 98.0, "max": 100.0}
+
+    def test_an_empty_shelf_has_ends_rather_than_nothing(self, conn):
+        assert dbm.shelf_facets(conn)["price"] == {"min": 0, "max": 0}
+
+    def test_the_page_opens_on_its_reader_own_sizes(self, conn):
+        """Otherwise it opens on whatever the catalogue has most of, which is
+        women's EU36 and is nobody's idea of a first screen."""
+        dbm.upsert_bot_user(
+            conn, 1, "1", "reader", sizes="EU44,EU45", kinds="shoes", genders="men",
+        )
+        assert dbm.shelf_facets(conn)["mine"] == {
+            "genders": ["men"], "kinds": ["shoes"], "sizes": ["EU44", "EU45"],
+        }
+
+    def test_a_reader_who_answered_nothing_highlights_nothing(self, conn):
+        dbm.upsert_bot_user(conn, 1, "1", "reader")
+        assert dbm.shelf_facets(conn)["mine"] == {"genders": [], "kinds": [], "sizes": []}
+
+    def test_no_reader_yet_is_not_an_error(self, conn):
+        assert dbm.shelf_facets(conn)["mine"] == {}
