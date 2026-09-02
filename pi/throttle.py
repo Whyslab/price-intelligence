@@ -327,7 +327,13 @@ class RateLimiter:
                     return
                 if self.blocked_at is None:
                     self.blocked_at = now
-                    log.error(
+                    # A warning, not an error. This happens on every sweep and the
+                    # design absorbs it: the abandoned shops go to the front of the
+                    # next run's queue and 143 of the 146 Shopify shops are still
+                    # read within a day, 115 within six hours. Logged at ERROR it
+                    # filled the journal a hundred lines at a time and buried the
+                    # failures that do need somebody — which is what an error is for.
+                    log.warning(
                         "%d shops refused us within %.0fs — Shopify has blocked this IP "
                         "platform-wide. Going slower does not lift it, so the rest of the "
                         "Shopify sweep is being abandoned; it will retry on the next run.",

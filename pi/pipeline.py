@@ -161,7 +161,11 @@ def _record_block(conn: sqlite3.Connection, run_id: int, limiter) -> None:
     """
     if limiter.abandoned:
         conn.execute("UPDATE runs SET blocked = 1 WHERE id = ?", (run_id,))
-        log.error(
+        # Warning rather than error, for the same reason as the block itself: the
+        # run is recorded as blocked, the next one adapts its budget from that,
+        # and the skipped shops are collected then. Degradation that actually
+        # needs a person is reported separately by `degradation_notice`.
+        log.warning(
             "Shopify blocked this IP part-way through; %d store(s) waited it out and "
             "were skipped, and will be collected on the next run", limiter.abandoned,
         )
