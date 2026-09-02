@@ -59,6 +59,18 @@ def _list(query: dict, name: str) -> list[str]:
     return out
 
 
+def _float(query: dict, name: str) -> float | None:
+    """An optional number. An unreadable one is no opinion, not zero."""
+    raw = (query.get(name, [""])[0] or "").strip().replace(",", ".")
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        return None
+    return value if value >= 0 else None
+
+
 def _int(query: dict, name: str, default: int, low: int, high: int) -> int:
     try:
         value = int(query.get(name, [default])[0])
@@ -81,6 +93,9 @@ def read_query(raw: str) -> dict:
         "sizes": [s.upper() for s in _list(query, "size")],
         "brands": _list(query, "brand"),
         "search": (query.get("q", [""])[0] or "").strip(),
+        "min_price": _float(query, "min_price"),
+        "max_price": _float(query, "max_price"),
+        "min_discount": _float(query, "min_discount"),
         "sort": sort if sort in SORTS else DEFAULT_SORT,
         "limit": _int(query, "limit", PAGE_SIZE, 1, MAX_PAGE_SIZE),
         "page": _int(query, "page", 0, 0, 10_000),
@@ -180,6 +195,9 @@ def shelf_page(conn: sqlite3.Connection, args: dict) -> dict:
         offset=args["page"] * args["limit"],
         order_by=SORTS[args["sort"]],
         search=args["search"] or None,
+        min_price=args["min_price"],
+        max_price=args["max_price"],
+        min_discount=args["min_discount"],
     )
     return {
         "total": total,
