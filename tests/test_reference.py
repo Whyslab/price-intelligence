@@ -266,6 +266,51 @@ class TestMarketIndex:
         assert market.msrp_usd == pytest.approx(200.0, abs=1)
 
 
+class TestAShopDroppedForItsPriceIsDroppedForItsTag:
+    """A shop rejected as not holding this article is rejected once, not twice.
+
+    `agreeing_prices` drops a shop asking $3,824 where others ask $60 because it
+    is describing something else. Its struck-through price is then a claim about
+    that something else, and letting it vote on the recommended price reads the
+    same rejected evidence a second time — which matters because the MSRP is
+    what disqualifies an inflated tag, and 90% of the shelf is priced off tags.
+    """
+
+    _stock = TestMarketIndex._stock
+
+    def test_a_rejected_shop_does_not_vote_on_the_recommended_price(self, conn):
+        mine = self._stock(conn, "mine.example", "CW2288-111", 140.0, compare=400.0)
+        for n, price in enumerate((100.0, 105.0, 110.0)):
+            self._stock(conn, f"real{n}.example", "CW2288-111", price, compare=200.0 + n * 5)
+        for n, price in enumerate((3800.0, 3850.0)):
+            self._stock(conn, f"junk{n}.example", "CW2288-111", price, compare=450.0 + n * 5)
+
+        market = reference.build_market_index(conn).look_up(mine, "mine.example")
+        assert market.shops == 3, "the two disagreeing shops are not the market"
+        assert market.msrp_shops == 3, "and they do not carry the recommended price either"
+        assert market.msrp_usd == pytest.approx(205.0, abs=5), "the real shops' tags, not $450"
+
+    def test_the_count_and_the_price_agree_on_who_is_in(self, conn):
+        """Whatever else is true, no more shops may speak about the tag than
+        about the price."""
+        mine = self._stock(conn, "mine.example", "CW2288-111", 140.0)
+        for n, price in enumerate((100.0, 105.0, 110.0, 3800.0, 3850.0, 3900.0)):
+            self._stock(conn, f"other{n}.example", "CW2288-111", price, compare=price * 1.4)
+
+        market = reference.build_market_index(conn).look_up(mine, "mine.example")
+        assert market.msrp_shops <= market.shops
+
+    def test_shops_that_all_agree_are_all_still_heard(self, conn):
+        """The guard must not silence the signal it is guarding."""
+        mine = self._stock(conn, "mine.example", "CW2288-111", 140.0)
+        for n in range(4):
+            self._stock(conn, f"other{n}.example", "CW2288-111", 180.0, compare=200.0)
+
+        market = reference.build_market_index(conn).look_up(mine, "mine.example")
+        assert market.shops == 4 and market.msrp_shops == 4
+        assert market.msrp_usd == pytest.approx(200.0, abs=1)
+
+
 class TestStoreTrust:
     """Telling a shop that remembers former prices from one that computes them."""
 
