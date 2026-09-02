@@ -17,6 +17,12 @@ SCHEMA_VERSION = 10
 SCHEMA_SQL = Path(__file__).with_name("schema.sql")
 
 
+# How much write-ahead log to keep on disk between checkpoints. Big enough that
+# a sweep writing a hundred thousand price points never has to stop and wait for
+# one, small enough that it is not the largest thing in the data directory.
+WAL_SIZE_LIMIT = 64 * 1024 * 1024
+
+
 def utcnow() -> str:
     """Timestamp in the single format the whole project stores and compares."""
     return datetime.now(UTC).isoformat(timespec="seconds")
@@ -31,6 +37,12 @@ def connect(path: Path | str) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA synchronous = NORMAL")
     conn.execute("PRAGMA foreign_keys = ON")
+    # A checkpoint moves the journal into the database but leaves the file at
+    # whatever size it reached, and nothing here ever shrinks it: the write-ahead
+    # log had grown to 1,061 MB beside a 1,492 MB database, every byte of it
+    # already checkpointed and none of it needed. With a limit set, each
+    # checkpoint truncates the file back down to it.
+    conn.execute(f"PRAGMA journal_size_limit = {WAL_SIZE_LIMIT}")
     migrate(conn)
     return conn
 

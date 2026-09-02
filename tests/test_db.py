@@ -357,3 +357,22 @@ class TestRecordingWhatIsOnOffer:
         written, withdrawn = dbm.record_offers(conn, [variant], [], ts())
         assert (written, withdrawn) == (0, 1)
         assert conn.execute("SELECT COUNT(*) FROM offers").fetchone()[0] == 0
+
+
+class TestTheWriteAheadLogIsBounded:
+    """A checkpoint moves the journal into the database and leaves the file the
+    size it grew to. On the live database that was 1,061 MB of already-written
+    log beside a 1,492 MB database — a gigabyte of disk holding nothing."""
+
+    def test_a_connection_caps_how_much_journal_stays_on_disk(self, conn):
+        limit = conn.execute("PRAGMA journal_size_limit").fetchone()[0]
+        assert limit == dbm.WAL_SIZE_LIMIT
+
+    def test_the_limit_leaves_room_for_a_sweep_to_write(self):
+        """Small enough not to dominate the data directory, big enough that a
+        run writing a hundred thousand price points does not stall on it."""
+        assert 16 * 1024 * 1024 <= dbm.WAL_SIZE_LIMIT <= 256 * 1024 * 1024
+
+    def test_the_journal_is_still_a_write_ahead_log(self, conn):
+        """The limit must not have cost the mode it exists to bound."""
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
