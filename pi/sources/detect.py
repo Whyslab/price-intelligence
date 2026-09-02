@@ -28,7 +28,7 @@ import httpx
 from ..db import upsert_store, utcnow
 from ..throttle import NullLimiter, RateLimiter
 from ..tls import context_with, repair
-from . import impersonate, jsonld, shopify
+from . import asos, impersonate, jsonld, shopify
 
 log = logging.getLogger(__name__)
 
@@ -37,7 +37,7 @@ BLOCKED_CODES = {202, 401, 402, 403, 405, 406, 423, 429, 503}
 # Failures that say "not right now" rather than "not ever". These never replace
 # a platform we have already seen working.
 TRANSIENT_CODES = {429, 503}
-WORKING = ("shopify", "jsonld")
+WORKING = ("shopify", "jsonld", "asos")
 # How many candidate product pages a probe may open before giving up on a shop.
 PRODUCT_PROBE_PAGES = 3
 
@@ -53,6 +53,18 @@ async def probe(
     limiter = limiter or NullLimiter()
     base = f"https://{domain}".rstrip("/")
     out: dict = {"platform": "unknown", "currency": None, "name": None, "country": None}
+
+    # 0. A shop we have written an adapter for by hand. Asked first because the
+    # generic tests answer the wrong question about it: ASOS publishes no
+    # schema.org markup and no /products.json, so every generic verdict about
+    # it is "unreadable", while its own catalogue API answers perfectly well.
+    # Confirmed rather than asserted — a hand-written adapter that has stopped
+    # working should show up as a shop that stopped working, not as one that is
+    # fine.
+    if asos.handles(domain):
+        verdict = await asos.probe(client, domain)
+        if verdict is not None:
+            return {**out, **verdict}
 
     # 1. Shopify? The catalogue endpoint is the definitive test.
     try:
@@ -170,8 +182,16 @@ async def _probe_as_a_browser(
             timeout=client.timeout.read or 30.0, headers=dict(client.headers)
         ) as browser:
             verdict = await probe(browser, domain, limiter, ca_cache, allow_impersonation=False)
-    except Exception as exc:  # a shim over a C library; never take the run down
+    except httpx.HTTPError as exc:  # the shop refused us; ordinary and expected
         log.debug("%s: impersonated probe failed (%s)", domain, exc)
+        return None
+    except Exception as exc:  # a shim over a C library; never take the run down
+        # Anything that is not a network error is a fault in our own code, and
+        # for a while this line hid one: the impersonating client's `get` took
+        # no per-request headers, so the ASOS adapter raised TypeError here and
+        # the shop was recorded as "blocked" — a verdict about ASOS that was
+        # really a verdict about us.
+        log.warning("%s: impersonated probe raised %s: %s", domain, type(exc).__name__, exc)
         return None
     if verdict["platform"] not in WORKING:
         return None

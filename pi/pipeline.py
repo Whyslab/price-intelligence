@@ -21,7 +21,7 @@ from .config import Config
 from .domains import same_shop
 from .fx import Rates, load_rates
 from .notify import Telegram, format_caption
-from .sources import impersonate, jsonld, shopify
+from .sources import asos, impersonate, jsonld, shopify
 from .sources.base import FetchResult
 from .throttle import RateLimiter
 
@@ -242,6 +242,11 @@ async def collect_store(
         return await jsonld.fetch(
             client, store["domain"], store["currency"],
             budget=jsonld_budget, cursor=store["sitemap_cursor"],
+        )
+    if platform == "asos":
+        return await asos.fetch(
+            client, store["domain"], store["currency"],
+            cursor=store["sitemap_cursor"],
         )
     return FetchResult(domain=store["domain"], error=f"no adapter for platform {platform!r}")
 
@@ -709,7 +714,7 @@ async def run(
     if not rescan and _last_run_was_capped(conn):
         log.info("the previous run hit its alert cap — scoring everything this time")
         rescan = True
-    stores = dbm.get_stores(conn, platforms=("shopify", "jsonld"), domains=domains)
+    stores = dbm.get_stores(conn, platforms=("shopify", "jsonld", "asos"), domains=domains)
     # Naming stores explicitly is a deliberate act, so it skips both the queue
     # and the budget: `--stores` means these, now. The budget is still recorded,
     # because the next run adapts from the last recorded one and a hand-run
@@ -764,6 +769,9 @@ async def run(
     pools = {
         "shopify": asyncio.Semaphore(config.concurrency),
         "jsonld": asyncio.Semaphore(max(2, config.concurrency // 2)),
+        # One shop, read sequentially by its own adapter: a pool of one keeps
+        # its forty requests from arriving as forty at once.
+        "asos": asyncio.Semaphore(1),
     }
     limiter = RateLimiter(rate=config.shopify_rate, per_host_rate=config.shopify_host_rate)
     changed: list[int] = []
@@ -1120,7 +1128,7 @@ def health_report(conn: sqlite3.Connection) -> str:
     broken = conn.execute(
         """
         SELECT domain, last_error FROM stores
-        WHERE status = 'error' AND platform IN ('shopify', 'jsonld')
+        WHERE status = 'error' AND platform IN ('shopify', 'jsonld', 'asos')
         ORDER BY domain LIMIT 10
         """
     ).fetchall()
@@ -1152,6 +1160,7 @@ def health_report(conn: sqlite3.Connection) -> str:
     labels = {
         "shopify": "Shopify (полный API)",
         "jsonld": "schema.org (по карточкам)",
+        "asos": "собственный API магазина",
         "blocked": "закрыты анти-ботом",
         "tls": "битый TLS-сертификат",
         "dead": "не отвечают",
