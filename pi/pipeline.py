@@ -497,6 +497,16 @@ def _one_alert_per_article(
     return kept
 
 
+# What a find has to save before it is worth putting on a shelf somebody chose
+# to open. `min_saving_usd` is an interruption threshold: it stops a $4 saving
+# arriving as a Telegram notification, which is the right call for a message
+# and the wrong one for a page. Measured: at $40 the shelf can draw on 123,737
+# discounted variants, at $10 on 163,667 — a third more, almost all of it
+# clothing under $40 that is genuinely a third off. ASOS is the extreme case,
+# where exactly one variant in 15,855 clears both $40 and 30%.
+SHELF_MIN_SAVING_USD = 10.0
+
+
 def shelf_config(config: Config) -> Config:
     """The same thresholds, with the personal filters taken back out.
 
@@ -511,7 +521,11 @@ def shelf_config(config: Config) -> Config:
     """
     return replace(
         config,
-        filters=replace(config.filters, sizes=(), brands_allow=(), brands_deny=()),
+        filters=replace(
+            config.filters,
+            sizes=(), brands_allow=(), brands_deny=(),
+            min_saving_usd=min(config.filters.min_saving_usd, SHELF_MIN_SAVING_USD),
+        ),
     )
 
 

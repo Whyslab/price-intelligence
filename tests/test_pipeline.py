@@ -1180,3 +1180,26 @@ class TestAPriceThatCannotBeAPrice:
         assert written == 40, "the impossible one is dropped, the other forty are kept"
         highest = conn.execute("SELECT MAX(price_native) FROM price_points").fetchone()[0]
         assert highest == 100.0
+
+
+class TestWhatBelongsOnAShelfButNotInAMessage:
+    """A notification interrupts somebody; a page they opened does not."""
+
+    def _with_saving(self, config, saving):
+        return replace(
+            config, filters=replace(config.filters, min_saving_usd=saving, sizes=("L",))
+        )
+
+    def test_the_shelf_asks_less_of_a_saving_than_an_alert_does(self, config):
+        shelf = pipeline.shelf_config(self._with_saving(config, 40.0))
+        assert shelf.filters.min_saving_usd == pipeline.SHELF_MIN_SAVING_USD
+        assert shelf.filters.min_saving_usd < 40.0
+
+    def test_a_stricter_setting_of_your_own_is_not_overruled(self, config):
+        """Somebody who asked for $5 gets $5, not the shelf's $10."""
+        shelf = pipeline.shelf_config(self._with_saving(config, 5.0))
+        assert shelf.filters.min_saving_usd == 5.0
+
+    def test_the_discount_threshold_is_not_touched(self, config):
+        shelf = pipeline.shelf_config(self._with_saving(config, 40.0))
+        assert shelf.filters.min_discount_pct == config.filters.min_discount_pct
