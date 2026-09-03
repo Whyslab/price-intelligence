@@ -850,9 +850,7 @@ async def run(
                 # A handful of shops answer only a browser's TLS fingerprint.
                 # They get their own client; everyone else shares the pooled one.
                 if store["impersonate"] and impersonate.available():
-                    async with impersonate.ImpersonatingClient(
-                        timeout=30.0, headers=HEADERS
-                    ) as browser:
+                    async with impersonate.ImpersonatingClient(timeout=30.0) as browser:
                         return store, await collect_store(
                             browser, store, jsonld_budget, limiter
                         )

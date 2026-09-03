@@ -61,11 +61,24 @@ class ImpersonatingClient:
     is a shim that cannot drift away from what it is imitating.
     """
 
-    def __init__(self, timeout: float = 30.0, headers: dict[str, str] | None = None):
+    def __init__(self, timeout: float = 30.0):
+        """No default headers, on purpose.
+
+        curl_cffi sends the complete, self-consistent header set of the browser
+        it is imitating, and every header handed in from outside contradicts it
+        somewhere: this project's User-Agent claims Chrome 120 on Linux while
+        the handshake is a newer Chrome, and httpx's own defaults announce
+        `connection: keep-alive` and an Accept-Encoding no browser sends.
+        Measured against www.mrporter.com, which is the whole point of this
+        class: bare, 200; with our User-Agent, 403. A borrowed fingerprint
+        under a borrowed name is a louder signal than either alone.
+
+        Headers a single request genuinely needs — the Accept and Referer an
+        adapter sends to a shop's own JSON API — still go through `get`.
+        """
         if _cffi is None:  # pragma: no cover - guarded by available()
             raise RuntimeError("curl_cffi is not installed")
         self.timeout = timeout
-        self.headers = httpx.Headers(headers or {})
         self._session = _cffi.AsyncSession(
             impersonate=BROWSER, timeout=timeout, verify=True
         )
@@ -85,7 +98,7 @@ class ImpersonatingClient:
         follow_redirects: bool = True,
         headers: dict[str, str] | None = None,
     ) -> httpx.Response:
-        """`headers` are merged over the session's, the way httpx merges them.
+        """`headers` travel with this one request, on top of the browser's own.
 
         An adapter that asks a shop's own JSON API has to send a Referer and an
         Accept with the request — httpx takes those per call, so a shim that
@@ -93,11 +106,9 @@ class ImpersonatingClient:
         of. It failed as a TypeError inside a probe that catches everything, so
         ASOS came back classified "blocked" with nothing in the log to say why.
         """
-        merged = httpx.Headers(self.headers)
-        merged.update(headers or {})
         try:
             resp = await self._session.get(
-                str(url), allow_redirects=follow_redirects, headers=dict(merged)
+                str(url), allow_redirects=follow_redirects, headers=dict(headers or {})
             )
         except Exception as exc:  # curl_cffi raises its own hierarchy
             # Every caller in pi.sources catches httpx.HTTPError. Translating

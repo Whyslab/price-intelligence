@@ -61,26 +61,35 @@ class TestPerRequestHeaders:
     """
 
     async def test_a_call_may_add_headers_of_its_own(self):
-        client = impersonate.ImpersonatingClient(headers={"User-Agent": "pi"})
+        client = impersonate.ImpersonatingClient()
         client._session = _Recorder()
 
         await client.get("https://shop.example/api", headers={"Referer": "https://shop.example/"})
 
-        # httpx.Headers normalises names to lower case, which is what HTTP/2
-        # puts on the wire anyway.
-        assert client._session.seen["referer"] == "https://shop.example/"
-        assert client._session.seen["user-agent"] == "pi", (
-            "the headers the client was built with were being dropped entirely: "
-            "__init__ stored them and nothing ever read them again"
-        )
+        assert client._session.seen["Referer"] == "https://shop.example/"
 
-    async def test_a_call_may_override_a_session_header(self):
-        client = impersonate.ImpersonatingClient(headers={"Accept": "text/html"})
+
+class TestWhoseHeadersTheyAre:
+    """A borrowed fingerprint under a borrowed name is worse than either alone."""
+
+    def test_it_cannot_be_handed_a_set_of_default_headers(self):
+        """Measured on www.mrporter.com: bare 200, with this project's UA 403.
+
+        httpx's own defaults are no safer — `connection: keep-alive` and an
+        Accept-Encoding no browser sends. The class simply does not take them.
+        """
+        import inspect
+
+        signature = inspect.signature(impersonate.ImpersonatingClient.__init__)
+        assert "headers" not in signature.parameters
+
+    async def test_nothing_is_added_to_a_request_that_asked_for_nothing(self):
+        client = impersonate.ImpersonatingClient()
         client._session = _Recorder()
 
-        await client.get("https://shop.example/api", headers={"Accept": "application/json"})
+        await client.get("https://shop.example/")
 
-        assert client._session.seen["accept"] == "application/json"
+        assert client._session.seen == {}, "curl_cffi's own browser headers stand alone"
 
 
 class _Recorder:

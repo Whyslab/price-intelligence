@@ -188,7 +188,6 @@ async def _probe_as_a_browser(
             # inherited from the sweep recorded them as domains that never
             # answer. They answer; what they do not publish is a price.
             timeout=max(client.timeout.read or 0.0, BROWSER_PROBE_TIMEOUT),
-            headers=dict(client.headers),
         ) as browser:
             verdict = await probe(browser, domain, limiter, ca_cache, allow_impersonation=False)
     except httpx.HTTPError as exc:  # the shop refused us; ordinary and expected
