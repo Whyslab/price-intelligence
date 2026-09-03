@@ -40,8 +40,18 @@ MAX_PAGE_SIZE = 200
 
 # Which orderings the page may ask for, and what each means in SQL. A map
 # rather than a string from the query: the value lands in an ORDER BY.
+# The default takes each shop's best find before anyone's second best. Without
+# it one shop owns the whole first screen: www.freshmansarchive.com lists the
+# same vintage blazer in eight sizes at −90%, all scored alike, and a page of
+# eight identical blazers is a worse answer than eight different shops even
+# when every one of the claims is true. The other sorts stay literal — "по
+# скидке" is asked precisely when the deepest cut is the whole question.
+BY_SHOP_THEN_SCORE = (
+    "ROW_NUMBER() OVER (PARTITION BY p.store_id ORDER BY o.score DESC, o.discount_pct DESC), "
+    "o.score DESC, o.discount_pct DESC"
+)
 SORTS = {
-    "score": "o.score DESC, o.discount_pct DESC",
+    "score": BY_SHOP_THEN_SCORE,
     "discount": "o.discount_pct DESC, o.score DESC",
     "saving": "o.saving_usd DESC",
     "cheapest": "o.price_usd ASC",

@@ -333,3 +333,30 @@ class TestTheMarketIsBelievedAtOneStrength:
         deal = deals.evaluate(1, 1, 120.0, None, True, history, filters, market=market)
         assert deal is not None
         assert deal.beats_market, "under the lowest of six shops"
+
+
+class TestAClaimNobodyCanMake:
+    """A reference that says the price fell 95% is not describing a sale."""
+
+    def test_a_tag_claiming_a_ninety_seven_percent_cut_is_refused(self):
+        """Live: a $40 vintage fleece marked down from $1,420, top of the shelf.
+
+        The shop does not price by rule and has no recommended price to be
+        inflated against, so every existing test on the tag passes it.
+        """
+        deal = _evaluate(price=40.59, compare_at=1420.76)
+        assert deal is None
+
+    def test_an_ordinary_deep_cut_still_counts(self):
+        deal = _evaluate(price=40.0, compare_at=200.0)
+        assert deal is not None
+        assert deal.discount_pct == pytest.approx(80.0)
+
+
+def _evaluate(price, compare_at):
+    history = make_history([(price, compare_at, 0)])
+    return deals.evaluate(
+        variant_id=1, product_id=1, price_usd=price, compare_at_usd=compare_at,
+        in_stock=True, history=history,
+        filters=Filters(min_discount_pct=30.0, min_saving_usd=10.0),
+    )

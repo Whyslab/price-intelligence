@@ -1128,3 +1128,78 @@ class TestTheJournalKeepsErrorsForThingsThatNeedSomebody:
         assert conn.execute(
             "SELECT blocked FROM runs WHERE id = ?", (run_id,)
         ).fetchone()[0] == 1
+
+
+class TestAPriceThatCannotBeAPrice:
+    """One shop published t-shirts at 333,085,723 and the shelf believed it."""
+
+    def _catalogue(self, prices, currency=None):
+        from pi.sources.base import ScrapedProduct, ScrapedVariant
+
+        return [
+            ScrapedProduct(
+                external_id=f"p{i}", title=f"Thing {i}", url=f"https://s.example/{i}",
+                currency=currency,
+                variants=[ScrapedVariant(external_id=f"v{i}", price=price)],
+            )
+            for i, price in enumerate(prices)
+        ]
+
+    def test_a_figure_a_thousand_times_the_shop_is_not_a_price(self):
+        products = self._catalogue([100.0] * 40 + [333_085_723.0])
+        ceilings = pipeline.price_ceilings(products)
+        assert ceilings[""] == 100.0 * pipeline.IMPOSSIBLE_MULTIPLE
+        assert ceilings[""] < 333_085_723.0
+
+    def test_an_expensive_shop_is_measured_against_itself(self):
+        """A €125,000 handbag at a shop whose median is €299 must survive."""
+        products = self._catalogue([299.0] * 40 + [125_000.0])
+        assert pipeline.price_ceilings(products)[""] >= 125_000.0
+
+    def test_too_small_a_catalogue_says_nothing_about_what_is_normal(self):
+        assert pipeline.price_ceilings(self._catalogue([100.0] * 5)) == {}
+
+    def test_each_currency_is_judged_on_its_own_scale(self):
+        products = self._catalogue([100.0] * 25, currency="USD")
+        products += self._catalogue([1_200_000.0] * 25, currency="KRW")
+        ceilings = pipeline.price_ceilings(products)
+        assert ceilings["USD"] < ceilings["KRW"], (
+            "a shop quoting won must not be capped at a dollar shop's ceiling"
+        )
+
+    def test_the_impossible_variant_never_reaches_the_database(self, conn):
+        store_id = dbm.upsert_store(conn, "shop.example", platform="shopify", currency="USD")
+        rates = Rates({"USD": 1.0}, fetched_at=datetime.now(UTC), source="test")
+        result = FetchResult(
+            domain="shop.example", currency="USD",
+            products=self._catalogue([100.0] * 40 + [333_085_723.0]),
+        )
+
+        written, _, _ = pipeline.store_result(conn, store_id, result, rates)
+
+        assert written == 40, "the impossible one is dropped, the other forty are kept"
+        highest = conn.execute("SELECT MAX(price_native) FROM price_points").fetchone()[0]
+        assert highest == 100.0
+
+
+class TestWhatBelongsOnAShelfButNotInAMessage:
+    """A notification interrupts somebody; a page they opened does not."""
+
+    def _with_saving(self, config, saving):
+        return replace(
+            config, filters=replace(config.filters, min_saving_usd=saving, sizes=("L",))
+        )
+
+    def test_the_shelf_asks_less_of_a_saving_than_an_alert_does(self, config):
+        shelf = pipeline.shelf_config(self._with_saving(config, 40.0))
+        assert shelf.filters.min_saving_usd == pipeline.SHELF_MIN_SAVING_USD
+        assert shelf.filters.min_saving_usd < 40.0
+
+    def test_a_stricter_setting_of_your_own_is_not_overruled(self, config):
+        """Somebody who asked for $5 gets $5, not the shelf's $10."""
+        shelf = pipeline.shelf_config(self._with_saving(config, 5.0))
+        assert shelf.filters.min_saving_usd == 5.0
+
+    def test_the_discount_threshold_is_not_touched(self, config):
+        shelf = pipeline.shelf_config(self._with_saving(config, 40.0))
+        assert shelf.filters.min_discount_pct == config.filters.min_discount_pct

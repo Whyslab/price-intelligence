@@ -350,3 +350,52 @@ class TestWhatTheControlsAreBuiltFrom:
 
     def test_no_reader_yet_is_not_an_error(self, conn):
         assert dbm.shelf_facets(conn)["mine"] == {}
+
+
+def _offer(conn, store_id, key, price, discount, score=None):
+    """One offer in a named shop, scored by how deep its cut is."""
+    product = dbm.upsert_product(
+        conn, store_id, key, f"Thing {key}", f"https://x.example/{key}"
+    )
+    variant = dbm.upsert_variant(conn, product, f"v-{key}")
+    conn.execute(
+        """
+        INSERT INTO offers (variant_id, product_id, found_at, checked_at,
+                            price_usd, reference_usd, reference_source,
+                            discount_pct, saving_usd, score, all_time_low)
+        VALUES (?, ?, ?, ?, ?, ?, 'tag', ?, ?, ?, 0)
+        """,
+        (variant, product, ts(1), ts(0), price, price * 2, discount, price,
+         score if score is not None else discount),
+    )
+
+
+class TestWhoseFindGoesFirst:
+    """One shop must not own the whole first screen of the shelf.
+
+    Live: www.freshmansarchive.com lists the same vintage blazer in eight sizes
+    at −90%, all scored alike, and they filled the top of the page.
+    """
+
+    def test_the_default_sort_takes_each_shop_in_turn(self, conn):
+        loud = dbm.upsert_store(conn, "loud.example", platform="shopify", currency="USD")
+        quiet = dbm.upsert_store(conn, "quiet.example", platform="shopify", currency="USD")
+        for n in range(4):
+            _offer(conn, loud, f"loud{n}", price=100.0, discount=90.0 - n)
+        _offer(conn, quiet, "quiet0", price=100.0, discount=40.0)
+
+        rows, _ = dbm.offers_for(conn, limit=2, order_by=web.SORTS["score"])
+
+        shops = [row["domain"] for row in rows]
+        assert shops == ["loud.example", "quiet.example"], shops
+
+    def test_asking_for_the_deepest_cut_still_answers_literally(self, conn):
+        loud = dbm.upsert_store(conn, "loud.example", platform="shopify", currency="USD")
+        quiet = dbm.upsert_store(conn, "quiet.example", platform="shopify", currency="USD")
+        _offer(conn, loud, "a", price=100.0, discount=95.0)
+        _offer(conn, loud, "b", price=100.0, discount=94.0)
+        _offer(conn, quiet, "c", price=100.0, discount=10.0)
+
+        rows, _ = dbm.offers_for(conn, limit=2, order_by=web.SORTS["discount"])
+
+        assert [row["domain"] for row in rows] == ["loud.example", "loud.example"]

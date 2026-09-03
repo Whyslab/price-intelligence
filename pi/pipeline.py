@@ -21,7 +21,7 @@ from .config import Config
 from .domains import same_shop
 from .fx import Rates, load_rates
 from .notify import Telegram, format_caption
-from .sources import impersonate, jsonld, shopify
+from .sources import asos, impersonate, jsonld, shopify
 from .sources.base import FetchResult
 from .throttle import RateLimiter
 
@@ -243,7 +243,43 @@ async def collect_store(
             client, store["domain"], store["currency"],
             budget=jsonld_budget, cursor=store["sitemap_cursor"],
         )
+    if platform == "asos":
+        return await asos.fetch(
+            client, store["domain"], store["currency"],
+            cursor=store["sitemap_cursor"],
+        )
     return FetchResult(domain=store["domain"], error=f"no adapter for platform {platform!r}")
+
+
+# A figure this far above everything else the same shop quotes is not a price.
+# Measured on the live catalogue: www.stadiumgoods.com published a run of
+# t-shirts at 333,085,723 — 165,000 times its own median — and because that was
+# the only earlier point those variants had, it became their 30-day floor. The
+# shelf then offered a $151 shirt at −100% off $35,684,060, seven such tiles in
+# the first screen. 1000× is deliberately far past anything a shop really sells:
+# it rejects the 105 impossible points in the database and keeps a €125,000
+# handbag at a shop whose median is €299.
+IMPOSSIBLE_MULTIPLE = 1000
+
+
+def price_ceilings(products: list) -> dict[str, float]:
+    """Per currency, the figure above which a number cannot be a price here.
+
+    Taken from the fetch itself rather than from the database, because it has
+    to hold on a shop's very first pass — that is when the poison arrives, and
+    a shop with no history has nothing to compare against yet.
+    """
+    seen: dict[str, list[float]] = {}
+    for product in products:
+        currency = (product.currency or "").upper()
+        for variant in product.variants:
+            if variant.price > 0:
+                seen.setdefault(currency, []).append(variant.price)
+    return {
+        currency: statistics.median(prices) * IMPOSSIBLE_MULTIPLE
+        for currency, prices in seen.items()
+        if len(prices) >= 20  # too few to say what this shop's prices look like
+    }
 
 
 def store_result(
@@ -261,6 +297,10 @@ def store_result(
     touched: list[int] = []
     fallback = (result.currency or "USD").upper()
     ts = dbm.utcnow()
+    # Keyed the way the products are: a product that names no currency of its
+    # own is measured against the rest of the shop, which is the same bucket.
+    ceilings = price_ceilings(result.products)
+    impossible = 0
 
     for product in result.products:
         # A product that named its own currency is priced in that one. Only a
@@ -280,7 +320,11 @@ def store_result(
                 product.brand, product.title, [v.sku for v in product.variants]
             ),
         )
+        ceiling = ceilings.get((product.currency or "").upper())
         for variant in product.variants:
+            if ceiling is not None and variant.price > ceiling:
+                impossible += 1
+                continue
             converted = rates.to_usd(variant.price, currency)
             if converted is None:
                 continue  # unknown currency: drop the price rather than invent one
@@ -301,6 +345,11 @@ def store_result(
             ):
                 written += 1
                 changed.append(variant_id)
+    if impossible:
+        log.warning(
+            "%d price(s) discarded as impossible — more than %d times what this "
+            "shop usually charges", impossible, IMPOSSIBLE_MULTIPLE,
+        )
     return written, changed, touched
 
 
@@ -448,6 +497,16 @@ def _one_alert_per_article(
     return kept
 
 
+# What a find has to save before it is worth putting on a shelf somebody chose
+# to open. `min_saving_usd` is an interruption threshold: it stops a $4 saving
+# arriving as a Telegram notification, which is the right call for a message
+# and the wrong one for a page. Measured: at $40 the shelf can draw on 123,737
+# discounted variants, at $10 on 163,667 — a third more, almost all of it
+# clothing under $40 that is genuinely a third off. ASOS is the extreme case,
+# where exactly one variant in 15,855 clears both $40 and 30%.
+SHELF_MIN_SAVING_USD = 10.0
+
+
 def shelf_config(config: Config) -> Config:
     """The same thresholds, with the personal filters taken back out.
 
@@ -462,7 +521,11 @@ def shelf_config(config: Config) -> Config:
     """
     return replace(
         config,
-        filters=replace(config.filters, sizes=(), brands_allow=(), brands_deny=()),
+        filters=replace(
+            config.filters,
+            sizes=(), brands_allow=(), brands_deny=(),
+            min_saving_usd=min(config.filters.min_saving_usd, SHELF_MIN_SAVING_USD),
+        ),
     )
 
 
@@ -709,7 +772,7 @@ async def run(
     if not rescan and _last_run_was_capped(conn):
         log.info("the previous run hit its alert cap — scoring everything this time")
         rescan = True
-    stores = dbm.get_stores(conn, platforms=("shopify", "jsonld"), domains=domains)
+    stores = dbm.get_stores(conn, platforms=("shopify", "jsonld", "asos"), domains=domains)
     # Naming stores explicitly is a deliberate act, so it skips both the queue
     # and the budget: `--stores` means these, now. The budget is still recorded,
     # because the next run adapts from the last recorded one and a hand-run
@@ -764,6 +827,9 @@ async def run(
     pools = {
         "shopify": asyncio.Semaphore(config.concurrency),
         "jsonld": asyncio.Semaphore(max(2, config.concurrency // 2)),
+        # One shop, read sequentially by its own adapter: a pool of one keeps
+        # its forty requests from arriving as forty at once.
+        "asos": asyncio.Semaphore(1),
     }
     limiter = RateLimiter(rate=config.shopify_rate, per_host_rate=config.shopify_host_rate)
     changed: list[int] = []
@@ -784,9 +850,7 @@ async def run(
                 # A handful of shops answer only a browser's TLS fingerprint.
                 # They get their own client; everyone else shares the pooled one.
                 if store["impersonate"] and impersonate.available():
-                    async with impersonate.ImpersonatingClient(
-                        timeout=30.0, headers=HEADERS
-                    ) as browser:
+                    async with impersonate.ImpersonatingClient(timeout=30.0) as browser:
                         return store, await collect_store(
                             browser, store, jsonld_budget, limiter
                         )
@@ -1120,7 +1184,7 @@ def health_report(conn: sqlite3.Connection) -> str:
     broken = conn.execute(
         """
         SELECT domain, last_error FROM stores
-        WHERE status = 'error' AND platform IN ('shopify', 'jsonld')
+        WHERE status = 'error' AND platform IN ('shopify', 'jsonld', 'asos')
         ORDER BY domain LIMIT 10
         """
     ).fetchall()
@@ -1152,6 +1216,7 @@ def health_report(conn: sqlite3.Connection) -> str:
     labels = {
         "shopify": "Shopify (полный API)",
         "jsonld": "schema.org (по карточкам)",
+        "asos": "собственный API магазина",
         "blocked": "закрыты анти-ботом",
         "tls": "битый TLS-сертификат",
         "dead": "не отвечают",

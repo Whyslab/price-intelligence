@@ -374,6 +374,10 @@ www.ln-cc.com
 # --- добавлено 29.08.2026, проба показала, что читать нечего ---
 # www.amazon.com, www.nordstromrack.com — страниц товаров не найти ни в карте сайта, ни обходом
 # www.jomashop.com — цена рисуется джаваскриптом, в HTML её нет
-# www.asos.com, www.mrporter.com, www.revolve.com — не отвечают вовсе, таймаут
+# www.mrporter.com, www.revolve.com — не отвечают вовсе, таймаут
+# www.asos.com — читается с 02.09.2026 собственным адаптером (pi/sources/asos.py):
+#   ни /products.json, ни schema.org, но её каталог отдаётся по
+#   /api/product/search/v2/categories/{id}. Собираются только разделы
+#   распродажи, около 26 000 товаров.
 # www.joesnewbalanceoutlet.com, www.zalando.de — HTTP 403
 # oneblockdown.com — тот же каталог, что уже собирается с it.oneblockdown.it

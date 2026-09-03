@@ -297,6 +297,10 @@ class MarketIndex:
 # full price, and a reference that rejected that would reject most of the
 # market. What it does reject is $61 against $3,824.
 MAX_SPREAD = 4.0
+# The largest fall from a shop's own earlier price that can be believed. The
+# live shelf's history-sourced references stop at 6× and then jump straight to
+# 87,000×, so there is nothing real in between to lose.
+MAX_DROP = 20.0
 
 
 def agreeing_prices(prices: list[float]) -> list[float]:
@@ -503,6 +507,14 @@ def prior_floor(
             continue  # this price had already been replaced before the window
         lowest = row["price_native"] if lowest is None else min(lowest, row["price_native"])
     if lowest is None:
+        return None
+    if lowest > price * MAX_DROP:
+        # No shop cuts a price by 95%. A ratio like that says the earlier
+        # figure was never a price: topshelfslc.com records 99,999 against a
+        # median of 190, a placeholder that survives the ingestion ceiling
+        # because it is not absurd enough relative to the shop. Believing it
+        # would put the item on the shelf at −100%, which is the one number on
+        # a shelf that is always wrong.
         return None
 
     covered_from = max(window_start, _parse(history[0]["ts"]))
