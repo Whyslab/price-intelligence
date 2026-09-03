@@ -36,6 +36,25 @@ def _a_browser_would_see(html: str):
     return lambda **kwargs: Browser()
 
 
+def _a_browser_would_not_reach_it_either():
+    """The impersonating client for a domain that is genuinely gone."""
+
+    class Browser:
+        headers = httpx.Headers({})
+        timeout = httpx.Timeout(30.0)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return None
+
+        async def get(self, url, follow_redirects: bool = True, headers=None):
+            raise httpx.ConnectError("no such host")
+
+    return lambda **kwargs: Browser()
+
+
 PRODUCT_PAGE = """
 <html><head><script type="application/ld+json">
 {"@type": "Product", "name": "Shoe",
@@ -92,7 +111,9 @@ async def test_a_shop_that_is_really_gone_is_still_called_dead(monkeypatch):
     """The retry must not turn every dead domain into a maybe."""
     monkeypatch.setattr(detect.impersonate, "available", lambda: True)
     monkeypatch.setattr(
-        detect.impersonate, "ImpersonatingClient", _a_browser_would_see("<html></html>")
+        detect.impersonate,
+        "ImpersonatingClient",
+        _a_browser_would_not_reach_it_either(),
     )
     respx.get(url__regex=r"https://gone\.example.*").mock(
         side_effect=httpx.ConnectError("no such host")
@@ -155,3 +176,52 @@ class TestHowLongASlowShopIsGiven:
 
 async def _refuse(*args, **kwargs):
     return {"platform": "dead"}
+
+
+class TestWhatTheBrowserProbeIsAllowedToSay:
+    """A shop that answers a browser but hides its prices is not a shut door.
+
+    www.revolve.com, www.mrporter.com and www.zalando.de all answer 200 to a
+    browser fingerprint and all render their prices in JavaScript. Throwing
+    that away left them recorded as "не отвечает" and "закрыт анти-ботом",
+    verdicts whose remedy is to wait. The real remedy is an adapter.
+    """
+
+    async def test_the_browser_saying_unknown_is_kept(self, monkeypatch):
+        verdict = await _browser_verdict(monkeypatch, "unknown")
+        assert verdict is not None
+        assert verdict["platform"] == "unknown"
+        assert verdict["impersonate"] == 1
+
+    async def test_the_browser_saying_blocked_too_adds_nothing(self, monkeypatch):
+        assert await _browser_verdict(monkeypatch, "blocked") is None
+
+    async def test_a_readable_verdict_is_still_kept(self, monkeypatch):
+        verdict = await _browser_verdict(monkeypatch, "shopify")
+        assert verdict is not None and verdict["platform"] == "shopify"
+
+
+async def _browser_verdict(monkeypatch, platform):
+    import httpx
+
+    from pi.sources import detect, impersonate
+
+    class Fake:
+        def __init__(self, timeout=30.0):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return None
+
+    async def answer(*args, **kwargs):
+        return {"platform": platform}
+
+    monkeypatch.setattr(impersonate, "available", lambda: True)
+    monkeypatch.setattr(impersonate, "ImpersonatingClient", Fake)
+    monkeypatch.setattr(detect, "probe", answer)
+
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        return await detect._probe_as_a_browser(client, "shop.example", None, None)

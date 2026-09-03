@@ -201,7 +201,14 @@ async def _probe_as_a_browser(
         # really a verdict about us.
         log.warning("%s: impersonated probe raised %s: %s", domain, type(exc).__name__, exc)
         return None
-    if verdict["platform"] not in WORKING:
+    # "unknown" is kept as well as the readable verdicts, because it is a
+    # different and more useful thing than what the caller would fall back to.
+    # www.revolve.com, www.mrporter.com and www.zalando.de all answer 200 here
+    # and all publish their prices in JavaScript; discarding that left them
+    # recorded as "не отвечает" and "закрыт анти-ботом", verdicts whose remedy
+    # is to wait or to find another way in. The real remedy is an adapter, the
+    # way ASOS got one, and only "unknown" says so.
+    if verdict["platform"] not in (*WORKING, "unknown"):
         return None
     log.info("%-40s answers a browser fingerprint (%s)", domain, verdict["platform"])
     return {**verdict, "impersonate": 1}
