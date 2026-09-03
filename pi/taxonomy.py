@@ -150,13 +150,24 @@ def canonical_brand(
 # --- gender -----------------------------------------------------------------
 # Ordered: the women's patterns run first because "women" contains "men", and
 # "Nike Air Max Women's" would otherwise be read as men's by the shorter word.
+#
+# "boys" and "girls" are deliberately absent, though both once sat here. They
+# are not adult words at all — a boys' t-shirt is a child's — and as gender
+# signals they were wrong twice over. Measured on the live catalogue: 3,917
+# products match one of the two as a whole word, and most of them are neither
+# menswear nor childrenswear but a name. Billionaire Boys Club is 386 products
+# of adult streetwear, the Powerpuff Girls are 61 SB Dunks and backpacks, and
+# JACKBOYS, Concrete Boys, Bayou Boys and Bronx Girls Skate are collections.
+# Every one of them was being filed as men's or women's on the strength of a
+# brand name. What a boys' department really looks like is a possessive, and
+# that reading lives in `audience` below.
 _WOMEN = re.compile(
     r"\b(w(?:o)?m(?:e|a)ns?|wmns|womens?|damen|femme|feminin|mujer|donna|dames|"
-    r"ladies|girls?|female)\b|\bw\.?\s?nsw\b",
+    r"ladies|female)\b|\bw\.?\s?nsw\b",
     re.I,
 )
 _MEN = re.compile(
-    r"\b(mens?|herren|homme|hombre|uomo|heren|male|boys?)\b",
+    r"\b(mens?|herren|homme|hombre|uomo|heren|male)\b",
     re.I,
 )
 

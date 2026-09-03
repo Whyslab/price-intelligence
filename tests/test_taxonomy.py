@@ -84,6 +84,21 @@ class TestGender:
         """87% of the catalogue lands here, and a guess would be indistinguishable."""
         assert taxonomy.gender("Air Force 1 '07") is None
 
+    def test_a_brand_called_boys_or_girls_is_not_a_gender(self):
+        """Measured: 3,917 products match one of the two, and most are names.
+
+        Billionaire Boys Club was filed as menswear and the Powerpuff Girls
+        collaboration as womenswear, on the strength of a collection's name.
+        """
+        assert taxonomy.gender("Billionaire Boys Club Curve Logo SS Tee") is None
+        assert taxonomy.gender("Nike SB Dunk Low The Powerpuff Girls Bubbles") is None
+        assert taxonomy.gender("Travis Scott JACKBOYS Vehicle Hoodie Black") is None
+
+    def test_a_childs_department_is_not_an_adult_gender(self):
+        """A boys' grade school shoe is a child's, and `audience` is where that lives."""
+        assert taxonomy.gender("Saucony Omni 9 - Boys' Grade School") is None
+        assert taxonomy.gender("Jordan Flowy Shorts Set - Girls' Infant") is None
+
 
 class TestKind:
     def test_a_size_says_what_a_missing_category_does_not(self):
