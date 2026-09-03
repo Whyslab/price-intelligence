@@ -120,3 +120,38 @@ async def test_a_certificate_problem_is_not_mistaken_for_a_refusal(monkeypatch):
         verdict = await detect.probe(client, "badcert.example")
 
     assert verdict["platform"] == "tls"
+
+
+class TestHowLongASlowShopIsGiven:
+    """Three shops were written off as dead for being slow rather than shut."""
+
+    async def test_the_browser_retry_waits_longer_than_the_sweep_does(self, monkeypatch):
+        import httpx
+
+        from pi.sources import detect, impersonate
+
+        seen: dict = {}
+
+        class Fake:
+            def __init__(self, timeout=30.0, headers=None):
+                seen["timeout"] = timeout
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return None
+
+        monkeypatch.setattr(impersonate, "available", lambda: True)
+        monkeypatch.setattr(impersonate, "ImpersonatingClient", Fake)
+        monkeypatch.setattr(detect, "probe", _refuse)
+
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            await detect._probe_as_a_browser(client, "slow.example", None, None)
+
+        assert seen["timeout"] == detect.BROWSER_PROBE_TIMEOUT
+        assert seen["timeout"] > 5.0, "the sweep's impatience must not carry over"
+
+
+async def _refuse(*args, **kwargs):
+    return {"platform": "dead"}

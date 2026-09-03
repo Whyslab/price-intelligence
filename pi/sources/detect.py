@@ -40,6 +40,9 @@ TRANSIENT_CODES = {429, 503}
 WORKING = ("shopify", "jsonld", "asos")
 # How many candidate product pages a probe may open before giving up on a shop.
 PRODUCT_PROBE_PAGES = 3
+# Seconds to wait on the second, impersonated attempt. Detection is not part of
+# a collection run, so patience here costs nothing that matters.
+BROWSER_PROBE_TIMEOUT = 60.0
 
 
 async def probe(
@@ -179,7 +182,13 @@ async def _probe_as_a_browser(
     """Re-probe with a browser's TLS fingerprint. None if that changes nothing."""
     try:
         async with impersonate.ImpersonatingClient(
-            timeout=client.timeout.read or 30.0, headers=dict(client.headers)
+            # Longer than the ordinary client's, on purpose. www.revolve.com,
+            # www.mrporter.com and www.zalando.de all answer 200 to a browser
+            # fingerprint and all take over 30 seconds to do it, so a timeout
+            # inherited from the sweep recorded them as domains that never
+            # answer. They answer; what they do not publish is a price.
+            timeout=max(client.timeout.read or 0.0, BROWSER_PROBE_TIMEOUT),
+            headers=dict(client.headers),
         ) as browser:
             verdict = await probe(browser, domain, limiter, ca_cache, allow_impersonation=False)
     except httpx.HTTPError as exc:  # the shop refused us; ordinary and expected
