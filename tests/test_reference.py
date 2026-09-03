@@ -110,6 +110,23 @@ class TestPriorFloor:
         history = make_history([(200.0, None, 60), (200.0, None, 0)])
         assert reference.prior_floor(history, window_days=30) is None
 
+    def test_a_ninety_nine_percent_fall_is_a_data_error_not_a_sale(self):
+        """Live: nine t-shirts recorded at 333,085,723 became a $151 shirt's floor.
+
+        The shelf showed them at −100%, seven of them in the first screen. The
+        ingestion ceiling stops that class of figure arriving, but a placeholder
+        like topshelfslc.com's 99,999 against a median of 190 is not absurd
+        enough to be caught there and still cannot be believed here.
+        """
+        history = make_history([(99_999.0, None, 20), (190.0, None, 0)])
+        assert reference.prior_floor(history, window_days=30) is None
+
+    def test_a_deep_but_believable_cut_still_counts(self):
+        """−90% is a clearance, not a corrupt row, and must survive the guard."""
+        history = make_history([(200.0, None, 20), (20.0, None, 0)])
+        floor = reference.prior_floor(history, window_days=30)
+        assert floor is not None and floor.lowest_native == 200.0
+
     def test_prices_that_left_the_window_are_not_counted(self):
         """A cheaper price from six months ago is not what it was before the drop."""
         history = make_history([(90.0, None, 200), (200.0, None, 60), (140.0, None, 0)])

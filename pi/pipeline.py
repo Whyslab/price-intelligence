@@ -251,6 +251,37 @@ async def collect_store(
     return FetchResult(domain=store["domain"], error=f"no adapter for platform {platform!r}")
 
 
+# A figure this far above everything else the same shop quotes is not a price.
+# Measured on the live catalogue: www.stadiumgoods.com published a run of
+# t-shirts at 333,085,723 — 165,000 times its own median — and because that was
+# the only earlier point those variants had, it became their 30-day floor. The
+# shelf then offered a $151 shirt at −100% off $35,684,060, seven such tiles in
+# the first screen. 1000× is deliberately far past anything a shop really sells:
+# it rejects the 105 impossible points in the database and keeps a €125,000
+# handbag at a shop whose median is €299.
+IMPOSSIBLE_MULTIPLE = 1000
+
+
+def price_ceilings(products: list) -> dict[str, float]:
+    """Per currency, the figure above which a number cannot be a price here.
+
+    Taken from the fetch itself rather than from the database, because it has
+    to hold on a shop's very first pass — that is when the poison arrives, and
+    a shop with no history has nothing to compare against yet.
+    """
+    seen: dict[str, list[float]] = {}
+    for product in products:
+        currency = (product.currency or "").upper()
+        for variant in product.variants:
+            if variant.price > 0:
+                seen.setdefault(currency, []).append(variant.price)
+    return {
+        currency: statistics.median(prices) * IMPOSSIBLE_MULTIPLE
+        for currency, prices in seen.items()
+        if len(prices) >= 20  # too few to say what this shop's prices look like
+    }
+
+
 def store_result(
     conn: sqlite3.Connection, store_id: int, result: FetchResult, rates: Rates
 ) -> tuple[int, list[int], list[int]]:
@@ -266,6 +297,10 @@ def store_result(
     touched: list[int] = []
     fallback = (result.currency or "USD").upper()
     ts = dbm.utcnow()
+    # Keyed the way the products are: a product that names no currency of its
+    # own is measured against the rest of the shop, which is the same bucket.
+    ceilings = price_ceilings(result.products)
+    impossible = 0
 
     for product in result.products:
         # A product that named its own currency is priced in that one. Only a
@@ -285,7 +320,11 @@ def store_result(
                 product.brand, product.title, [v.sku for v in product.variants]
             ),
         )
+        ceiling = ceilings.get((product.currency or "").upper())
         for variant in product.variants:
+            if ceiling is not None and variant.price > ceiling:
+                impossible += 1
+                continue
             converted = rates.to_usd(variant.price, currency)
             if converted is None:
                 continue  # unknown currency: drop the price rather than invent one
@@ -306,6 +345,11 @@ def store_result(
             ):
                 written += 1
                 changed.append(variant_id)
+    if impossible:
+        log.warning(
+            "%d price(s) discarded as impossible — more than %d times what this "
+            "shop usually charges", impossible, IMPOSSIBLE_MULTIPLE,
+        )
     return written, changed, touched
 
 
