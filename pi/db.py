@@ -13,7 +13,7 @@ from .domains import same_shop
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 SCHEMA_SQL = Path(__file__).with_name("schema.sql")
 
 
@@ -737,6 +737,7 @@ def offers_for(
     min_price: float | None = None,
     max_price: float | None = None,
     min_discount: float | None = None,
+    kids: bool = False,
 ) -> tuple[list[sqlite3.Row], int]:
     """What is on offer for one person, best first. Returns (page, total).
 
@@ -749,12 +750,19 @@ def offers_for(
     never states a gender, so excluding the unknown would hide almost everything;
     asking for women is the narrow, clean filter, and that one does exclude it.
 
+    Children's clothing is the one filter that is on by default, because it is
+    the one nobody browsing this shelf has ever wanted and it is the only
+    reading here confident enough to hide something on. `kids=True` puts it
+    back, which is also how a misclassification is meant to be found.
+
     `order_by` is interpolated, so it must never be built from anything a
     caller was handed: pi.web picks it out of a fixed map by key, which is the
     only way it is meant to be chosen.
     """
     where = ["1 = 1"]
     params: list = []
+    if not kids:
+        where.append("(p.audience IS NULL OR p.audience <> 'kids')")
     if genders:
         if "women" in genders and "men" not in genders:
             where.append("p.gender = 'women'")
@@ -863,14 +871,21 @@ def _size_order(label: str) -> tuple:
     return (2, 0.0, label)
 
 
-def shelf_facets(conn: sqlite3.Connection) -> dict:
+def shelf_facets(conn: sqlite3.Connection, kids: bool = False) -> dict:
     """What the shelf actually contains, for building filters out of.
 
     Offered rather than hardcoded because a filter listing a size nothing is on
     sale in is worse than no filter: it invites a click that returns an empty
     page and says nothing about why. Counts come along for the same reason —
     "EU44 (312)" is a decision, "EU44" is a guess.
+
+    Which is exactly why `kids` has to be passed in rather than assumed. These
+    counts are a promise about what a click returns, and the shelf hides
+    children's clothing unless asked — so a facet counting it would be a
+    promise the page then breaks.
     """
+    hide = "" if kids else " AND (p.audience IS NULL OR p.audience <> 'kids')"
+
     def tally(sql: str) -> list[dict]:
         return [
             {"value": row[0], "count": row[1]}
@@ -880,36 +895,44 @@ def shelf_facets(conn: sqlite3.Connection) -> dict:
 
     return {
         "kinds": tally(
-            """
+            f"""
             SELECT p.kind, COUNT(*) FROM offers o
               JOIN products p ON p.id = o.product_id
+             WHERE 1 = 1{hide}
              GROUP BY p.kind ORDER BY 2 DESC
             """
         ),
         "genders": tally(
-            """
+            f"""
             SELECT p.gender, COUNT(*) FROM offers o
               JOIN products p ON p.id = o.product_id
+             WHERE 1 = 1{hide}
              GROUP BY p.gender ORDER BY 2 DESC
             """
         ),
         # Ordered by how much is on offer, not alphabetically: the sizes a
         # person scans for are the ones with anything behind them.
         "sizes": tally(
-            """
+            f"""
             SELECT v.size_norm, COUNT(*) FROM offers o
               JOIN variants v ON v.id = o.variant_id
+              JOIN products p ON p.id = o.product_id
+             WHERE 1 = 1{hide}
              GROUP BY v.size_norm ORDER BY 2 DESC LIMIT 60
             """
         ),
         "brands": tally(
-            """
+            f"""
             SELECT p.brand_family, COUNT(*) FROM offers o
               JOIN products p ON p.id = o.product_id
+             WHERE 1 = 1{hide}
              GROUP BY p.brand_family ORDER BY 2 DESC LIMIT 80
             """
         ),
-        "total": conn.execute("SELECT COUNT(*) FROM offers").fetchone()[0],
+        "total": conn.execute(
+            f"SELECT COUNT(*) FROM offers o JOIN products p ON p.id = o.product_id"
+            f" WHERE 1 = 1{hide}"
+        ).fetchone()[0],
         # Where the prices actually start and stop, so a range control has ends
         # rather than guesses. Rounded outwards: a slider that cannot reach the
         # cheapest thing on the shelf is a bug people report as missing stock.
@@ -917,8 +940,9 @@ def shelf_facets(conn: sqlite3.Connection) -> dict:
             zip(
                 ("min", "max"),
                 conn.execute(
-                    "SELECT COALESCE(MIN(price_usd), 0), COALESCE(MAX(price_usd), 0)"
-                    " FROM offers"
+                    f"SELECT COALESCE(MIN(o.price_usd), 0), COALESCE(MAX(o.price_usd), 0)"
+                    f"  FROM offers o JOIN products p ON p.id = o.product_id"
+                    f" WHERE 1 = 1{hide}"
                 ).fetchone(),
                 strict=True,
             )

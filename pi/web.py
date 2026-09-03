@@ -115,6 +115,11 @@ def read_query(raw: str) -> dict:
         "max_price": _float(query, "max_price"),
         "min_discount": _float(query, "min_discount"),
         "sort": sort if sort in SORTS else DEFAULT_SORT,
+        # The one filter that is on unless switched off. Children's clothing is
+        # 447 of the 33,738 offers standing right now and none of them is what
+        # this shelf is for — but it stays reachable, because a hidden
+        # misclassification is one nobody can report.
+        "kids": (query.get("kids", ["0"])[0] or "0").lower() in ("1", "true", "yes"),
         "limit": _int(query, "limit", PAGE_SIZE, 1, MAX_PAGE_SIZE),
         "page": _int(query, "page", 0, 0, 10_000),
     }
@@ -231,6 +236,7 @@ def shelf_page(conn: sqlite3.Connection, args: dict) -> dict:
         min_price=args["min_price"],
         max_price=args["max_price"],
         min_discount=args["min_discount"],
+        kids=args["kids"],
     )
     return {
         "total": total,
@@ -249,7 +255,10 @@ def render_page(conn: sqlite3.Connection, args: dict) -> bytes:
     and a page served without one behaves identically.
     """
     seed = json.dumps(
-        {"seed": {"facets": dbm.shelf_facets(conn), "offers": shelf_page(conn, args)}},
+        {"seed": {
+            "facets": dbm.shelf_facets(conn, kids=args["kids"]),
+            "offers": shelf_page(conn, args),
+        }},
         ensure_ascii=False,
     )
     # A JSON string may contain "</script>"; inside a script element that ends
@@ -306,7 +315,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if parsed.path == "/api/facets":
                 with self._open() as conn:
-                    self._json(dbm.shelf_facets(conn))
+                    self._json(
+                        dbm.shelf_facets(conn, kids=read_query(parsed.query)["kids"])
+                    )
                 return
             if parsed.path.startswith("/api/product/"):
                 try:

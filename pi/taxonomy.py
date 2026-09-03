@@ -1,6 +1,6 @@
 """Who made it, who it is for, and what kind of thing it is.
 
-Three questions the shops do not answer in any usable form, and all three are
+Four questions the shops do not answer in any usable form, and all four are
 needed before anything can be filtered.
 
 **Brand.** Shopify's `vendor` is not a brand field, it is a free-text box. It
@@ -26,6 +26,14 @@ none. `size_norm` is the better classifier because it is already normalised and
 present. `US10.5` is a shoe, `XL` is a garment, `OS` is an accessory. The one
 place this misfires is Italian clothing sizing, where a jacket is a 44 the same
 way a shoe is — so words win over sizes when the words are unambiguous.
+
+**Audience.** Whether it is for a child, which is not a third gender but a
+different question — a boys' shoe and a girls' shoe are both a child's. Read
+strictly from the title and loosely from the category, because the two fields
+lie in different ways; the long note above `_KIDS_TITLE` says which words did
+not survive measurement and why. 25,122 products of 660,470 are read as a
+child's, and the reading is stored rather than acted on at collection, so
+improving it costs a `pi reclassify` instead of a fresh crawl.
 """
 from __future__ import annotations
 
@@ -150,13 +158,24 @@ def canonical_brand(
 # --- gender -----------------------------------------------------------------
 # Ordered: the women's patterns run first because "women" contains "men", and
 # "Nike Air Max Women's" would otherwise be read as men's by the shorter word.
+#
+# "boys" and "girls" are deliberately absent, though both once sat here. They
+# are not adult words at all — a boys' t-shirt is a child's — and as gender
+# signals they were wrong twice over. Measured on the live catalogue: 3,917
+# products match one of the two as a whole word, and most of them are neither
+# menswear nor childrenswear but a name. Billionaire Boys Club is 386 products
+# of adult streetwear, the Powerpuff Girls are 61 SB Dunks and backpacks, and
+# JACKBOYS, Concrete Boys, Bayou Boys and Bronx Girls Skate are collections.
+# Every one of them was being filed as men's or women's on the strength of a
+# brand name. What a boys' department really looks like is a possessive, and
+# that reading lives in `audience` below.
 _WOMEN = re.compile(
     r"\b(w(?:o)?m(?:e|a)ns?|wmns|womens?|damen|femme|feminin|mujer|donna|dames|"
-    r"ladies|girls?|female)\b|\bw\.?\s?nsw\b",
+    r"ladies|female)\b|\bw\.?\s?nsw\b",
     re.I,
 )
 _MEN = re.compile(
-    r"\b(mens?|herren|homme|hombre|uomo|heren|male|boys?)\b",
+    r"\b(mens?|herren|homme|hombre|uomo|heren|male)\b",
     re.I,
 )
 
@@ -168,6 +187,74 @@ def gender(title: str | None, category: str | None = None) -> str | None:
         return "women"
     if _MEN.search(haystack):
         return "men"
+    return None
+
+
+# --- audience ---------------------------------------------------------------
+# Whether a thing is for a child. Asked separately from gender because it is a
+# separate question, and answered from the title and the category separately
+# because the two fields lie in different ways.
+#
+# A title is prose written by a marketing department, so the reading has to be
+# strict. Measured across the 660,470 products in the live catalogue, these are
+# the words that turned out not to survive:
+#
+#   "baby"  — 1,543 matches, and the common ones are a women's "Baby Tee", a
+#             BAPE "Baby Milo" and a "Baby Blue" colourway. Dropped entirely.
+#             Real infant clothing almost always says infant, toddler or
+#             newborn as well, or carries a children's category.
+#   "youth" — 1,749 matches, split between a size class ("Uno Gen1 - Youth")
+#             and a brand ("World Industries Youth Classic Hoodie"). Kept only
+#             where it trails as a qualifier, which is how a size class reads.
+#   "boys"  — see the note on gender above. Kept only as a possessive followed
+#   "girls"   by a word, which is how a department reads and how a collection's
+#             name does not: "- Boys' Grade School" against "'Concrete Boys'".
+#   "child" — matches Star Wars' "The Child" and Polar's "Angel Child"
+#             colourway. Kept only as the possessive or the plural.
+#
+# A category is a taxonomy path rather than prose — "kids/girls-clothing/
+# dresses", "Toddler/Preschool" — so the plain words are safe there. Checked:
+# of 100 distinct categories carrying one of these words, not one is a brand
+# name.
+_KIDS_TITLE = re.compile(
+    r"\bkids?\b|\bkid[’']s\b|\bchildren[’']?s?\b|\bchild[’']s\b"
+    r"|\btoddlers?\b|\binfants?\b|\bnewborns?\b|\bjuniors?\b|\bpreschool(?:ers?)?\b"
+    r"|\b(?:grade|pre)[-\s]?school\b"
+    # Nike and Jordan size classes: grade school, pre-school, toddler, and the
+    # rest of the family. Written in brackets by every shop that uses them.
+    r"|\((?:GS|PS|TD|BP|BT|BG|GG|PT)\)|\b(?:GS|TD|PS)/"
+    r"|\b(?:boys|girls)[’'](?=\s+\w)|[-–]\s*(?:boys|girls)[’']\s*$"
+    r"|\b(?:big|little)\s+kids?[’']?\b"
+    r"|[-–(]\s*youth\b|\byouth\s+sizes?\b"
+    # A youth shoe size, as the shops write it: 5Y, 6.5Y.
+    r"|\b\d+(?:\.5)?Y\b",
+    re.I,
+)
+_KIDS_CATEGORY = re.compile(
+    r"\b(kids?|child|children|childrens|junior|juniors|toddler|toddlers|infant|"
+    r"infants|baby|babies|newborn|boys?|girls?|youth|nursery|"
+    r"pre[-\s]?school|grade[-\s]?school|gradeschool)\b",
+    re.I,
+)
+
+# Bare "GS" is deliberately not read as grade school. It would add 1,886
+# products, and it is a model code as often as a size class: "Nike Dunk Low GS"
+# is a child's shoe and "GS Air Paris Pocket T-Shirt" is not. Every shop that
+# means the size class also writes it in brackets or spells out "Grade School",
+# both of which are read above, so the cost of leaving it out is small and the
+# cost of guessing wrong is a find that never arrives.
+
+
+def audience(title: str | None, category: str | None = None) -> str | None:
+    """'kids', or None meaning nothing here says it is for a child.
+
+    None is not "adult". Most of the catalogue says nothing either way, exactly
+    as with gender, and the filters treat silence as "show it".
+    """
+    if title and _KIDS_TITLE.search(title):
+        return "kids"
+    if category and _KIDS_CATEGORY.search(category):
+        return "kids"
     return None
 
 
@@ -346,7 +433,7 @@ def _borrow_gender_from_stored(
 def classify(
     conn: sqlite3.Connection, product_ids: Collection[int] | None = None
 ) -> dict[str, int]:
-    """Fill brand_norm, brand_family, gender and kind.
+    """Fill brand_norm, brand_family, gender, kind and audience.
 
     With no ids this rebuilds the whole catalogue, which is what `pi reclassify`
     does; a run passes the products it just collected, because reclassifying
@@ -374,7 +461,7 @@ def classify(
         ids = list(product_ids)
         if not ids:
             return {"products": 0, "brands": len(index), "brand": 0, "kind": 0,
-                    "gender_stated": 0, "gender_borrowed": 0}
+                    "kids": 0, "gender_stated": 0, "gender_borrowed": 0}
         rows = []
         # Chunked because SQLite caps a statement at 999 parameters by default.
         for start in range(0, len(ids), 900):
@@ -395,18 +482,22 @@ def classify(
 
     stated: dict[int, str] = {}
     updates: list[tuple] = []
-    stats = {"products": len(rows), "brands": len(index), "brand": 0, "kind": 0}
+    stats = {"products": len(rows), "brands": len(index), "brand": 0, "kind": 0,
+             "kids": 0}
     for row in rows:
         brand, family = canonical_brand(row["brand"], index)
         who = gender(row["title"], row["category"])
         what = kind(row["title"], row["category"], (row["sizes"] or "").split("|"))
+        for_whom = audience(row["title"], row["category"])
         if brand:
             stats["brand"] += 1
         if what:
             stats["kind"] += 1
+        if for_whom:
+            stats["kids"] += 1
         if who:
             stated[row["id"]] = who
-        updates.append((brand, family, who, what, row["id"]))
+        updates.append((brand, family, who, what, for_whom, row["id"]))
 
     if product_ids is None:
         borrowed = _borrow_gender_by_article(conn, stated)
@@ -420,7 +511,7 @@ def classify(
         )
     if borrowed:
         updates = [
-            (b, f, g or borrowed.get(pid), k, pid) for b, f, g, k, pid in updates
+            (b, f, g or borrowed.get(pid), k, a, pid) for b, f, g, k, a, pid in updates
         ]
     stats["gender_stated"] = len(stated)
     stats["gender_borrowed"] = len(borrowed)
@@ -428,7 +519,8 @@ def classify(
     with conn:
         conn.executemany(
             """UPDATE products
-                  SET brand_norm = ?, brand_family = ?, gender = ?, kind = ?
+                  SET brand_norm = ?, brand_family = ?, gender = ?, kind = ?,
+                      audience = ?
                 WHERE id = ?""",
             updates,
         )

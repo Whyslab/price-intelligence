@@ -41,6 +41,71 @@ def a_shelf(conn, n=3):
         )
 
 
+def a_childs_offer(conn):
+    """One more offer on the shelf, this one for a child."""
+    store = dbm.upsert_store(conn, "kidshop.example", platform="shopify", currency="USD")
+    product = dbm.upsert_product(
+        conn, store, "k1", "Nike Dunk Low (GS)", "https://kidshop.example/p",
+        brand="Nike", image_url="https://img.example/k.jpg",
+    )
+    conn.execute(
+        "UPDATE products SET kind = 'shoes', brand_family = 'Nike', audience = 'kids'"
+        " WHERE id = ?", (product,),
+    )
+    variant = dbm.upsert_variant(conn, product, "kv1", size="5Y", size_norm="US5")
+    conn.execute(
+        """
+        INSERT INTO offers (variant_id, product_id, found_at, checked_at,
+                            price_usd, reference_usd, reference_source,
+                            discount_pct, saving_usd, score, all_time_low)
+        VALUES (?, ?, ?, ?, 40.0, 100.0, 'market', 60.0, 60.0, 99, 0)
+        """,
+        (variant, product, ts(1), ts(0)),
+    )
+    return product
+
+
+class TestChildrensClothing:
+    """Hidden by default, and reachable — a hidden misreading is unreportable."""
+
+    def test_the_shelf_leaves_it_out_unless_asked(self, conn):
+        a_shelf(conn, 3)
+        a_childs_offer(conn)
+        rows, total = dbm.offers_for(conn)
+        assert total == 3
+        assert all("(GS)" not in row["title"] for row in rows)
+
+    def test_asking_puts_it_back(self, conn):
+        a_shelf(conn, 3)
+        a_childs_offer(conn)
+        rows, total = dbm.offers_for(conn, kids=True)
+        assert total == 4
+        assert any("(GS)" in row["title"] for row in rows)
+
+    def test_the_row_is_written_either_way(self, conn):
+        """It is filtered on read, so a rerun of the classifier can undo it."""
+        a_shelf(conn, 1)
+        product = a_childs_offer(conn)
+        assert conn.execute(
+            "SELECT COUNT(*) FROM offers WHERE product_id = ?", (product,)
+        ).fetchone()[0] == 1
+
+    def test_the_counts_follow_what_the_page_will_show(self, conn):
+        """A facet count is a promise about what a click returns."""
+        a_shelf(conn, 3)
+        a_childs_offer(conn)
+        assert dbm.shelf_facets(conn)["total"] == 3
+        assert dbm.shelf_facets(conn, kids=True)["total"] == 4
+        shoes = {f["value"]: f["count"] for f in dbm.shelf_facets(conn)["kinds"]}
+        assert shoes["shoes"] == 3
+
+    def test_the_query_reads_the_switch(self):
+        assert web.read_query("")["kids"] is False
+        assert web.read_query("kids=1")["kids"] is True
+        assert web.read_query("kids=0")["kids"] is False
+        assert web.read_query("kids=nonsense")["kids"] is False
+
+
 class TestReadingTheQuery:
     """Everything that can go wrong with a URL goes wrong here."""
 

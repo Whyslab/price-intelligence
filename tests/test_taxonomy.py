@@ -1,4 +1,4 @@
-"""Brand, gender and kind: what the shops did not tell us."""
+"""Brand, gender, kind and audience: what the shops did not tell us."""
 from __future__ import annotations
 
 import pytest
@@ -84,6 +84,68 @@ class TestGender:
         """87% of the catalogue lands here, and a guess would be indistinguishable."""
         assert taxonomy.gender("Air Force 1 '07") is None
 
+    def test_a_brand_called_boys_or_girls_is_not_a_gender(self):
+        """Measured: 3,917 products match one of the two, and most are names.
+
+        Billionaire Boys Club was filed as menswear and the Powerpuff Girls
+        collaboration as womenswear, on the strength of a collection's name.
+        """
+        assert taxonomy.gender("Billionaire Boys Club Curve Logo SS Tee") is None
+        assert taxonomy.gender("Nike SB Dunk Low The Powerpuff Girls Bubbles") is None
+        assert taxonomy.gender("Travis Scott JACKBOYS Vehicle Hoodie Black") is None
+
+    def test_a_childs_department_is_not_an_adult_gender(self):
+        """A boys' grade school shoe is a child's, and `audience` is where that lives."""
+        assert taxonomy.gender("Saucony Omni 9 - Boys' Grade School") is None
+        assert taxonomy.gender("Jordan Flowy Shorts Set - Girls' Infant") is None
+
+
+class TestAudience:
+    """Every case here was found in the live catalogue, not invented."""
+
+    def test_the_words_that_really_mean_a_child(self):
+        assert taxonomy.audience("Nike Dunk Low (GS)") == "kids"
+        assert taxonomy.audience("Jordan True Flight Toddler") == "kids"
+        assert taxonomy.audience("Saucony Omni 9 - Boys' Grade School") == "kids"
+        assert taxonomy.audience("Kith Kids Nelson Sweatpant - Rogue") == "kids"
+        assert taxonomy.audience("Air Jordan 1 Retro High OG GS Big Kid's") == "kids"
+        assert taxonomy.audience("Jordan 1 Low SE Dune Red (GS) Sz 7Y") == "kids"
+        assert taxonomy.audience("Vans Sk8-Hi Mid Pop Check - Youth Sneakers") == "kids"
+
+    def test_a_collection_named_after_children_is_not_for_them(self):
+        """The reason bare "boys", "girls" and "baby" are not signals.
+
+        1,543 products match "baby" and the common ones are a women's Baby Tee
+        and a BAPE Baby Milo; 3,917 match "boys" or "girls" and most of those
+        are Billionaire Boys Club and the Powerpuff Girls.
+        """
+        assert taxonomy.audience("Billionaire Boys Club Curve Logo SS Tee") is None
+        assert taxonomy.audience("Powerpuff Girls Rainbow Shark Backpack") is None
+        assert taxonomy.audience("Womens Crystal Soft Serve Baby Tee") is None
+        assert taxonomy.audience("A Bathing Ape X OVO Baby Milo Tee - White") is None
+        assert taxonomy.audience("Travis Scott JACKBOYS Vehicle Hoodie") is None
+        assert taxonomy.audience("World Industries Youth Classic Hoodie") is None
+
+    def test_a_closing_quote_is_not_a_possessive(self):
+        """'Concrete Boys' ends in an apostrophe and is a Lil Yachty release."""
+        assert taxonomy.audience("Lil Yachty US Force 1 'Concrete Boys'") is None
+        assert taxonomy.audience("Jordan Air Nfh 'Bayou Boys'") is None
+
+    def test_a_colourway_called_child_is_not_a_child(self):
+        assert taxonomy.audience("Polar Big Boy Jeans - Lemon Black / Demon Child") is None
+        assert taxonomy.audience("Bape Star Wars The Child Milo Tee") is None
+
+    def test_a_small_adult_size_is_not_a_childs_size(self):
+        """US5 women's shoes exist; 1,491 offers carry a US size below 6."""
+        assert taxonomy.audience("Nike Dunk Low Women's US5") is None
+        assert taxonomy.audience("Air Force 1 '07") is None
+
+    def test_the_category_may_say_plainly_what_a_title_may_not(self):
+        """A category is a taxonomy path, so the plain words are safe there."""
+        assert taxonomy.audience("Nelson Sweatpant", "kids/boys-clothing/shirts-tops") == "kids"
+        assert taxonomy.audience("Stan Smith", "Toddler/Preschool") == "kids"
+        assert taxonomy.audience("Some Shoe", "Sneakers") is None
+
 
 class TestKind:
     def test_a_size_says_what_a_missing_category_does_not(self):
@@ -108,12 +170,28 @@ class TestClassify:
             )
         stats = taxonomy.classify(conn)
         row = conn.execute(
-            "SELECT brand_norm, brand_family, gender, kind FROM products LIMIT 1"
+            "SELECT brand_norm, brand_family, gender, kind, audience FROM products LIMIT 1"
         ).fetchone()
         assert (row["brand_norm"], row["brand_family"]) == ("Nike", "Nike")
         assert row["gender"] == "women"
         assert row["kind"] == "shoes"
+        assert row["audience"] is None
         assert stats["brand"] == 3
+
+    def test_it_writes_the_audience_too(self, conn, shops):
+        add_product(conn, shops[0], "grown", "Air Force 1 '07", sizes=["US10"])
+        add_product(conn, shops[0], "small", "Air Force 1 (GS)", sizes=["US5"])
+        stats = taxonomy.classify(conn)
+        found = dict(conn.execute("SELECT external_id, audience FROM products"))
+        assert found == {"grown": None, "small": "kids"}
+        assert stats["kids"] == 1
+
+    def test_reclassifying_can_take_a_misreading_back(self, conn, shops):
+        """The point of storing it: a better rule costs a rerun, not a crawl."""
+        product = add_product(conn, shops[0], "x", "Air Force 1 '07", sizes=["US10"])
+        conn.execute("UPDATE products SET audience = 'kids' WHERE id = ?", (product,))
+        taxonomy.classify(conn)
+        assert conn.execute("SELECT audience FROM products").fetchone()[0] is None
 
     def test_a_gender_travels_along_the_article_number(self, conn, shops):
         """One shop spells out Wmns, the next does not, and it is the same shoe."""

@@ -217,6 +217,7 @@ def cmd_find(args, config: Config) -> int:
         conn, pipeline.all_scorable_variants(conn), scoped,
         cap_per_store=False, skip_alerted=False,
         watched=pipeline.watched_products(conn, pipeline.read_watchlist(config.watchlist_file)),
+        kids=args.kids,
     )
     if args.shop:
         wanted = same_host(args.shop.strip().lower())
@@ -301,7 +302,7 @@ def cmd_reindex(args, config: Config) -> int:
 
 
 def cmd_reclassify(args, config: Config) -> int:
-    """Re-derive brand, gender and kind from what the shops wrote.
+    """Re-derive brand, gender, kind and audience from what the shops wrote.
 
     Separate from `reindex` because it answers a different question — that one
     asks which products are the same product, this one asks what each product
@@ -319,6 +320,7 @@ def cmd_reclassify(args, config: Config) -> int:
     print(f"товаров: {total:,}")
     print(f"марка определена:  {share(stats['brand'])}, словарь {stats['brands']:,} марок")
     print(f"тип определён:     {share(stats['kind'])}")
+    print(f"детских товаров:   {share(stats['kids'])}")
     print(
         f"пол определён:     {share(known)}"
         f" — {stats['gender_stated']:,} названо магазином,"
@@ -419,7 +421,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser(
         "reclassify",
-        help="re-derive brand, gender and kind for every product",
+        help="re-derive brand, gender, kind and audience for every product",
     )
     p.set_defaults(func=cmd_reclassify)
 
@@ -429,6 +431,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--brand", help="comma-separated, matched as substrings")
     p.add_argument("--size", help="comma-separated, e.g. US10,EU44")
     p.add_argument("--any-size", action="store_true", help="ignore the size filter entirely")
+    p.add_argument(
+        "--kids", action="store_true",
+        help="include children's clothing, which is left out by default",
+    )
     p.add_argument("--shop", help="only this shop's domain")
     p.add_argument("--min-discount", type=float, metavar="PCT")
     p.add_argument("--min-price", type=float, metavar="USD")

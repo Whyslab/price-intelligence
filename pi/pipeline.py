@@ -356,7 +356,7 @@ def store_result(
 CANDIDATES_SQL = """
     SELECT v.id AS variant_id, v.product_id, v.sku, v.size, v.size_norm, v.color,
            p.title, p.brand, p.url, p.image_url, p.store_id,
-           p.brand_norm, p.brand_family, p.gender, p.kind,
+           p.brand_norm, p.brand_family, p.gender, p.kind, p.audience,
            s.name AS store_name, s.domain, s.country, s.currency
     FROM pi_candidates c
     JOIN variants v ON v.id = c.id
@@ -603,16 +603,32 @@ def arrange_for(
     cap_per_store: bool = True,
     fold_duplicates: bool = True,
     skip_alerted: bool = True,
+    kids: bool = False,
+    watched: set[int] | None = None,
 ) -> list[tuple[dealm.Deal, sqlite3.Row]]:
     """One reader's list, out of deals already scored. The cheap half.
 
     Everything here is a question about the reader rather than about the price:
     what they have already been told, how much they should care, and how much of
     it they can stand in one hour. Run once per subscriber.
+
+    Children's clothing is dropped here rather than at scoring, and the
+    distinction matters: scoring feeds the browsable shelf as well, and a shelf
+    that cannot be asked to show what it hid has no way to reveal a
+    misclassification. So the deal is computed either way and withheld only
+    from the list somebody is interrupted with.
     """
     best_per_product: dict[int, tuple[dealm.Deal, sqlite3.Row]] = {}
     for deal, row in scored:
         if skip_alerted and dealm.already_alerted(conn, deal, user_id):
+            continue
+        # A watched article still arrives: naming an article is a clearer
+        # statement of intent than any classifier's reading of a title.
+        if (
+            not kids
+            and row["audience"] == "kids"
+            and not (watched and deal.product_id in watched)
+        ):
             continue
         # One notification per product: the same hoodie discounted in six sizes
         # is one thing worth knowing, so keep only its best-scoring variant.
@@ -650,6 +666,7 @@ def find_deals(
     watched: set[int] | None = None,
     rank: Callable[[dealm.Deal, sqlite3.Row], float | None] | None = None,
     user_id: int = 0,
+    kids: bool = False,
 ) -> list[tuple[dealm.Deal, sqlite3.Row]]:
     """Score the variants that moved, returning the ones worth announcing.
 
@@ -677,7 +694,7 @@ def find_deals(
     return arrange_for(
         conn, scored, config, market, user_id=user_id, rank=rank,
         cap_per_store=cap_per_store, fold_duplicates=fold_duplicates,
-        skip_alerted=skip_alerted,
+        skip_alerted=skip_alerted, kids=kids, watched=watched,
     )
 
 
@@ -923,9 +940,13 @@ async def run(
             conn, scorable, shelf_config(config), market=market, trust=trust,
             watched=watching,
         )
+        # The shelf is written whole, children's clothing included: hiding it
+        # is the page's decision (pi.db.offers_for), and a row that was never
+        # written cannot be revealed by asking.
         on_offer = arrange_for(
             conn, scored, shelf_config(config), market,
             cap_per_store=False, fold_duplicates=False, skip_alerted=False,
+            kids=True,
         )
         written, withdrawn = dbm.record_offers(
             conn, scorable, [deal for deal, _ in on_offer], dbm.utcnow()
@@ -953,6 +974,7 @@ async def run(
                 rank=personal.ranker(
                     reader.reader, config.filters.min_score, shipping, eur_usd
                 ),
+                watched=watching,
             )
             selected = candidates[:cap]
             overflow = len(candidates) - len(selected)
