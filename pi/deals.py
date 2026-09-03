@@ -34,7 +34,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 from .config import Filters
-from .reference import Market, Trust, prior_floor
+from .reference import MAX_DROP, Market, Trust, prior_floor
 
 # How much of the reference window has to be covered by observations before the
 # floor it produces is worth believing. A "30-day low" drawn from two days of
@@ -231,6 +231,15 @@ def evaluate(
     elif tag_native and tag_native > price_native:
         reference_native, source = tag_native, "tag"
     else:
+        return None
+
+    if reference_native > price_native * MAX_DROP:
+        # Nobody cuts a price by 95%. www.freshmansarchive.com marks a $40
+        # vintage fleece down from $1,420 and a $81 blazer from $1,691, and
+        # because it does not do that across its whole catalogue, none of the
+        # rule-pricing or inflated-tag tests catch it. The claim survives every
+        # check and lands at the top of the shelf, which is where the least
+        # believable number in the database should never be.
         return None
 
     discount_pct = (reference_native - price_native) / reference_native * 100
