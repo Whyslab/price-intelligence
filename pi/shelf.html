@@ -167,7 +167,8 @@ tr.cheap td.p{color:var(--accent);font-weight:600}
     </div>
     <div class="group"><h3>Скидка не меньше</h3><div class="chips" id="f-disc"></div></div>
     <div class="group"><h3>Что</h3><div class="chips" id="f-kind"></div></div>
-    <div class="group"><h3>Кому</h3><div class="chips" id="f-gender"></div></div>
+    <div class="group"><h3>Кому</h3><div class="chips" id="f-gender"></div>
+      <div class="chips" id="f-kids"></div></div>
     <div class="group"><h3>Размер<button class="mine-link" id="mine-size" hidden>только мои</button></h3>
       <div class="chips" id="f-size"></div>
       <button class="more-link" id="more-size" hidden>Все размеры</button></div>
@@ -200,9 +201,13 @@ const esc = s => String(s ?? "").replace(/[&<>"]/g, c =>
   ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 
 const state = {kind:new Set(), gender:new Set(), size:new Set(), brand:new Set(),
-               q:"", min_price:"", max_price:"", min_discount:"",
+               q:"", min_price:"", max_price:"", min_discount:"", kids:false,
                sort:"score", page:0};
 let facets = null, expanded = {size:false, brand:false};
+// Which side of the children's toggle the cached counts were built for. A
+// count is a promise about what a click returns, so when the toggle moves the
+// counts have to be asked again rather than reused.
+let facets_kids = false;
 
 /* --- запомнить выбор: витрина, открытая заново, продолжает разговор --- */
 function save(){
@@ -210,7 +215,7 @@ function save(){
     localStorage.setItem(STORE, JSON.stringify({
       kind:[...state.kind], gender:[...state.gender], size:[...state.size],
       brand:[...state.brand], min_price:state.min_price, max_price:state.max_price,
-      min_discount:state.min_discount, sort:state.sort,
+      min_discount:state.min_discount, kids:state.kids, sort:state.sort,
     }));
   } catch {}
 }
@@ -222,6 +227,7 @@ function restore(){
     for (const k of ["kind","gender","size","brand"]) state[k] = new Set(s[k] || []);
     for (const k of ["min_price","max_price","min_discount","sort"])
       if (s[k] != null) state[k] = s[k];
+    state.kids = Boolean(s.kids);
     return true;
   } catch { return false; }
 }
@@ -229,7 +235,7 @@ function restore(){
 function count_active(){
   return state.kind.size + state.gender.size + state.size.size + state.brand.size
        + (state.min_price ? 1 : 0) + (state.max_price ? 1 : 0)
-       + (state.min_discount ? 1 : 0);
+       + (state.min_discount ? 1 : 0) + (state.kids ? 1 : 0);
 }
 
 function toggle(name, value){
@@ -270,6 +276,19 @@ function discount_chips(){
   }
 }
 
+/* Детское скрыто по умолчанию: на полке его 447 из 33 738, и это не то, за чем
+   сюда приходят. Но кнопка есть — иначе ошибку классификатора никто не увидит. */
+function kids_chip(){
+  const box = el("f-kids");
+  box.innerHTML = "";
+  const b = document.createElement("button");
+  b.className = "chip"; b.type = "button";
+  b.setAttribute("aria-pressed", String(state.kids));
+  b.textContent = "Детское";
+  b.onclick = () => { state.kids = !state.kids; reload(); };
+  box.append(b);
+}
+
 /* --- активные фильтры: убрать любой одним нажатием --- */
 function draw_active(){
   const box = el("active");
@@ -285,6 +304,7 @@ function draw_active(){
   for (const v of state.gender) add(GENDER_RU[v] || v, () => state.gender.delete(v));
   for (const v of state.size)   add(v,                 () => state.size.delete(v));
   for (const v of state.brand)  add(v,                 () => state.brand.delete(v));
+  if (state.kids) add("детское", () => state.kids = false);
   if (state.min_discount) add("от −" + state.min_discount + "%", () => state.min_discount = "");
   if (state.min_price) add("от $" + state.min_price, () => state.min_price = "");
   if (state.max_price) add("до $" + state.max_price, () => state.max_price = "");
@@ -302,6 +322,7 @@ function draw_active(){
 function clear_all(){
   for (const k of ["kind","gender","size","brand"]) state[k].clear();
   state.min_price = state.max_price = state.min_discount = "";
+  state.kids = false;
   el("pmin").value = ""; el("pmax").value = "";
   reload();
 }
@@ -313,6 +334,7 @@ function params(){
   if (state.q) p.set("q", state.q);
   for (const k of ["min_price","max_price","min_discount"])
     if (state[k]) p.set(k, state[k]);
+  if (state.kids) p.set("kids", "1");
   p.set("sort", state.sort);
   p.set("page", state.page);
   return p;
@@ -377,6 +399,13 @@ function draw_mine(){
 function reload(){
   state.page = 0;
   draw_active();
+  if (facets && facets_kids !== state.kids){
+    save();
+    fetch("/api/facets" + (state.kids ? "?kids=1" : ""))
+      .then(r => r.json())
+      .then(f => { facets = f; facets_kids = state.kids; reload(); });
+    return;
+  }
   if (facets){
     draw_mine();
     chips("f-size", "size", facets.sizes, null, facets.mine?.sizes);
@@ -384,6 +413,7 @@ function reload(){
     chips("f-kind", "kind", facets.kinds, v => KIND_RU[v] || v, facets.mine?.kinds);
     chips("f-gender", "gender", facets.genders, v => GENDER_RU[v] || v, facets.mine?.genders);
     discount_chips();
+    kids_chip();
   }
   save();
   load(false);
@@ -499,6 +529,7 @@ for (const [id, key] of [["pmin","min_price"], ["pmax","max_price"]]){
 
   const ready = f => {
     facets = f;
+    facets_kids = state.kids;
     if (f.price && f.price.max)
       el("prange").textContent = `на полке ${money(f.price.min)} – ${money(f.price.max)}`;
     reload();
@@ -506,6 +537,7 @@ for (const [id, key] of [["pmin","min_price"], ["pmax","max_price"]]){
   if (seed && !remembered){
     // Nothing chosen yet: the seed in the HTML is already the right answer.
     facets = seed.facets;
+    facets_kids = state.kids;
     if (facets.price?.max)
       el("prange").textContent = `на полке ${money(facets.price.min)} – ${money(facets.price.max)}`;
     draw_active();
@@ -515,11 +547,12 @@ for (const [id, key] of [["pmin","min_price"], ["pmax","max_price"]]){
     chips("f-kind", "kind", facets.kinds, v => KIND_RU[v] || v, facets.mine?.kinds);
     chips("f-gender", "gender", facets.genders, v => GENDER_RU[v] || v, facets.mine?.genders);
     discount_chips();
+    kids_chip();
     render(seed.offers, false);
   } else if (seed){
     ready(seed.facets);
   } else {
-    fetch("/api/facets").then(r => r.json()).then(ready);
+    fetch("/api/facets" + (state.kids ? "?kids=1" : "")).then(r => r.json()).then(ready);
   }
 })();
 </script>

@@ -46,11 +46,17 @@ CREATE TABLE IF NOT EXISTS products (
     brand_family TEXT,   -- Jordan's family is Nike; what a brand filter matches on
     gender       TEXT,   -- 'men' | 'women' | NULL, and NULL means the shop did not say
     kind         TEXT,   -- 'shoes' | 'clothing' | 'accessories' | NULL
+    -- 'kids' | NULL. A separate question from gender, not a third value of it:
+    -- a boys' shoe and a girls' shoe are both a child's, and neither is
+    -- menswear. Held as a column rather than thrown away at collection, so a
+    -- misreading costs a `pi reclassify` and not a fresh crawl of the shop.
+    audience     TEXT,
     UNIQUE (store_id, external_id)
 );
 CREATE INDEX IF NOT EXISTS ix_products_brand ON products(brand);
 CREATE INDEX IF NOT EXISTS ix_products_brand_family ON products(brand_family);
 CREATE INDEX IF NOT EXISTS ix_products_kind ON products(kind, gender);
+CREATE INDEX IF NOT EXISTS ix_products_audience ON products(audience);
 
 CREATE TABLE IF NOT EXISTS variants (
     id          INTEGER PRIMARY KEY,

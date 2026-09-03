@@ -155,7 +155,7 @@ class TestArrangingOneReadersList:
         product = a_product(conn)
         row = conn.execute(
             """
-            SELECT v.id AS variant_id, v.product_id, s.domain
+            SELECT v.id AS variant_id, v.product_id, s.domain, p.audience
               FROM variants v
               JOIN products p ON p.id = v.product_id
               JOIN stores   s ON s.id = p.store_id
@@ -179,6 +179,35 @@ class TestArrangingOneReadersList:
 
         assert for_seven == []
         assert len(for_nine) == 1
+
+    def _a_childs_offer(self, conn) -> list:
+        self._scored(conn)
+        conn.execute("UPDATE products SET audience = 'kids'")
+        return self._scored(conn)   # re-read, now carrying the audience
+
+    def test_a_childs_shoe_is_not_worth_interrupting_anyone_with(self, config, conn):
+        scored = self._a_childs_offer(conn)
+
+        assert pipeline.arrange_for(
+            conn, scored, config, market=None, fold_duplicates=False
+        ) == []
+
+    def test_the_shelf_is_written_with_it_anyway(self, config, conn):
+        """Scoring feeds the browsable shelf too, and that one can be asked."""
+        scored = self._a_childs_offer(conn)
+
+        assert len(pipeline.arrange_for(
+            conn, scored, config, market=None, fold_duplicates=False, kids=True
+        )) == 1
+
+    def test_an_article_asked_for_by_name_still_arrives(self, config, conn):
+        """Naming an article is a clearer statement than a reading of a title."""
+        scored = self._a_childs_offer(conn)
+        watched = {scored[0][0].product_id}
+
+        assert len(pipeline.arrange_for(
+            conn, scored, config, market=None, fold_duplicates=False, watched=watched
+        )) == 1
 
 
 class TestMigratingToPerReaderAlerts:
