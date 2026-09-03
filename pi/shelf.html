@@ -523,6 +523,10 @@ for (const [id, key] of [["pmin","min_price"], ["pmax","max_price"]]){
 
   const seed = JSON.parse(el("seed").textContent).seed;
   const remembered = restore();
+  // The server renders the first screenful from the query string, so the page
+  // has to read it too — otherwise /?kids=1 paints the children's shelf and the
+  // first fetch replaces it with the grown-up one.
+  if (new URLSearchParams(location.search).get("kids") === "1") state.kids = true;
   el("sort").value = state.sort;
   el("pmin").value = state.min_price;
   el("pmax").value = state.max_price;
