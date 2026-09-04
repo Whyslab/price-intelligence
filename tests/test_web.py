@@ -464,3 +464,47 @@ class TestWhoseFindGoesFirst:
         rows, _ = dbm.offers_for(conn, limit=2, order_by=web.SORTS["discount"])
 
         assert [row["domain"] for row in rows] == ["loud.example", "loud.example"]
+
+
+class TestLookingSomethingUpFromThePage:
+    """The shelf holds what is discounted; this asks the whole catalogue."""
+
+    @staticmethod
+    def _stock(conn, domain, title, price, style=None):
+        store = dbm.upsert_store(conn, domain, platform="shopify", currency="USD")
+        product = dbm.upsert_product(
+            conn, store, f"p-{domain}", title, f"https://{domain}/p", brand="Nike"
+        )
+        if style:
+            dbm.set_product_keys(conn, product, [("style", style)])
+        variant = dbm.upsert_variant(conn, product, f"v-{domain}")
+        dbm.record_price(conn, variant, price, None, True, "USD", price, 1.0)
+
+    def test_an_article_comes_back_cheapest_first(self, conn):
+        self._stock(conn, "dear.example", "AF1", 150.0, "CW2288-111")
+        self._stock(conn, "cheap.example", "AF1", 90.0, "CW2288-111")
+
+        page = web.lookup_page(conn, "CW2288-111")
+
+        assert page["same_thing"] is True
+        assert [s["price"] for s in page["shops"]] == [90.0, 150.0]
+        assert page["shops"][0]["shop"] == "cheap.example"
+
+    def test_a_name_says_it_is_not_a_comparison(self, conn):
+        self._stock(conn, "one.example", "Salomon XT-6 Ember", 140.0)
+        self._stock(conn, "two.example", "Salomon XT-6 Skyline", 160.0)
+
+        page = web.lookup_page(conn, "Salomon XT-6")
+
+        assert page["same_thing"] is False, "different shoes, not one price compared"
+        assert page["found"] == 2
+
+    def test_an_empty_query_is_not_a_search(self, conn):
+        self._stock(conn, "shop.example", "AF1", 110.0, "CW2288-111")
+        assert web.lookup_page(conn, "")["shops"] == []
+
+    def test_every_row_carries_what_the_page_draws(self, conn):
+        self._stock(conn, "shop.example", "AF1", 110.0, "CW2288-111")
+        row = web.lookup_page(conn, "CW2288-111")["shops"][0]
+        assert set(row) >= {"shop", "url", "title", "price", "country", "checked_at"}
+        assert json.dumps(row), "must survive the trip to the browser"

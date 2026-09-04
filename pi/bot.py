@@ -186,6 +186,69 @@ def format_card(row: sqlite3.Row, sizes: list[tuple[str, bool]], now: str,
 
 # --- keyboards --------------------------------------------------------------
 
+BOT_LOOKUP_LIMIT = 8
+
+
+def plural(n: int, one: str, few: str, many: str) -> str:
+    """Russian counts, because "26 магазин(ов)" is a developer in the text."""
+    tail, unit = abs(n) % 100, abs(n) % 10
+    if 10 < tail < 20:
+        return f"{n} {many}"
+    return f"{n} {one if unit == 1 else few if 1 < unit < 5 else many}"
+
+
+def format_lookup(found: dict) -> str:
+    """The answer to "what does this cost", as a message.
+
+    Two different answers wear the same shape and must not read alike. An
+    article number is one thing priced by several merchants, and the cheapest
+    of them is the answer. A name is a list of different things, and calling
+    the cheapest of those a saving would be a lie the layout tells by itself.
+    """
+    if not found["shops"]:
+        if found["too_common"]:
+            return (
+                f"«{escape(found['too_common'])}» стоит в поле артикула у слишком "
+                "многих разных товаров — это слово, а не номер модели."
+            )
+        return (
+            "Ничего не нашлось. Пришлите артикул с коробки "
+            "(<code>CW2288-111</code>) или название — посмотрю, где дешевле.\n"
+            "/deals — список скидок, /settings — настройки."
+        )
+
+    lines: list[str] = []
+    if found["same_thing"]:
+        lines.append(
+            f"<b>{escape(str(found['key']))}</b> · "
+            + plural(found["found"], "магазин", "магазина", "магазинов")
+        )
+        if found["found"] == 1:
+            lines.append("<i>только один магазин — сравнить не с чем</i>")
+    else:
+        lines.append(
+            "По названию нашлось "
+            + plural(found["found"], "товар", "товара", "товаров")
+        )
+        lines.append("<i>это разные вещи, а не одна в разных магазинах</i>")
+    lines.append("")
+
+    for row in found["shops"][:BOT_LOOKUP_LIMIT]:
+        shop = escape(row["store_name"] or row["domain"])
+        country = f" · {escape(row['country'])}" if row["country"] else ""
+        cut = f" · −{row['discount_pct']:.0f}%" if row["discount_pct"] else ""
+        title = escape(row["title"])[:60]
+        lines.append(
+            f'<a href="{escape(row["url"])}">{_money(row["price_usd"])}</a>'
+            f" — {shop}{country}{cut}"
+        )
+        if not found["same_thing"]:
+            lines.append(f"   {title}")
+    if found["found"] > BOT_LOOKUP_LIMIT:
+        lines.append(f"\n<i>показано {BOT_LOOKUP_LIMIT} из {found['found']}</i>")
+    return "\n".join(lines)
+
+
 def entry_keyboard(row: sqlite3.Row, page: int) -> dict:
     """Under each photo: buy it, or see the whole account of why it is a deal."""
     return {
@@ -526,7 +589,11 @@ class Bot:
             await self.send(chat_id, f"Записал: {value or 'любые'}")
             await self.next_step(chat_id, user, step)
             return
-        await self.send(chat_id, "Не понял. /deals — список, /settings — настройки.")
+        # Anything else is a thing somebody wants priced. This is the one
+        # question the shelf could never answer: it starts from a product id
+        # and the page only has ids for what is already discounted.
+        found = dbm.lookup_article(self.conn, text, limit=BOT_LOOKUP_LIMIT)
+        await self.send(chat_id, format_lookup(found))
 
     @staticmethod
     def _clean(step: str, text: str) -> str | None:

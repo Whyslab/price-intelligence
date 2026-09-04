@@ -4,11 +4,12 @@ from __future__ import annotations
 import logging
 import re
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from . import reference
 from .domains import same_shop
 
 log = logging.getLogger(__name__)
@@ -981,6 +982,105 @@ def _owner_profile(conn: sqlite3.Connection) -> dict:
 MAX_KEY_FANOUT = 40
 
 
+# How the cheapest live price is read for a set of products. Shared by
+# `same_article`, which asks it about one product's siblings, and by
+# `lookup_article`, which asks it about whatever a person typed. One copy,
+# because both want the same three things and getting any of them differently
+# would make the two disagree about the same catalogue: only the latest point
+# per variant, only what is in stock, and one row per product at its cheapest.
+_CHEAPEST_SQL = """
+    WITH latest AS (
+        SELECT variant_id, price_usd, currency, price_native
+          FROM (
+            SELECT variant_id, price_usd, currency, price_native, in_stock,
+                   ROW_NUMBER() OVER (PARTITION BY variant_id ORDER BY ts DESC) AS rn
+              FROM price_points
+             WHERE variant_id IN (
+                 SELECT id FROM variants WHERE product_id IN ({placeholders})
+             )
+          )
+         WHERE rn = 1 AND in_stock = 1
+    )
+    SELECT s.domain, s.name AS store_name, s.country, s.last_ok,
+           p.title, p.url, p.id AS product_id, p.brand_norm, p.audience,
+           MIN(latest.price_usd) AS price_usd,
+           latest.currency, latest.price_native,
+           (SELECT MAX(discount_pct) FROM offers WHERE product_id = p.id) AS discount_pct
+      FROM latest
+      JOIN variants v ON v.id = latest.variant_id
+      JOIN products p ON p.id = v.product_id
+      JOIN stores   s ON s.id = p.store_id
+     GROUP BY p.id
+     ORDER BY price_usd
+"""
+
+# How many products one lookup will price. Well above MAX_KEY_FANOUT, because a
+# search by name legitimately matches more rows than an article number does,
+# and far below the point where the query stops being instant.
+MAX_LOOKUP_PRODUCTS = 300
+
+
+def _cheapest_per_product(
+    conn: sqlite3.Connection, product_ids: Sequence[int]
+) -> list[sqlite3.Row]:
+    """The live price of each of these products, cheapest first."""
+    ids = list(product_ids)[:MAX_LOOKUP_PRODUCTS]
+    if not ids:
+        return []
+    sql = _CHEAPEST_SQL.format(placeholders=",".join("?" * len(ids)))
+    return conn.execute(sql, ids).fetchall()
+
+
+def _one_row_per_merchant(
+    rows: list[sqlite3.Row], exclude: str | None = None
+) -> list[sqlite3.Row]:
+    """Fold a chain into one opinion, at its cheapest.
+
+    Done here rather than in SQL because "same merchant" is a judgement about
+    hostnames, not a column. A shop listing the same shoe twice, or selling it
+    in four countries, is one price to compare against.
+    """
+    best: dict[str, sqlite3.Row] = {}
+    for row in rows:
+        shop = same_shop(row["domain"])
+        if exclude is not None and shop == exclude:
+            continue
+        if shop not in best or row["price_usd"] < best[shop]["price_usd"]:
+            best[shop] = row
+    return sorted(best.values(), key=lambda row: row["price_usd"])
+
+
+def _sibling_product_ids(conn: sqlite3.Connection, product_id: int) -> list[int]:
+    """Products other rows describe as the same article as this one.
+
+    Keys carried by an implausible number of products are dropped rather than
+    followed: a shop that writes its brand into the SKU field turns `DIME` into
+    a claim about 413 unrelated products.
+    """
+    return [
+        row[0]
+        for row in conn.execute(
+            """
+            WITH mine AS (
+                SELECT key_type, key FROM product_keys WHERE product_id = :pid
+            ),
+            usable AS (
+                SELECT m.key_type, m.key FROM mine m
+                 WHERE (
+                     SELECT COUNT(DISTINCT x.product_id) FROM product_keys x
+                      WHERE x.key_type = m.key_type AND x.key = m.key
+                 ) <= :fanout
+            )
+            SELECT DISTINCT pk.product_id
+              FROM product_keys pk
+              JOIN usable u ON u.key_type = pk.key_type AND u.key = pk.key
+             WHERE pk.product_id <> :pid
+            """,
+            {"pid": product_id, "fanout": MAX_KEY_FANOUT},
+        ).fetchall()
+    ]
+
+
 def same_article(conn: sqlite3.Connection, product_id: int) -> list[sqlite3.Row]:
     """Every other shop selling what this product is, cheapest first.
 
@@ -994,64 +1094,136 @@ def same_article(conn: sqlite3.Connection, product_id: int) -> list[sqlite3.Row]
     price. One row per merchant, at their cheapest, since a chain agreeing with
     itself across four countries is one opinion — see pi.domains.same_shop.
     """
-    rows = conn.execute(
-        """
-        WITH mine AS (
-            SELECT key_type, key FROM product_keys WHERE product_id = :pid
-        ),
-        usable AS (
-            SELECT m.key_type, m.key FROM mine m
-             WHERE (
-                 SELECT COUNT(DISTINCT x.product_id) FROM product_keys x
-                  WHERE x.key_type = m.key_type AND x.key = m.key
-             ) <= :fanout
-        ),
-        siblings AS (
-            SELECT DISTINCT pk.product_id
-              FROM product_keys pk
-              JOIN usable u ON u.key_type = pk.key_type AND u.key = pk.key
-             WHERE pk.product_id <> :pid
-        ),
-        latest AS (
-            SELECT variant_id, price_usd, currency, price_native
-              FROM (
-                SELECT variant_id, price_usd, currency, price_native, in_stock,
-                       ROW_NUMBER() OVER (PARTITION BY variant_id ORDER BY ts DESC) AS rn
-                  FROM price_points
-                 WHERE variant_id IN (
-                     SELECT id FROM variants WHERE product_id IN (SELECT product_id FROM siblings)
-                 )
-              )
-             WHERE rn = 1 AND in_stock = 1
-        )
-        SELECT s.domain, s.name AS store_name, s.country, s.last_ok,
-               p.title, p.url, p.id AS product_id,
-               MIN(latest.price_usd) AS price_usd,
-               latest.currency, latest.price_native
-          FROM latest
-          JOIN variants v ON v.id = latest.variant_id
-          JOIN products p ON p.id = v.product_id
-          JOIN stores   s ON s.id = p.store_id
-         GROUP BY p.id
-         ORDER BY price_usd
-        """,
-        {"pid": product_id, "fanout": MAX_KEY_FANOUT},
-    ).fetchall()
-
+    rows = _cheapest_per_product(conn, _sibling_product_ids(conn, product_id))
     ours = conn.execute(
         "SELECT s.domain FROM products p JOIN stores s ON s.id = p.store_id WHERE p.id = ?",
         (product_id,),
     ).fetchone()
-    us = same_shop(ours["domain"]) if ours else ""
+    # Excluding the shop itself is the point: a price confirmed by
+    # `bdgastore.com` and `shop.bdgastore.com` is one shop agreeing with itself.
+    return _one_row_per_merchant(rows, exclude=same_shop(ours["domain"]) if ours else None)
 
-    # Folded here rather than in SQL because "same merchant" is a judgement
-    # about hostnames, not a column. A shop listing the same shoe twice, or
-    # selling it in four countries, is one price to compare against.
-    best: dict[str, sqlite3.Row] = {}
-    for row in rows:
-        shop = same_shop(row["domain"])
-        if shop == us:
-            continue
-        if shop not in best or row["price_usd"] < best[shop]["price_usd"]:
-            best[shop] = row
-    return sorted(best.values(), key=lambda r: r["price_usd"])
+
+def _products_by_key(
+    conn: sqlite3.Connection, key_type: str, keys: Sequence[str]
+) -> tuple[list[int], str | None]:
+    """Products carrying any of these keys, and the key that was too common.
+
+    A key on more than `MAX_KEY_FANOUT` products is not an article number and
+    following it would answer a different question than the one asked: `DIME`
+    is 413 unrelated products because one shop writes its brand into the SKU
+    field. Saying so is better than returning them.
+    """
+    found: list[int] = []
+    for key in keys:
+        rows = conn.execute(
+            "SELECT product_id FROM product_keys WHERE key_type = ? AND key = ?",
+            (key_type, key),
+        ).fetchall()
+        if len(rows) > MAX_KEY_FANOUT:
+            return [], key
+        found += [row[0] for row in rows]
+    return found, None
+
+
+def _products_by_name(conn: sqlite3.Connection, text: str) -> list[int]:
+    """Products whose title or brand contains what was typed."""
+    like = f"%{text}%"
+    return [
+        row[0]
+        for row in conn.execute(
+            """
+            SELECT id FROM products
+             WHERE title LIKE ? OR brand_norm LIKE ? OR brand LIKE ?
+             LIMIT ?
+            """,
+            (like, like, like, MAX_LOOKUP_PRODUCTS),
+        ).fetchall()
+    ]
+
+
+def lookup_article(conn: sqlite3.Connection, query: str, limit: int = 25) -> dict:
+    """What every shop charges for one thing, cheapest first.
+
+    The shelf can only answer this about something already discounted, because
+    `same_article` starts from a product id and the page only has ids for what
+    is on offer. This starts from what a person typed, so the answer exists for
+    the whole catalogue — including the 95% of it that is at its normal price.
+
+    Read in the order the keys deserve, which is the order `MarketIndex.identity`
+    already uses: the manufacturer's article number is a number two shops arrive
+    at independently; a shop's own SKU is weaker; a name is two shops happening
+    to describe something similarly, and is a search rather than a match.
+
+    The honest answer is usually "one shop". 17,936 of 105,707 article numbers
+    in the catalogue are carried by more than one product, so for most things
+    there is nothing to compare against — and `shops` of length one says exactly
+    that rather than implying a comparison was made.
+
+    An article number and a name are not the same question, and the answer says
+    which was asked. `same_thing` is true only for an article number: those rows
+    are one product priced by several merchants, folded so a chain counts once,
+    and the cheapest of them is an answer. A name matches many different
+    products — "air force 1 07" is 242 of them — and folding those by merchant
+    would quietly turn a search into a comparison and call the cheapest of 242
+    unrelated things a saving. So a name returns the products themselves.
+
+    Children's clothing is not filtered out here. Asking for a thing by name is
+    a clearer statement of intent than any classifier's reading of a title, the
+    same reason a watched article still reaches its reader.
+    """
+    text = (query or "").strip()
+    result: dict = {
+        "query": text, "matched_by": None, "key": None, "same_thing": False,
+        "products": 0, "shops": [], "found": 0, "too_common": None,
+    }
+    if len(text) < 3:
+        return result
+
+    # A cascade, strongest key first, and every step may come up empty without
+    # ending the search: someone who types a code that is nobody's article
+    # number still meant something by it, and the words are the last reading
+    # left. Only an exhausted cascade is "nothing found".
+    ids: list[int] = []
+    codes = sorted(reference.style_codes(text))
+    if codes:
+        ids, blocked = _products_by_key(conn, reference.STYLE, codes)
+        result["too_common"] = blocked
+        if ids:
+            result["matched_by"], result["key"] = reference.STYLE, codes[0]
+
+    if not ids and " " not in text and len(text) >= 4:
+        # No recognised article shape, but a single token is still worth trying
+        # as a shop's own SKU. This is also where the junk is caught: `DIME` is
+        # in the SKU field of 413 unrelated products because one shop puts its
+        # brand there, and saying so is more useful than either the 413 or a
+        # silent fall-through.
+        sku_ids, blocked = _products_by_key(conn, reference.SKU, [text.upper()])
+        result["too_common"] = result["too_common"] or blocked
+        # A word is only allowed to *be* an article number if it is shaped like
+        # one. `nike` sits in exactly one shop's SKU field, and taking that as
+        # the answer would hand back a single shop to somebody who plainly asked
+        # about a brand. The probe still ran, so the junk guard above still
+        # fires — it is only the result that a word may not claim.
+        if sku_ids and any(ch.isdigit() for ch in text):
+            ids = sku_ids
+            result["matched_by"], result["key"] = reference.SKU, text.upper()
+
+    if not ids:
+        ids = _products_by_name(conn, text)
+        if ids:
+            result["matched_by"], result["key"] = reference.TITLE, text
+
+    if not ids:
+        return result
+
+    priced = _cheapest_per_product(conn, ids)
+    same_thing = result["matched_by"] in (reference.STYLE, reference.SKU)
+    result["same_thing"] = same_thing
+    rows = _one_row_per_merchant(priced) if same_thing else priced
+    result["products"] = len(ids)
+    # How many there are, beside how many are being handed back: a caller that
+    # only sees the truncated list reports the limit as the answer.
+    result["found"] = len(rows)
+    result["shops"] = rows[:limit]
+    return result

@@ -296,9 +296,35 @@ class TestRouting:
 
     @pytest.mark.asyncio
     async def test_text_outside_the_wizard_is_not_swallowed(self, robot, calls, conn):
+        """Nothing matches "привет", and the reply still says what to do next."""
         dbm.upsert_bot_user(conn, 7, "42", "u", onboarded=1)
         await robot.handle(self._message("привет"))
         assert "/deals" in calls[-1][1]["text"]
+
+    @pytest.mark.asyncio
+    async def test_an_article_number_is_priced_rather_than_shrugged_at(
+        self, robot, calls, conn
+    ):
+        """The one question the shelf cannot answer: what does this cost anywhere."""
+        dbm.upsert_bot_user(conn, 7, "42", "u", onboarded=1)
+        for n, (domain, price) in enumerate(
+            [("cheap.example", 90.0), ("dear.example", 150.0)]
+        ):
+            store = dbm.upsert_store(conn, domain, platform="shopify", currency="USD")
+            product = dbm.upsert_product(
+                conn, store, f"p{n}", "Nike Air Force 1 CW2288-111",
+                f"https://{domain}/p",
+            )
+            dbm.set_product_keys(conn, product, [("style", "CW2288-111")])
+            variant = dbm.upsert_variant(conn, product, f"v{n}")
+            dbm.record_price(conn, variant, price, None, True, "USD", price, 1.0)
+
+        await robot.handle(self._message("CW2288-111"))
+
+        text = calls[-1][1]["text"]
+        assert "CW2288-111" in text
+        assert "cheap.example" in text and "$90" in text
+        assert text.index("cheap.example") < text.index("dear.example"), "cheapest first"
 
     @pytest.mark.asyncio
     async def test_a_broken_update_does_not_take_the_bot_down(self, robot):
@@ -464,3 +490,18 @@ class TestTheShelfButton:
         with_it = bot.menu_keyboard(user, "https://shelf.example")["inline_keyboard"]
         assert len(with_it) == len(without) + 1
         assert any("web_app" in b for row in with_it for b in row)
+
+
+class TestCountingInRussian:
+    """"26 магазин(ов)" is a developer showing through the text."""
+
+    def test_it_declines_the_way_the_language_does(self):
+        def say(n):
+            return bot.plural(n, "магазин", "магазина", "магазинов")
+
+        assert say(1) == "1 магазин"
+        assert say(2) == "2 магазина"
+        assert say(5) == "5 магазинов"
+        assert say(11) == "11 магазинов", "the teens are the exception"
+        assert say(21) == "21 магазин"
+        assert say(112) == "112 магазинов"
