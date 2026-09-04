@@ -16,10 +16,14 @@ Deliberately small. The stdlib's HTTP server is enough for a shelf that is read
 far more often than it changes, and adding a framework for one page and two
 JSON endpoints would be a dependency to maintain for no answer this cannot give.
 
-Bound to localhost by default. There is no login: anything reachable from
-outside this machine has to get its authentication first, and pretending
-otherwise by binding to 0.0.0.0 with a comment about it would be worse than
-requiring the flag.
+Bound to localhost by default. Reading needs no login and never has: the worst
+a stranger on this machine could learn from it is what is on sale.
+
+Writing is another matter, and the page writes now — a star against a product is
+a row in somebody's name. Every write is signed by Telegram (pi.webauth), with
+no exemption for localhost, because an exemption is invisible from outside and
+`--host 0.0.0.0` is a flag that exists. Outside Telegram the only way to be
+somebody is `pi web --owner <id>`, typed by the person it names.
 """
 from __future__ import annotations
 
@@ -31,6 +35,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from . import db as dbm
+from . import webauth
 
 log = logging.getLogger(__name__)
 
@@ -124,6 +129,9 @@ def read_query(raw: str) -> dict:
         # this shelf is for — but it stays reachable, because a hidden
         # misclassification is one nobody can report.
         "kids": (query.get("kids", ["0"])[0] or "0").lower() in ("1", "true", "yes"),
+        # Not a filter on the shelf but a different list entirely — see
+        # db.favorites_for. Read here so a link to it can be sent to somebody.
+        "favorites": (query.get("favorites", ["0"])[0] or "0").lower() in ("1", "true", "yes"),
         "limit": _int(query, "limit", PAGE_SIZE, 1, MAX_PAGE_SIZE),
         "page": _int(query, "page", 0, 0, 10_000),
     }
@@ -263,6 +271,35 @@ def lookup_page(conn: sqlite3.Connection, query: str) -> dict:
     }
 
 
+def favorite_json(item: dict) -> dict:
+    """One followed product, in the shape the page's cards already read.
+
+    `price` may be None and `discount` usually is. A followed product is
+    normally at its ordinary price — waiting for it to stop being is the point —
+    so the card has to be able to say "still $180" and "sold out" as plainly as
+    it says "−40%".
+    """
+    return {
+        "id": item["product_id"],
+        "variant": item["variant_id"],
+        "title": item["title"],
+        "url": item["url"],
+        "image": item["image_url"],
+        "brand": item["brand"],
+        "shop": item["store_name"] or item["domain"],
+        "domain": item["domain"],
+        "country": item["country"],
+        "price": item["price_usd"],
+        # What it cost when it was starred, which is the comparison this list is
+        # for. The shelf compares against the market; this compares against the
+        # moment somebody said they wanted it.
+        "since": item["since_usd"],
+        "discount": round(item["discount_pct"]) if item["discount_pct"] else None,
+        "added_at": item["added_at"],
+        "checked_at": item["checked_at"],
+    }
+
+
 def shelf_page(conn: sqlite3.Connection, args: dict) -> dict:
     """One page of the shelf, with enough around it to render the controls."""
     rows, total = dbm.offers_for(
@@ -288,18 +325,33 @@ def shelf_page(conn: sqlite3.Connection, args: dict) -> dict:
     }
 
 
-def render_page(conn: sqlite3.Connection, args: dict) -> bytes:
+def render_page(
+    conn: sqlite3.Connection, args: dict, user_id: int | None = None
+) -> bytes:
     """The page with its first screenful already in it.
 
     Sending an empty shell and letting it ask twice puts two round trips between
     opening the link and seeing anything, which on a phone is the whole
     impression the page makes. The markup is unchanged; only the seed differs,
     and a page served without one behaves identically.
+
+    The reader's name goes in it whenever the server already knows it, which is
+    the `--owner` case: their hearts are then drawn in the first paint instead of
+    appearing a moment later. Inside Telegram it cannot be known here — the
+    signature travels in the URL fragment, which browsers do not send — so the
+    page asks for it and the seed says nobody.
     """
     seed = json.dumps(
         {"seed": {
             "facets": dbm.shelf_facets(conn, kids=args["kids"]),
             "offers": shelf_page(conn, args),
+            "me": user_id,
+            "favorites": sorted(dbm.favorite_ids(conn, user_id)) if user_id else [],
+            # Only when the link asked for that list, so an ordinary page does
+            # not pay for a list nobody opened.
+            "favorites_items": [
+                favorite_json(item) for item in dbm.favorites_for(conn, user_id)
+            ] if user_id and args["favorites"] else None,
         }},
         ensure_ascii=False,
     )
@@ -313,10 +365,20 @@ def render_page(conn: sqlite3.Connection, args: dict) -> bytes:
     )
 
 
+# The largest body a write is allowed to send. A favourite is two integers;
+# anything larger is either a mistake or somebody probing.
+MAX_BODY = 4096
+
+
 class Handler(BaseHTTPRequestHandler):
     """One request. A connection per request, because the server is threaded."""
 
     db_path: Path = Path("data/pi.db")
+    bot_token: str | None = None
+    # Whose shelf this is when there is no Telegram to ask. None means nobody:
+    # the page then hides its hearts entirely rather than offering a button that
+    # answers 401.
+    owner_id: int | None = None
     server_version = "price-intelligence"
 
     def log_message(self, fmt: str, *args) -> None:
@@ -347,12 +409,59 @@ class Handler(BaseHTTPRequestHandler):
         conn.row_factory = sqlite3.Row
         return conn
 
+    def _open_rw(self) -> sqlite3.Connection:
+        """A writable connection, for the one thing this server writes.
+
+        Separate from `_open` so that reading stays incapable of writing, and
+        with a busy timeout because the other writer is a sweep that runs for
+        minutes. WAL means a reader never blocks it; a second writer waits, and
+        five seconds is far longer than the single INSERT here can need.
+        """
+        conn = sqlite3.connect(self.db_path, timeout=5)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout = 5000")
+        conn.execute("PRAGMA foreign_keys = ON")
+        return conn
+
+    def _reader(self) -> int | None:
+        """Whose request this is: Telegram's signature, or the owner flag.
+
+        In that order, and with no third answer. A page inside Telegram sends
+        its initData with every call; a person debugging on their own machine
+        passes --owner and is that person. Anyone else is nobody, and nobody
+        cannot write.
+        """
+        signed = webauth.verify(
+            self.headers.get("X-Telegram-Init-Data", ""), self.bot_token
+        )
+        return signed if signed is not None else self.owner_id
+
+    def _body(self) -> dict:
+        """The JSON a write sent, or {}."""
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            return {}
+        if length <= 0 or length > MAX_BODY:
+            return {}
+        try:
+            payload = json.loads(self.rfile.read(length) or b"{}")
+        except (ValueError, OSError):
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def _product_id(self, path: str) -> int | None:
+        try:
+            return int(path.rsplit("/", 1)[1])
+        except (ValueError, IndexError):
+            return None
+
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         try:
             if parsed.path in ("/", "/index.html"):
                 with self._open() as conn:
-                    body = render_page(conn, read_query(parsed.query))
+                    body = render_page(conn, read_query(parsed.query), self._reader())
                 self._send(200, body, "text/html; charset=utf-8")
                 return
             if parsed.path == "/api/facets":
@@ -382,6 +491,18 @@ class Handler(BaseHTTPRequestHandler):
                 with self._open() as conn:
                     self._json(shelf_page(conn, read_query(parsed.query)))
                 return
+            if parsed.path == "/api/favorites":
+                # 401 is the page's signal to hide its hearts, not an error to
+                # show anybody: a shelf opened in a plain browser is still a
+                # perfectly good shelf, it just cannot star anything.
+                user_id = self._reader()
+                if user_id is None:
+                    self._json({"error": "not signed in"}, 401)
+                    return
+                with self._open() as conn:
+                    items = dbm.favorites_for(conn, user_id)
+                self._json({"user": user_id, "items": [favorite_json(i) for i in items]})
+                return
             self._json({"error": "not found"}, 404)
         except Exception as exc:  # a browsable page must not take the process down
             log.exception("%s failed", self.path)
@@ -389,10 +510,80 @@ class Handler(BaseHTTPRequestHandler):
 
     do_HEAD = do_GET
 
+    def do_POST(self) -> None:
+        parsed = urlparse(self.path)
+        try:
+            if parsed.path != "/api/favorites":
+                self._json({"error": "not found"}, 404)
+                return
+            user_id = self._reader()
+            if user_id is None:
+                self._json({"error": "not signed in"}, 401)
+                return
+            payload = self._body()
+            try:
+                product_id = int(payload["product_id"])
+            except (KeyError, TypeError, ValueError):
+                self._json({"error": "product_id required"}, 400)
+                return
+            try:
+                variant_id = int(payload["variant_id"])
+            except (KeyError, TypeError, ValueError):
+                variant_id = None
+            with self._open_rw() as conn:
+                exists = conn.execute(
+                    "SELECT 1 FROM products WHERE id = ?", (product_id,)
+                ).fetchone()
+                if exists is None:
+                    self._json({"error": "no such product"}, 404)
+                    return
+                added = dbm.add_favorite(conn, user_id, product_id, variant_id)
+                conn.commit()
+            # 200 rather than 201 for one already there: starring twice is the
+            # same wish stated twice, and the page should not have to care.
+            self._json({"product_id": product_id, "added": added}, 201 if added else 200)
+            return
+        except Exception as exc:
+            log.exception("%s failed", self.path)
+            self._json({"error": f"{type(exc).__name__}: {exc}"}, 500)
 
-def serve(db_path: Path, host: str = "127.0.0.1", port: int = 8000) -> None:
+    def do_DELETE(self) -> None:
+        parsed = urlparse(self.path)
+        try:
+            if not parsed.path.startswith("/api/favorites/"):
+                self._json({"error": "not found"}, 404)
+                return
+            user_id = self._reader()
+            if user_id is None:
+                self._json({"error": "not signed in"}, 401)
+                return
+            product_id = self._product_id(parsed.path)
+            if product_id is None:
+                self._json({"error": "not a product id"}, 400)
+                return
+            with self._open_rw() as conn:
+                removed = dbm.remove_favorite(conn, user_id, product_id)
+                conn.commit()
+            self._json({"product_id": product_id, "removed": removed})
+            return
+        except Exception as exc:
+            log.exception("%s failed", self.path)
+            self._json({"error": f"{type(exc).__name__}: {exc}"}, 500)
+
+
+def serve(
+    db_path: Path,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+    bot_token: str | None = None,
+    owner_id: int | None = None,
+) -> None:
     """Run until interrupted."""
-    handler = type("BoundHandler", (Handler,), {"db_path": Path(db_path)})
+    handler = type(
+        "BoundHandler",
+        (Handler,),
+        {"db_path": Path(db_path), "bot_token": bot_token, "owner_id": owner_id},
+    )
     server = ThreadingHTTPServer((host, port), handler)
     log.info("shelf on http://%s:%d — Ctrl-C to stop", host, port)
     try:
