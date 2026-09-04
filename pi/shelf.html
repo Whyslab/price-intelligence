@@ -107,6 +107,12 @@ main{display:grid;gap:11px;padding:13px 12px 8px;max-width:1400px;margin:0 auto;
 #more{display:block;margin:14px auto 44px;padding:11px 28px;background:var(--card);
       border:1px solid var(--line);border-radius:11px;cursor:pointer}
 .empty{padding:56px 16px;text-align:center;color:var(--dim);grid-column:1/-1;line-height:1.7}
+/* Полка — это то, что подешевело. Каталог — всё, что вообще есть. Второй
+   вопрос задают редко, поэтому он строкой, а не второй строкой поиска. */
+#whole{max-width:1400px;margin:0 auto;padding:8px 12px 0}
+#whole button{background:none;border:0;padding:6px 0;cursor:pointer;
+  color:var(--accent);font-size:14px;text-align:left}
+#whole button:hover{text-decoration:underline}
 .skeleton{grid-column:1/-1;padding:40px;text-align:center;color:var(--faint)}
 
 /* --- карточка товара --- */
@@ -178,6 +184,7 @@ tr.cheap td.p{color:var(--accent);font-weight:600}
 </header>
 
 <script type="application/json" id="seed">{"seed": null}</script>
+<div id="whole" hidden></div>
 <main id="grid"><div class="skeleton">Открываю полку…</div></main>
 <button id="more" hidden>Показать ещё</button>
 <dialog id="sheet"><button class="close" id="x" aria-label="Закрыть">×</button>
@@ -197,6 +204,11 @@ const STORE = "shelf.filters";
 
 const el = id => document.getElementById(id);
 const money = n => "$" + (n < 100 ? n.toFixed(2) : Math.round(n));
+// «26 магазин(ов)» — след разработчика в тексте, который читает человек.
+const plural = (n, one, few, many) => {
+  const t = Math.abs(n) % 100, u = t % 10;
+  return n + " " + (t > 10 && t < 20 ? many : u === 1 ? one : u > 1 && u < 5 ? few : many);
+};
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c =>
   ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 
@@ -377,7 +389,9 @@ function render(data, append){
   if (!append) el("grid").innerHTML = "";
   if (!data.offers.length && !append){
     el("grid").innerHTML = `<div class="empty">Под эти условия ничего нет.<br>
-      ${count_active() ? "Снимите часть фильтров — они над списком." : "Полка пуста."}</div>`;
+      ${state.q
+        ? "На полке лежит только то, что подешевело — попробуйте кнопку над списком."
+        : count_active() ? "Снимите часть фильтров — они над списком." : "Полка пуста."}</div>`;
   }
   for (const o of data.offers) el("grid").append(card(o));
   el("more").hidden = state.page + 1 >= data.pages;
@@ -415,6 +429,7 @@ function reload(){
     discount_chips();
     kids_chip();
   }
+  draw_whole();
   save();
   load(false);
 }
@@ -476,6 +491,58 @@ async function open_sheet(id, variant){
     <a class="go" href="${esc(ours.url)}" target="_blank" rel="noopener">Открыть в ${esc(ours.shop)}</a>`;
 }
 
+/* --- «пробить по всем магазинам»: полка против каталога --- */
+function draw_whole(){
+  const box = el("whole");
+  box.innerHTML = "";
+  box.hidden = !state.q;
+  if (!state.q) return;
+  const b = document.createElement("button");
+  b.type = "button";
+  b.textContent = `Пробить «${state.q}» по всем магазинам — включая то, что без скидки`;
+  b.onclick = () => open_lookup(state.q);
+  box.append(b);
+}
+
+async function open_lookup(query){
+  const d = el("sheet");
+  el("sheet-body").innerHTML = "<p style='color:var(--dim)'>Смотрю по всем магазинам…</p>";
+  if (!d.open) d.showModal();
+  const r = await fetch("/api/lookup?q=" + encodeURIComponent(query));
+  const f = await r.json();
+
+  if (!f.shops.length){
+    el("sheet-body").innerHTML = `<h2>«${esc(query)}»</h2>
+      <p style="color:var(--dim)">${f.too_common
+        ? `«${esc(f.too_common)}» стоит в поле артикула у слишком многих разных
+           товаров — это слово, а не номер модели.`
+        : "Ничего не нашлось. Попробуйте артикул с коробки, например CW2288-111."}</p>`;
+    return;
+  }
+
+  // Артикул и название — разные вопросы, и рисовать их одинаково нельзя:
+  // «дешевле всего» про 242 непохожие вещи было бы неправдой.
+  const head = f.same_thing
+    ? `<h2>${esc(f.key)}</h2><div class="verdict ${f.found === 1 ? "alone" : "best"}">
+       ${f.found === 1
+         ? "Только один магазин — сравнить не с чем."
+         : `Дешевле всего <b>${money(f.shops[0].price)}</b> в ${esc(f.shops[0].shop)} —
+            этот артикул держат ${plural(f.found, "магазин", "магазина", "магазинов")}.`}</div>`
+    : `<h2>«${esc(query)}»</h2><div class="verdict alone">По названию нашлось
+       ${plural(f.found, "товар", "товара", "товаров")} — это разные вещи,
+       а не одна в разных магазинах.</div>`;
+
+  const rows = f.shops.map(o => `<tr>
+      <td>${esc(o.shop)}${o.country ? " · " + esc(o.country) : ""}</td>
+      <td>${f.same_thing ? "" : esc(String(o.title).slice(0, 46))}</td>
+      <td style="text-align:right">${money(o.price)}${
+        o.discount_pct ? ` <span class="badge" style="position:static">−${Math.round(o.discount_pct)}%</span>` : ""}</td>
+      <td><a href="${esc(o.url)}" target="_blank" rel="noopener">открыть</a></td>
+    </tr>`).join("");
+
+  el("sheet-body").innerHTML = head + `<table>${rows}</table>`;
+}
+
 /* --- обработчики --- */
 el("x").onclick = () => el("sheet").close();
 el("sheet").onclick = e => { if (e.target === el("sheet")) el("sheet").close(); };
@@ -520,14 +587,22 @@ for (const [id, key] of [["pmin","min_price"], ["pmax","max_price"]]){
   // as a link rather than as a description of where to look.
   const wanted = new URLSearchParams(location.search).get("product");
   if (wanted) open_sheet(wanted);
+  // ?lookup=CW2288-111 открывается сразу на ответе «где это дешевле всего»,
+  // чтобы находку можно было переслать, как и карточку товара.
+  const asked = new URLSearchParams(location.search).get("lookup");
+  if (asked) open_lookup(asked.trim());
 
   const seed = JSON.parse(el("seed").textContent).seed;
   const remembered = restore();
   // The server renders the first screenful from the query string, so the page
   // has to read it too — otherwise /?kids=1 paints the children's shelf and the
   // first fetch replaces it with the grown-up one.
-  if (new URLSearchParams(location.search).get("kids") === "1") state.kids = true;
+  const url_params = new URLSearchParams(location.search);
+  if (url_params.get("kids") === "1") state.kids = true;
+  if (url_params.get("q")) state.q = url_params.get("q").trim();
   el("sort").value = state.sort;
+  el("q").value = state.q;
+  el("q-clear").hidden = !state.q;
   el("pmin").value = state.min_price;
   el("pmax").value = state.max_price;
 
@@ -552,6 +627,7 @@ for (const [id, key] of [["pmin","min_price"], ["pmax","max_price"]]){
     chips("f-gender", "gender", facets.genders, v => GENDER_RU[v] || v, facets.mine?.genders);
     discount_chips();
     kids_chip();
+    draw_whole();
     render(seed.offers, false);
   } else if (seed){
     ready(seed.facets);

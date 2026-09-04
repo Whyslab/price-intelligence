@@ -376,3 +376,114 @@ class TestTheWriteAheadLogIsBounded:
     def test_the_journal_is_still_a_write_ahead_log(self, conn):
         """The limit must not have cost the mode it exists to bound."""
         assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+
+
+class TestLookingUpAnArticle:
+    """The question the shelf cannot answer: what does this cost anywhere.
+
+    `same_article` starts from a product id, and the page only has ids for what
+    is already discounted — so 95% of the catalogue was unreachable.
+    """
+
+    @staticmethod
+    def _stock(conn, domain, title, price, *, style=None, sku=None, in_stock=True):
+        store = dbm.upsert_store(conn, domain, platform="shopify", currency="USD")
+        product = dbm.upsert_product(
+            conn, store, f"p-{domain}-{title}", title, f"https://{domain}/p"
+        )
+        keys = set()
+        if style:
+            keys.add(("style", style))
+        if sku:
+            keys.add(("sku", sku))
+        if keys:
+            dbm.set_product_keys(conn, product, keys)
+        variant = dbm.upsert_variant(conn, product, f"v-{domain}", sku=sku)
+        dbm.record_price(conn, variant, price, None, in_stock, "USD", price, 1.0)
+        return product
+
+    def test_an_article_number_is_priced_across_shops_cheapest_first(self, conn):
+        self._stock(conn, "dear.example", "AF1", 150.0, style="CW2288-111")
+        self._stock(conn, "cheap.example", "Air Force 1", 90.0, style="CW2288-111")
+
+        found = dbm.lookup_article(conn, "CW2288-111")
+
+        assert found["matched_by"] == "style"
+        assert found["same_thing"] is True
+        assert [row["price_usd"] for row in found["shops"]] == [90.0, 150.0]
+
+    def test_it_reaches_what_is_not_discounted(self, conn):
+        """The whole point: nothing here is on the shelf, and it still answers."""
+        self._stock(conn, "shop.example", "AF1", 110.0, style="CW2288-111")
+
+        assert conn.execute("SELECT COUNT(*) FROM offers").fetchone()[0] == 0
+        assert len(dbm.lookup_article(conn, "CW2288-111")["shops"]) == 1
+
+    def test_one_shop_is_said_plainly_rather_than_implied(self, conn):
+        """83% of articles are stocked by nobody else, so this is the usual answer."""
+        self._stock(conn, "alone.example", "AF1", 110.0, style="CW2288-111")
+
+        found = dbm.lookup_article(conn, "CW2288-111")
+        assert found["found"] == 1
+
+    def test_a_chain_across_countries_is_one_opinion(self, conn):
+        self._stock(conn, "footlocker.com", "AF1", 150.0, style="CW2288-111")
+        self._stock(conn, "footlocker.de", "AF1", 140.0, style="CW2288-111")
+
+        found = dbm.lookup_article(conn, "CW2288-111")
+        assert found["found"] == 1, "one merchant, not two"
+        assert found["shops"][0]["price_usd"] == 140.0, "at its cheapest"
+
+    def test_a_price_nobody_can_pay_is_not_a_price(self, conn):
+        self._stock(conn, "gone.example", "AF1", 50.0, style="CW2288-111", in_stock=False)
+        self._stock(conn, "here.example", "AF1", 120.0, style="CW2288-111")
+
+        found = dbm.lookup_article(conn, "CW2288-111")
+        assert [row["domain"] for row in found["shops"]] == ["here.example"]
+
+    def test_a_name_returns_products_not_a_comparison(self, conn):
+        """Folding 242 different shoes by merchant would call the cheapest a saving."""
+        self._stock(conn, "one.example", "Salomon XT-6 Ember", 140.0)
+        self._stock(conn, "one.example", "Salomon XT-6 Skyline", 160.0)
+
+        found = dbm.lookup_article(conn, "Salomon XT-6")
+
+        assert found["matched_by"] == "title"
+        assert found["same_thing"] is False
+        assert found["found"] == 2, "both products, though one merchant"
+
+    def test_a_word_in_the_sku_field_is_not_an_article_number(self, conn):
+        """One shop writes its brand there: `DIME` is 413 unrelated products."""
+        for n in range(dbm.MAX_KEY_FANOUT + 1):
+            self._stock(conn, "junk.example", f"Thing {n}", 20.0 + n, sku="DIME")
+
+        found = dbm.lookup_article(conn, "DIME")
+
+        assert found["too_common"] == "DIME"
+        assert found["matched_by"] != "sku"
+
+    def test_a_word_in_one_shops_sku_field_does_not_shadow_the_name(self, conn):
+        """`nike` is one shop's SKU and everybody's brand.
+
+        Taking the SKU would hand back a single shop to somebody who plainly
+        asked about a brand, and the answer would look authoritative.
+        """
+        self._stock(conn, "odd.example", "Some Thing", 30.0, sku="NIKE")
+        self._stock(conn, "a.example", "Nike Air Max", 120.0)
+        self._stock(conn, "b.example", "Nike Dunk", 110.0)
+
+        found = dbm.lookup_article(conn, "nike")
+
+        assert found["matched_by"] == "title"
+        assert found["found"] >= 2
+
+    def test_a_code_nobody_stocks_falls_through_to_the_words(self, conn):
+        """A cascade: a step coming up empty is not the end of the search."""
+        self._stock(conn, "shop.example", "Zoom Fly ZF1234", 120.0)
+
+        assert dbm.lookup_article(conn, "ZF1234")["found"] == 1
+
+    def test_too_short_to_mean_anything_is_not_a_search(self, conn):
+        self._stock(conn, "shop.example", "AF1", 110.0, style="CW2288-111")
+        assert dbm.lookup_article(conn, "CW")["shops"] == []
+        assert dbm.lookup_article(conn, "")["shops"] == []

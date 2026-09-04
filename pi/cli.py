@@ -239,6 +239,53 @@ def cmd_find(args, config: Config) -> int:
     return 0
 
 
+def cmd_price(args, config: Config) -> int:
+    """What every shop charges for one article, cheapest first.
+
+    The other half of what the shelf shows on a product card, asked from the
+    outside: the card can only compare something already discounted, because it
+    starts from a product id and the page only has ids for what is on offer.
+    """
+    conn = dbm.connect(config.db_path)
+    found = dbm.lookup_article(conn, args.query, limit=args.limit)
+
+    if found["too_common"]:
+        print(
+            f"«{found['too_common']}» стоит в поле артикула у слишком многих разных "
+            f"товаров — это слово, а не номер модели. Ищу по названию.\n"
+        )
+    if not found["shops"]:
+        print("ничего не нашлось")
+        return 1
+
+    shown = len(found["shops"])
+    if found["same_thing"]:
+        head = f"артикул {found['key']} · {bot.plural(found['found'], 'магазин', 'магазина', 'магазинов')}"
+        print(head + (f", показано {shown}\n" if shown < found["found"] else "\n"))
+    else:
+        print(
+            f"поиск по названию · {bot.plural(found['found'], 'товар', 'товара', 'товаров')}"
+            + (f", показано {shown}" if shown < found["found"] else "")
+            + " — это разные вещи, а не одна в разных магазинах\n"
+        )
+
+    for row in found["shops"]:
+        shop = row["store_name"] or row["domain"]
+        cut = f"−{row['discount_pct']:.0f}%" if row["discount_pct"] else ""
+        native = ""
+        if row["currency"] and row["currency"] != "USD":
+            native = f"{row['price_native']:,.0f} {row['currency']}"
+        print(
+            f"${row['price_usd']:>9,.2f} {cut:>5}  {shop[:26]:<26} "
+            f"{(row['country'] or ''):<3} {native:<14} {row['title'][:44]}"
+        )
+        print(f"           {row['url']}")
+
+    if found["same_thing"] and found["found"] == 1:
+        print("\nтолько один магазин — сравнить не с чем")
+    return 0
+
+
 def _renormalise_sizes(conn) -> int:
     """Re-derive `variants.size_norm` from the size the shop wrote.
 
@@ -443,6 +490,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--min-score", type=int)
     p.add_argument("--limit", type=int, default=25, help="rows to print (default 25)")
     p.set_defaults(func=cmd_find)
+
+    p = sub.add_parser(
+        "price", help="what every shop charges for one article or name",
+    )
+    p.add_argument("query", help="article number (CW2288-111) or a name")
+    p.add_argument("--limit", type=int, default=25, help="rows to print (default 25)")
+    p.set_defaults(func=cmd_price)
 
     p = sub.add_parser("bot", help="serve the Telegram bot (runs until stopped)")
     p.set_defaults(func=cmd_bot)

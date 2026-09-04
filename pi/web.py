@@ -37,6 +37,10 @@ log = logging.getLogger(__name__)
 PAGE = Path(__file__).with_name("shelf.html")
 PAGE_SIZE = 60
 MAX_PAGE_SIZE = 200
+# How many shops one article lookup returns. Enough that a popular sneaker
+# shows its whole spread — CW2288-111 is stocked by 26 merchants — without a
+# name search dumping a page of unrelated things.
+LOOKUP_LIMIT = 40
 
 # Which orderings the page may ask for, and what each means in SQL. A map
 # rather than a string from the query: the value lands in an ORDER BY.
@@ -221,6 +225,44 @@ def product_page(
     }
 
 
+def lookup_json(row: sqlite3.Row) -> dict:
+    """One shop's live price for a looked-up article."""
+    return {
+        "shop": row["store_name"] or row["domain"],
+        "domain": row["domain"],
+        "country": row["country"],
+        "url": row["url"],
+        "title": row["title"],
+        "brand": row["brand_norm"],
+        "price": round(row["price_usd"], 2),
+        "currency": row["currency"],
+        "price_native": row["price_native"],
+        "discount_pct": row["discount_pct"],
+        "checked_at": row["last_ok"],
+        "product_id": row["product_id"],
+    }
+
+
+def lookup_page(conn: sqlite3.Connection, query: str) -> dict:
+    """What every shop charges for what was typed.
+
+    `same_thing` is the part that must survive the trip to the browser: an
+    article number gives one product priced by several merchants, a name gives
+    several different products, and a page that drew both the same way would
+    call the cheapest of 242 unrelated shoes a saving.
+    """
+    found = dbm.lookup_article(conn, query, limit=LOOKUP_LIMIT)
+    return {
+        "query": found["query"],
+        "matched_by": found["matched_by"],
+        "key": found["key"],
+        "same_thing": found["same_thing"],
+        "found": found["found"],
+        "too_common": found["too_common"],
+        "shops": [lookup_json(row) for row in found["shops"]],
+    }
+
+
 def shelf_page(conn: sqlite3.Connection, args: dict) -> dict:
     """One page of the shelf, with enough around it to render the controls."""
     rows, total = dbm.offers_for(
@@ -330,6 +372,11 @@ class Handler(BaseHTTPRequestHandler):
                         conn, product_id, read_variant(parsed.query)
                     )
                 self._json(found or {"error": "not on the shelf"}, 200 if found else 404)
+                return
+            if parsed.path == "/api/lookup":
+                wanted = (parse_qs(parsed.query).get("q", [""])[0] or "").strip()
+                with self._open() as conn:
+                    self._json(lookup_page(conn, wanted))
                 return
             if parsed.path == "/api/offers":
                 with self._open() as conn:
