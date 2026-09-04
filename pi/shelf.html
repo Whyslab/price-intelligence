@@ -93,8 +93,27 @@ main{display:grid;gap:11px;padding:13px 12px 8px;max-width:1400px;margin:0 auto;
 .thumb img{width:100%;height:100%;object-fit:cover;display:block}
 .badge{position:absolute;top:7px;left:7px;background:var(--hot);color:#fff;
        border-radius:7px;padding:2px 7px;font-size:12px;font-weight:700}
-.low{position:absolute;top:7px;right:7px;background:var(--accent);color:#fff;
+.low{position:absolute;top:32px;left:7px;background:var(--accent);color:#fff;
      border-radius:7px;padding:2px 7px;font-size:11px;font-weight:700}
+/* Сама плитка — ссылка, и вкладывать в неё кнопку нельзя. Поэтому обёртка:
+   карточка внутри, сердечко рядом, поверх угла картинки. */
+.wrap{position:relative;display:flex}
+.wrap > .card{flex:1;min-width:0}
+/* Сердечко — единственная кнопка на витрине, которая что-то записывает.
+   Внизу справа, чтобы не спорить с «минимумом» в верхнем углу. */
+.heart{position:absolute;top:6px;right:6px;width:30px;height:30px;border:none;
+  border-radius:50%;background:rgba(255,255,255,.82);color:#57534e;font-size:15px;
+  line-height:30px;padding:0;cursor:pointer;backdrop-filter:blur(3px)}
+.heart.on{background:var(--hot);color:#fff}
+.heart:disabled{opacity:.45;cursor:progress}
+@media (prefers-color-scheme: dark){ .heart{background:rgba(28,25,23,.8);color:#d6d3d1} }
+.fav-line{display:flex;gap:6px;align-items:baseline;font-size:12px;color:var(--dim)}
+.fav-line b{color:var(--accent);font-weight:600}
+.gone{color:var(--faint)}
+/* Сердечко в карточке товара и в строках «пробить по магазинам» */
+.heart-inline{border:1px solid var(--line);background:var(--chip);border-radius:8px;
+  padding:3px 9px;font-size:13px;cursor:pointer;white-space:nowrap}
+.heart-inline.on{background:var(--hot);border-color:var(--hot);color:#fff}
 .body{padding:9px 10px 11px;display:flex;flex-direction:column;gap:3px;flex:1}
 .brand{font-size:10.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--faint)}
 .name{font-size:13px;line-height:1.32;display:-webkit-box;-webkit-line-clamp:2;
@@ -149,6 +168,7 @@ tr.cheap td.p{color:var(--accent);font-weight:600}
       <input type="search" id="q" placeholder="Поиск: nike, cargo, carhartt…" autocomplete="off">
       <button id="q-clear" hidden aria-label="Очистить">×</button>
     </span>
+    <button class="tool" id="fav" hidden aria-pressed="false" title="Избранное">★<span class="n" id="favcount" hidden></span></button>
     <button class="tool" id="toggle" aria-expanded="false">Фильтры<span class="n" id="fcount" hidden></span></button>
     <select class="tool" id="sort" aria-label="Сортировка">
       <option value="score">Лучшие</option>
@@ -194,6 +214,8 @@ tr.cheap td.p{color:var(--accent);font-weight:600}
 addEventListener("load", () => {
   const tg = window.Telegram?.WebApp;
   if (tg) { tg.ready(); tg.expand(); }
+  // После него, потому что подпись приходит вместе с этим скриптом.
+  identity();
 });
 
 const KIND_RU = {shoes:"Обувь", clothing:"Одежда", accessories:"Аксессуары"};
@@ -212,10 +234,116 @@ const plural = (n, one, few, many) => {
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c =>
   ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 
+/* --- избранное: единственное, что эта страница записывает --- */
+// Подпись Telegram уходит с каждым запросом. Ни сессии, ни куки: нечему
+// протухнуть в хранилище и нечего у страницы украсть.
+const tg_headers = () => {
+  const d = window.Telegram?.WebApp?.initData;
+  return d ? {"X-Telegram-Init-Data": d} : {};
+};
+
+function announce(user, ids){
+  me = user;
+  starred = new Set(ids);
+  el("fav").hidden = false;
+  draw_fav_count();
+  for (const b of document.querySelectorAll(".heart")) b.hidden = false;
+  paint_hearts();
+}
+
+async function identity(){
+  // Спрашивается один раз, и только если сервер не назвал читателя сам.
+  // 401 значит «этот человек нам не представлен» — тогда сердечек нет вовсе:
+  // кнопка, которая отвечает отказом, хуже её отсутствия.
+  if (me === null){
+    let r;
+    try { r = await fetch("/api/favorites", {headers: tg_headers()}); } catch { return; }
+    if (!r.ok) return;
+    const d = await r.json();
+    announce(d.user, d.items.map(i => i.id));
+    // Лист, открытый по ссылке из бота, успел нарисоваться без сердечка.
+    if (el("sheet").open && reopen) reopen();
+  }
+  if (state.view !== "fav" && new URLSearchParams(location.search).get("favorites") === "1"){
+    state.view = "fav";
+    reload();
+  }
+}
+
+function draw_fav_count(){
+  el("favcount").hidden = starred.size === 0;
+  el("favcount").textContent = starred.size;
+}
+
+function paint_heart(b){
+  const on = starred.has(Number(b.dataset.heart));
+  b.classList.toggle("on", on);
+  b.setAttribute("aria-pressed", String(on));
+  b.textContent = b.classList.contains("heart-inline")
+    ? (on ? "♥ слежу" : "♡ следить")
+    : (on ? "♥" : "♡");
+}
+
+function wire_hearts(root){
+  for (const b of root.querySelectorAll("[data-heart]")){
+    const id = Number(b.dataset.heart), v = Number(b.dataset.variant) || null;
+    b.onclick = e => { e.preventDefault(); e.stopPropagation(); toggle_star(id, v, b); };
+    paint_heart(b);
+  }
+}
+
+const paint_hearts = () => wire_hearts(document);
+
+function heart_button(id, variant){
+  const b = document.createElement("button");
+  b.type = "button";
+  b.className = "heart";
+  b.dataset.heart = id;
+  if (variant) b.dataset.variant = variant;
+  b.setAttribute("aria-label", "Следить за ценой");
+  // Первый экран рисуется из зерна в HTML, раньше, чем Telegram отвечает, кто
+  // смотрит. Сердечко ставится сразу и показывается, когда ответ придёт.
+  b.hidden = me === null;
+  return b;
+}
+
+const heart_inline = (id, variant) => me === null ? "" :
+  `<button type="button" class="heart-inline" data-heart="${id}"${
+    variant ? ` data-variant="${variant}"` : ""}>♡ следить</button>`;
+
+async function toggle_star(id, variant, button){
+  if (me === null) return;
+  const on = starred.has(id);
+  button.disabled = true;
+  try {
+    const r = on
+      ? await fetch("/api/favorites/" + id, {method:"DELETE", headers: tg_headers()})
+      : await fetch("/api/favorites", {
+          method:"POST",
+          headers: {...tg_headers(), "Content-Type":"application/json"},
+          body: JSON.stringify({product_id:id, variant_id:variant || null}),
+        });
+    if (!r.ok) return;
+    on ? starred.delete(id) : starred.add(id);
+    draw_fav_count();
+    // Список перерисовывается целиком: снятое сердечко должно убрать вещь из
+    // него, а не оставить строку, которой там уже нет.
+    if (state.view === "fav") load_favorites(); else paint_hearts();
+  } catch {} finally { button.disabled = false; }
+}
+
 const state = {kind:new Set(), gender:new Set(), size:new Set(), brand:new Set(),
                q:"", min_price:"", max_price:"", min_discount:"", kids:false,
-               sort:"score", page:0};
+               sort:"score", page:0, view:"shelf"};
 let facets = null, expanded = {size:false, brand:false};
+// Кто смотрит. null — никто: страница открыта не из Telegram и без --owner,
+// и тогда сердечек нет вовсе. Кнопка, которая отвечает 401, хуже её отсутствия.
+let me = null;
+let starred = new Set();
+// Чем открыт лист сейчас — чтобы перерисовать его, когда личность подтвердится.
+let reopen = null;
+// Избранное, присланное вместе со страницей. Тратится один раз, на первый экран.
+let seeded_favs = null;
 // Which side of the children's toggle the cached counts were built for. A
 // count is a promise about what a click returns, so when the toggle moves the
 // counts have to be asked again rather than reused.
@@ -312,6 +440,13 @@ function draw_active(){
     b.onclick = () => { undo(); reload(); };
     box.append(b);
   };
+  if (state.view === "fav"){
+    // В избранном фильтры не применяются, и сказать об этом лучше здесь, чем
+    // дать человеку решить, что список сломан.
+    add("★ избранное — фильтры не в счёт", () => state.view = "shelf");
+    el("fcount").hidden = true;
+    return;
+  }
   for (const v of state.kind)   add(KIND_RU[v] || v,   () => state.kind.delete(v));
   for (const v of state.gender) add(GENDER_RU[v] || v, () => state.gender.delete(v));
   for (const v of state.size)   add(v,                 () => state.size.delete(v));
@@ -353,6 +488,7 @@ function params(){
 }
 
 function freshness(iso){
+  if (!iso) return {text:"—", stale:false};
   const d = (Date.now() - new Date(iso).getTime()) / 86400000;
   if (d < 1) return {text:"сегодня", stale:false};
   if (d < 2) return {text:"вчера", stale:false};
@@ -360,6 +496,8 @@ function freshness(iso){
 }
 
 function card(o){
+  const wrap = document.createElement("div");
+  wrap.className = "wrap";
   const a = document.createElement("a");
   a.className = "card"; a.href = o.url; a.target = "_blank"; a.rel = "noopener";
   // The link is real, so middle-click and "open in new tab" still work; the
@@ -381,7 +519,70 @@ function card(o){
       <div class="meta"><span class="${f.stale ? "stale" : ""}">${f.text}</span>
         <span>−${money(o.saving)}</span></div>
     </div>`;
-  return a;
+  wrap.append(a);
+  wrap.append(heart_button(o.id, o.variant));
+  wire_hearts(wrap);
+  return wrap;
+}
+
+/* Избранное — не срез полки, и срезом быть не может: полка это то, что
+   подешевело, а вещь, за которой следят, обычно стоит свою обычную цену — за
+   этим за ней и следят. Поэтому карточка другая: цена сейчас, движение с того
+   дня, когда её отметили, и «нет в наличии» вместо пропажи из списка. */
+function fav_card(o){
+  const wrap = document.createElement("div");
+  wrap.className = "wrap";
+  const a = document.createElement("a");
+  a.className = "card"; a.href = o.url; a.target = "_blank"; a.rel = "noopener";
+  a.onclick = e => { e.preventDefault(); open_sheet(o.id, o.variant); };
+  const f = freshness(o.checked_at);
+  const move = (o.price != null && o.since) ? o.price - o.since : null;
+  const moved = move !== null && Math.abs(move) >= 0.01;
+  a.innerHTML = `
+    <div class="thumb">
+      ${o.image ? `<img loading="lazy" src="${esc(o.image)}" alt="">` : ""}
+      ${o.discount ? `<span class="badge">−${o.discount}%</span>` : ""}
+    </div>
+    <div class="body">
+      <div class="brand">${esc(o.brand || o.shop)}</div>
+      <div class="name">${esc(o.title)}</div>
+      <div class="prices">${o.price == null
+        ? `<span class="now gone">нет в наличии</span>`
+        : `<span class="now">${money(o.price)}</span>`}
+        ${moved && move < 0 ? `<span class="then">${money(o.since)}</span>` : ""}</div>
+      <div class="fav-line">${
+        moved
+          ? (move < 0 ? `<b>дешевле на ${money(-move)}</b>` : `дороже на ${money(move)}`)
+          : (o.since ? "цена та же" : "цена ещё не записана")}</div>
+      <div class="meta"><span>${esc(o.shop)}</span>
+        <span class="${f.stale ? "stale" : ""}">${f.text}</span></div>
+    </div>`;
+  wrap.append(a);
+  wrap.append(heart_button(o.id, o.variant));
+  wire_hearts(wrap);
+  return wrap;
+}
+
+async function load_favorites(){
+  // Список, пришедший вместе со страницей, рисуется без запроса — ссылка
+  // ?favorites=1 открывается сразу на нём, как и всё остальное здесь.
+  let items = seeded_favs;
+  seeded_favs = null;
+  if (!items){
+    let r;
+    try { r = await fetch("/api/favorites", {headers: tg_headers()}); } catch { return; }
+    if (!r.ok){ state.view = "shelf"; reload(); return; }
+    items = (await r.json()).items;
+  }
+  const d = {items};
+  starred = new Set(d.items.map(i => i.id));
+  draw_fav_count();
+  el("count").textContent = plural(d.items.length, "вещь", "вещи", "вещей");
+  el("more").hidden = true;
+  el("grid").innerHTML = d.items.length ? "" : `<div class="empty">Здесь пусто.<br>
+    Нажмите ♡ на любой карточке — и об этой вещи придёт уведомление, даже если
+    она подешевеет всего на пару процентов.</div>`;
+  for (const o of d.items) el("grid").append(fav_card(o));
 }
 
 function render(data, append){
@@ -413,6 +614,12 @@ function draw_mine(){
 function reload(){
   state.page = 0;
   draw_active();
+  el("fav").setAttribute("aria-pressed", String(state.view === "fav"));
+  if (state.view === "fav"){
+    el("whole").hidden = true;
+    load_favorites();
+    return;
+  }
   if (facets && facets_kids !== state.kids){
     save();
     fetch("/api/facets" + (state.kids ? "?kids=1" : ""))
@@ -443,6 +650,7 @@ function shop_row(o, mine, cheap){
 }
 
 async function open_sheet(id, variant){
+  reopen = () => open_sheet(id, variant);
   const d = el("sheet");
   el("sheet-body").innerHTML = "<p style='color:var(--dim)'>Смотрю, у кого ещё это есть…</p>";
   if (!d.open) d.showModal();
@@ -480,6 +688,7 @@ async function open_sheet(id, variant){
         <div class="prices"><span class="big">${money(ours.price)}</span>
           <span class="then">${money(ours.was)}</span>
           <span class="badge" style="position:static">−${ours.discount}%</span></div>
+        ${me === null ? "" : `<div style="margin-top:9px">${heart_inline(ours.id, ours.variant)}</div>`}
       </div>
     </div>
     ${verdict}
@@ -489,6 +698,7 @@ async function open_sheet(id, variant){
     </div>` : ""}
     ${elsewhere.length ? `<table>${all.map(o => shop_row(o, ours, cheap)).join("")}</table>` : ""}
     <a class="go" href="${esc(ours.url)}" target="_blank" rel="noopener">Открыть в ${esc(ours.shop)}</a>`;
+  wire_hearts(el("sheet-body"));
 }
 
 /* --- «пробить по всем магазинам»: полка против каталога --- */
@@ -505,6 +715,7 @@ function draw_whole(){
 }
 
 async function open_lookup(query){
+  reopen = () => open_lookup(query);
   const d = el("sheet");
   el("sheet-body").innerHTML = "<p style='color:var(--dim)'>Смотрю по всем магазинам…</p>";
   if (!d.open) d.showModal();
@@ -538,9 +749,11 @@ async function open_lookup(query){
       <td style="text-align:right">${money(o.price)}${
         o.discount_pct ? ` <span class="badge" style="position:static">−${Math.round(o.discount_pct)}%</span>` : ""}</td>
       <td><a href="${esc(o.url)}" target="_blank" rel="noopener">открыть</a></td>
+      ${me === null ? "" : `<td>${heart_inline(o.product_id, null)}</td>`}
     </tr>`).join("");
 
   el("sheet-body").innerHTML = head + `<table>${rows}</table>`;
+  wire_hearts(el("sheet-body"));
 }
 
 /* --- обработчики --- */
@@ -552,6 +765,10 @@ if (new URLSearchParams(location.search).has("filters")){
   el("panel").classList.add("open");
   el("toggle").setAttribute("aria-expanded", "true");
 }
+el("fav").onclick = () => {
+  state.view = state.view === "fav" ? "shelf" : "fav";
+  reload();
+};
 el("toggle").onclick = () => {
   const open = el("panel").classList.toggle("open");
   el("toggle").setAttribute("aria-expanded", open);
@@ -593,6 +810,13 @@ for (const [id, key] of [["pmin","min_price"], ["pmax","max_price"]]){
   if (asked) open_lookup(asked.trim());
 
   const seed = JSON.parse(el("seed").textContent).seed;
+  // Раньше всего, что рисует карточки: сердечко на них ставится по тому, знаем
+  // ли мы, кто смотрит.
+  if (seed && seed.me != null) announce(seed.me, seed.favorites);
+  if (seed && seed.favorites_items){
+    seeded_favs = seed.favorites_items;
+    state.view = "fav";
+  }
   const remembered = restore();
   // The server renders the first screenful from the query string, so the page
   // has to read it too — otherwise /?kids=1 paints the children's shelf and the
@@ -629,6 +853,7 @@ for (const [id, key] of [["pmin","min_price"], ["pmax","max_price"]]){
     kids_chip();
     draw_whole();
     render(seed.offers, false);
+    if (state.view === "fav") reload();
   } else if (seed){
     ready(seed.facets);
   } else {

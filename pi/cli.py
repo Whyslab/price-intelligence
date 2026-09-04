@@ -148,7 +148,27 @@ def cmd_web(args, config: Config) -> int:
             "behind something that has one",
             file=sys.stderr,
         )
-    web.serve(config.db_path, host=args.host, port=args.port)
+    # Open it once through the migrator: the server itself connects raw — one
+    # read-only handle per request — so nothing else here would ever bring an
+    # older database up to the schema this build writes favourites into.
+    dbm.connect(config.db_path).close()
+    if args.owner and args.host != "127.0.0.1":
+        # --owner is a machine saying "everyone who reaches me is this person".
+        # On localhost that is true. On an address other people can reach it
+        # hands them somebody else's favourites, so the two do not combine.
+        print(
+            "--owner works only on 127.0.0.1: away from this machine, identity "
+            "has to come from Telegram",
+            file=sys.stderr,
+        )
+        return 2
+    web.serve(
+        config.db_path,
+        host=args.host,
+        port=args.port,
+        bot_token=config.bot_token,
+        owner_id=args.owner,
+    )
     return 0
 
 
@@ -504,6 +524,12 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("web", help="browse the shelf in a browser")
     p.add_argument("--host", default="127.0.0.1", help="default: this machine only")
     p.add_argument("--port", type=int, default=8000)
+    p.add_argument(
+        "--owner",
+        type=int,
+        metavar="TELEGRAM_USER_ID",
+        help="be this reader without Telegram, for favourites while debugging",
+    )
     p.set_defaults(func=cmd_web)
 
     p = sub.add_parser("health", help="collection health summary")

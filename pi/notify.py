@@ -90,6 +90,7 @@ def format_caption(
     native_price: float | None = None,
     currency: str = "USD",
     landed: list | None = None,
+    since_usd: float | None = None,
     limit: int = CAPTION_LIMIT,
 ) -> str:
     """Build the HTML body of a deal notification."""
@@ -115,7 +116,14 @@ def format_caption(
         f"💰 <b>{_money(deal.price_usd)}</b> ({_reference_phrase(deal)})"
     )
     if deal.watched:
-        lines.append("⭐ Из вашего списка отслеживания")
+        # What it cost when this reader was last told about it. A different
+        # comparison from every other line here, and the one somebody following
+        # a particular thing actually asked for: not "cheaper than the market"
+        # but "cheaper than when you looked".
+        lines.append(
+            "⭐ Вы следите за этой вещью"
+            + (f" — было {_money(since_usd)}" if since_usd and since_usd > deal.price_usd else "")
+        )
     if deal.all_time_low:
         lines.append("📉 Минимум за всё время наблюдения")
     if deal.beats_market and deal.reference_source != "market":

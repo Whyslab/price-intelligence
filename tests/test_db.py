@@ -487,3 +487,132 @@ class TestLookingUpAnArticle:
         self._stock(conn, "shop.example", "AF1", 110.0, style="CW2288-111")
         assert dbm.lookup_article(conn, "CW")["shops"] == []
         assert dbm.lookup_article(conn, "")["shops"] == []
+
+
+class TestFollowingAProduct:
+    """Favourites: the one thing the page writes, and what the run reads back."""
+
+    @staticmethod
+    def _stock(conn, domain="shop.example", price=180.0, in_stock=True):
+        store = dbm.upsert_store(conn, domain, platform="shopify", currency="USD")
+        product = dbm.upsert_product(
+            conn, store, f"p-{domain}", "Salomon XT-6", f"https://{domain}/p",
+            brand="Salomon", image_url="https://img.example/x.jpg",
+        )
+        variant = dbm.upsert_variant(conn, product, f"v-{domain}", size_norm="EU44")
+        dbm.record_price(conn, variant, price, None, in_stock, "USD", price, 1.0)
+        return product, variant
+
+    def test_starring_writes_down_what_it_costs_today(self, conn):
+        """What "it got cheaper" will be measured against later."""
+        product, variant = self._stock(conn, price=180.0)
+
+        assert dbm.add_favorite(conn, 7, product, variant) is True
+
+        row = conn.execute("SELECT * FROM favorites").fetchone()
+        assert (row["user_id"], row["product_id"], row["variant_id"]) == (7, product, variant)
+        assert row["last_price_usd"] == 180.0
+        assert row["notify"] == 1
+
+    def test_starring_twice_is_the_same_wish_stated_twice(self, conn):
+        product, _ = self._stock(conn)
+        dbm.add_favorite(conn, 7, product)
+
+        assert dbm.add_favorite(conn, 7, product) is False
+        assert conn.execute("SELECT COUNT(*) FROM favorites").fetchone()[0] == 1
+
+    def test_something_sold_out_is_measured_from_what_it_last_cost(self, conn):
+        """One of the two ordinary reasons to follow a thing is that it is gone."""
+        product, _ = self._stock(conn, price=180.0, in_stock=False)
+
+        dbm.add_favorite(conn, 7, product)
+
+        assert conn.execute("SELECT last_price_usd FROM favorites").fetchone()[0] == 180.0
+
+    def test_a_product_never_priced_at_all_records_nothing(self, conn):
+        store = dbm.upsert_store(conn, "quiet.example", platform="shopify")
+        product = dbm.upsert_product(conn, store, "q1", "Never priced", "https://q/1")
+        dbm.upsert_variant(conn, product, "qv1")
+
+        dbm.add_favorite(conn, 7, product)
+
+        assert conn.execute("SELECT last_price_usd FROM favorites").fetchone()[0] is None
+
+    def test_unstarring_removes_it_and_says_so(self, conn):
+        product, _ = self._stock(conn)
+        dbm.add_favorite(conn, 7, product)
+
+        assert dbm.remove_favorite(conn, 7, product) is True
+        assert dbm.remove_favorite(conn, 7, product) is False
+        assert dbm.favorite_ids(conn, 7) == set()
+
+    def test_one_readers_list_is_not_anothers(self, conn):
+        mine, _ = self._stock(conn, "mine.example")
+        theirs, _ = self._stock(conn, "theirs.example")
+        dbm.add_favorite(conn, 7, mine)
+        dbm.add_favorite(conn, 9, theirs)
+
+        assert dbm.favorite_ids(conn, 7) == {mine}
+        assert dbm.following(conn) == {7: {mine}, 9: {theirs}}
+
+    def test_the_run_reads_everybodys_in_one_query(self, conn):
+        one, _ = self._stock(conn, "one.example")
+        two, _ = self._stock(conn, "two.example")
+        dbm.add_favorite(conn, 7, one)
+        dbm.add_favorite(conn, 7, two)
+        dbm.add_favorite(conn, 9, two)
+
+        assert dbm.following(conn) == {7: {one, two}, 9: {two}}
+
+    def test_deleting_a_product_takes_its_stars_with_it(self, conn):
+        product, _ = self._stock(conn)
+        dbm.add_favorite(conn, 7, product)
+
+        conn.execute("DELETE FROM products WHERE id = ?", (product,))
+
+        assert conn.execute("SELECT COUNT(*) FROM favorites").fetchone()[0] == 0
+
+    def test_the_list_carries_the_price_now_and_the_price_then(self, conn):
+        product, _ = self._stock(conn, price=180.0)
+        dbm.add_favorite(conn, 7, product)
+        conn.execute("UPDATE favorites SET last_price_usd = 220.0")
+
+        item = dbm.favorites_for(conn, 7)[0]
+
+        assert item["price_usd"] == 180.0
+        assert item["since_usd"] == 220.0, "what it cost when they were last told"
+        assert item["title"] == "Salomon XT-6"
+        assert item["domain"] == "shop.example"
+
+    def test_something_sold_out_keeps_its_place_in_the_list(self, conn):
+        """The most useful row there is — the thing you are waiting for, gone."""
+        product, _ = self._stock(conn, price=180.0, in_stock=False)
+        dbm.add_favorite(conn, 7, product)
+
+        item = dbm.favorites_for(conn, 7)[0]
+
+        assert item["product_id"] == product
+        assert item["price_usd"] is None
+
+    def test_a_starred_thing_that_is_also_on_the_shelf_says_so(self, conn):
+        product, variant = self._stock(conn, price=120.0)
+        conn.execute(
+            """
+            INSERT INTO offers (variant_id, product_id, found_at, checked_at,
+                                price_usd, reference_usd, reference_source,
+                                discount_pct, saving_usd, score, all_time_low)
+            VALUES (?, ?, ?, ?, 120.0, 200.0, 'market', 40.0, 80.0, 77, 0)
+            """,
+            (variant, product, ts(1), ts(0)),
+        )
+        dbm.add_favorite(conn, 7, product)
+
+        assert dbm.favorites_for(conn, 7)[0]["discount_pct"] == 40.0
+
+    def test_the_price_reported_is_updated_after_a_notification(self, conn):
+        product, _ = self._stock(conn, price=180.0)
+        dbm.add_favorite(conn, 7, product)
+
+        dbm.record_favorite_price(conn, 7, product, 149.0)
+
+        assert dbm.favorite_prices(conn, 7) == {product: 149.0}

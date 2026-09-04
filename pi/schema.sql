@@ -184,6 +184,38 @@ CREATE TABLE IF NOT EXISTS bot_users (
     active      INTEGER NOT NULL DEFAULT 1
 );
 
+-- What one reader asked to be told about, whatever the thresholds say.
+--
+-- The watchlist file does the same job for the owner and does it globally: one
+-- list, applied to everybody, edited by hand on the machine the collector runs
+-- on. This is the same idea addressed to a person — a thing somebody starred on
+-- the shelf or found by its article number, which from then on passes the bars
+-- that stop an ordinary discount.
+--
+-- No foreign key on user_id, and that is deliberate. It is Telegram's id, the
+-- same as bot_users.id, but the id in `.env` belongs to a reader who may never
+-- have spoken to the bot (see the note on personal.Subscriber), and a starred
+-- product failing to save because its owner has no row would be a bug nobody
+-- could diagnose from the page.
+--
+-- last_price_usd is what the thing cost when it was starred, or when its owner
+-- was last written to about it. It is what "it got cheaper" is measured
+-- against, which is a different question from "it is below its market price".
+CREATE TABLE IF NOT EXISTS favorites (
+    user_id        INTEGER NOT NULL,
+    product_id     INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+    -- Which size was being looked at. Kept so the notification can name it, and
+    -- allowed to go NULL rather than take the row with it when a shop drops a
+    -- size from its catalogue.
+    variant_id     INTEGER          REFERENCES variants(id) ON DELETE SET NULL,
+    added_at       TEXT    NOT NULL,
+    notify         INTEGER NOT NULL DEFAULT 1,
+    last_price_usd REAL,
+    PRIMARY KEY (user_id, product_id)
+);
+-- Read once per run, to collect everything anybody follows.
+CREATE INDEX IF NOT EXISTS ix_favorites_product ON favorites(product_id);
+
 CREATE TABLE IF NOT EXISTS runs (
     id             INTEGER PRIMARY KEY,
     started_at     TEXT    NOT NULL,

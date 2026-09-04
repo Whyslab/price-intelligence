@@ -221,3 +221,41 @@ class TestTheReferencePhraseNamesItsOwnEvidence:
             history_points=1, market_shops=9, msrp_usd=200.0, msrp_shops=3,
         )
         assert "по 9" in notify._reference_phrase(deal)
+
+
+class TestTellingSomebodyAboutSomethingTheyFollow:
+    """A different comparison from every other line: not "cheaper than the
+    market" but "cheaper than when you looked"."""
+
+    def test_it_names_the_price_they_last_saw(self):
+        caption = notify.format_caption(
+            a_deal(watched=True, price_usd=149.0),
+            title="Salomon XT-6", url="https://shop.example/p", since_usd=180.0,
+        )
+
+        assert "Вы следите за этой вещью" in caption
+        assert "было $180" in caption
+
+    def test_without_a_recorded_price_it_simply_says_less(self):
+        caption = notify.format_caption(
+            a_deal(watched=True), title="Salomon XT-6", url="https://shop.example/p"
+        )
+
+        assert "Вы следите за этой вещью" in caption
+        assert "было" not in caption
+
+    def test_a_thing_that_went_up_is_not_reported_as_a_fall(self):
+        """The line exists to show movement, and this movement is the wrong way."""
+        caption = notify.format_caption(
+            a_deal(watched=True, price_usd=200.0),
+            title="Salomon XT-6", url="https://shop.example/p", since_usd=180.0,
+        )
+
+        assert "было" not in caption
+
+    def test_nothing_is_said_to_somebody_who_follows_nothing(self):
+        caption = notify.format_caption(
+            a_deal(), title="Salomon XT-6", url="https://shop.example/p", since_usd=180.0,
+        )
+
+        assert "следите" not in caption

@@ -14,7 +14,7 @@ from .domains import same_shop
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 SCHEMA_SQL = Path(__file__).with_name("schema.sql")
 
 
@@ -1227,3 +1227,170 @@ def lookup_article(conn: sqlite3.Connection, query: str, limit: int = 25) -> dic
     result["found"] = len(rows)
     result["shops"] = rows[:limit]
     return result
+
+
+# ---------------------------------------------------------------- favourites
+
+def add_favorite(
+    conn: sqlite3.Connection,
+    user_id: int,
+    product_id: int,
+    variant_id: int | None = None,
+) -> bool:
+    """Start following a product for one reader. False if it was already followed.
+
+    The price it costs right now is written down with it, because that is what
+    "it got cheaper" will be measured against later.
+
+    Nothing in stock falls back to the last price the shop was asking, in
+    whatever state. Following something sold out is not the odd case, it is one
+    of the two ordinary reasons to follow anything — measured on a shoe picked
+    at random from the catalogue, every one of its 24 sizes was last seen out of
+    stock — and "it was $300 when you starred it" is true and useful whether or
+    not anybody could have bought it that day. The rigorous comparison is the
+    reference price in the notification; this one is only ever shown when it is
+    above what the thing costs now.
+    """
+    priced = _cheapest_per_product(conn, [product_id])
+    if priced:
+        was = priced[0]["price_usd"]
+    else:
+        row = conn.execute(
+            """
+            SELECT price_usd FROM price_points
+             WHERE variant_id IN (SELECT id FROM variants WHERE product_id = ?)
+             ORDER BY ts DESC LIMIT 1
+            """,
+            (product_id,),
+        ).fetchone()
+        was = row[0] if row else None
+    cur = conn.execute(
+        """
+        INSERT OR IGNORE INTO favorites
+            (user_id, product_id, variant_id, added_at, notify, last_price_usd)
+        VALUES (?, ?, ?, ?, 1, ?)
+        """,
+        (user_id, product_id, variant_id, utcnow(), round(was, 2) if was else None),
+    )
+    return cur.rowcount > 0
+
+
+def remove_favorite(conn: sqlite3.Connection, user_id: int, product_id: int) -> bool:
+    """Stop following it. False if it was not being followed."""
+    cur = conn.execute(
+        "DELETE FROM favorites WHERE user_id = ? AND product_id = ?",
+        (user_id, product_id),
+    )
+    return cur.rowcount > 0
+
+
+def favorite_ids(conn: sqlite3.Connection, user_id: int) -> set[int]:
+    """Which products this reader follows. What the page draws its hearts from."""
+    return {
+        row[0]
+        for row in conn.execute(
+            "SELECT product_id FROM favorites WHERE user_id = ?", (user_id,)
+        )
+    }
+
+
+def following(conn: sqlite3.Connection) -> dict[int, set[int]]:
+    """Everything anybody is following, by reader.
+
+    One query for the whole run. The union of these is what has to be scored —
+    a followed product must be judged before anyone can be told about it, and
+    scoring is the half that is shared — while the per-reader sets decide who
+    actually hears.
+    """
+    out: dict[int, set[int]] = {}
+    for row in conn.execute(
+        "SELECT user_id, product_id FROM favorites WHERE notify = 1"
+    ):
+        out.setdefault(row[0], set()).add(row[1])
+    return out
+
+
+def favorite_prices(conn: sqlite3.Connection, user_id: int) -> dict[int, float | None]:
+    """What each of this reader's followed products cost when last reported."""
+    return {
+        row[0]: row[1]
+        for row in conn.execute(
+            "SELECT product_id, last_price_usd FROM favorites"
+            " WHERE user_id = ? AND notify = 1",
+            (user_id,),
+        )
+    }
+
+
+def record_favorite_price(
+    conn: sqlite3.Connection, user_id: int, product_id: int, price_usd: float
+) -> None:
+    """Remember what it cost when this reader was last written to about it."""
+    conn.execute(
+        "UPDATE favorites SET last_price_usd = ? WHERE user_id = ? AND product_id = ?",
+        (round(price_usd, 2), user_id, product_id),
+    )
+
+
+def favorites_for(conn: sqlite3.Connection, user_id: int) -> list[dict]:
+    """What this reader follows, newest first, priced as it stands now.
+
+    Not a slice of the shelf, and it cannot be one. The shelf holds what is
+    discounted; a followed product is usually at its normal price — that is
+    ordinarily the whole reason for following it — so narrowing `offers` to
+    these ids would show a person most of their own list missing with no
+    explanation. So the list is built from the products themselves, and the
+    discount is an extra fact about a row rather than the reason it is there.
+
+    A product with nothing in stock keeps its place with `price` None. It is the
+    single most useful row in the list — the thing you are waiting for, sold out
+    — and dropping it would look like the star had been forgotten.
+    """
+    rows = conn.execute(
+        """
+        SELECT f.product_id, f.variant_id, f.added_at, f.notify, f.last_price_usd,
+               p.title, p.url, p.image_url, p.brand, p.brand_family, p.brand_norm,
+               p.gender, p.kind, p.audience,
+               s.domain, s.name AS store_name, s.country, s.last_ok,
+               (SELECT MAX(discount_pct) FROM offers WHERE product_id = p.id) AS discount_pct
+          FROM favorites f
+          JOIN products p ON p.id = f.product_id
+          JOIN stores   s ON s.id = p.store_id
+         WHERE f.user_id = ?
+         ORDER BY f.added_at DESC
+        """,
+        (user_id,),
+    ).fetchall()
+
+    ids = [row["product_id"] for row in rows]
+    # In batches, because `_cheapest_per_product` names every id in the query
+    # and a long list of favourites is a perfectly reasonable thing to have.
+    priced: dict[int, sqlite3.Row] = {}
+    for start in range(0, len(ids), MAX_LOOKUP_PRODUCTS):
+        for row in _cheapest_per_product(conn, ids[start : start + MAX_LOOKUP_PRODUCTS]):
+            priced[row["product_id"]] = row
+
+    out: list[dict] = []
+    for row in rows:
+        live = priced.get(row["product_id"])
+        out.append(
+            {
+                "product_id": row["product_id"],
+                "variant_id": row["variant_id"],
+                "added_at": row["added_at"],
+                "since_usd": row["last_price_usd"],
+                "title": row["title"],
+                "url": row["url"],
+                "image_url": row["image_url"],
+                "brand": row["brand_family"] or row["brand_norm"] or row["brand"],
+                "store_name": row["store_name"],
+                "domain": row["domain"],
+                "country": row["country"],
+                "checked_at": row["last_ok"],
+                "discount_pct": row["discount_pct"],
+                "price_usd": round(live["price_usd"], 2) if live else None,
+                "currency": live["currency"] if live else None,
+                "price_native": live["price_native"] if live else None,
+            }
+        )
+    return out

@@ -8,11 +8,18 @@ not a reason to hide them.
 from __future__ import annotations
 
 import json
+import threading
+from contextlib import contextmanager
+from http.server import ThreadingHTTPServer
+from pathlib import Path
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 
 from pi import db as dbm
 from pi import web
 
 from .conftest import ts
+from .test_webauth import TOKEN, signed
 
 
 def a_shelf(conn, n=3):
@@ -508,3 +515,184 @@ class TestLookingSomethingUpFromThePage:
         row = web.lookup_page(conn, "CW2288-111")["shops"][0]
         assert set(row) >= {"shop", "url", "title", "price", "country", "checked_at"}
         assert json.dumps(row), "must survive the trip to the browser"
+
+
+class TestStarringSomethingOverHttp:
+    """The one thing this server writes, and the check that stands in front of it.
+
+    Over a real socket rather than by calling the handler's methods, because
+    what is being tested is a rule about requests: no header, no write, with no
+    exemption for the machine the server happens to be running on.
+    """
+
+    @staticmethod
+    @contextmanager
+    def _serving(conn, **attrs):
+        path = Path(conn.execute("PRAGMA database_list").fetchone()[2])
+        handler = type("Bound", (web.Handler,), {"db_path": path, **attrs})
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        # A short poll, or every one of these tests spends half a second in
+        # shutdown() waiting for serve_forever's default interval to come round.
+        thread = threading.Thread(target=server.serve_forever, args=(0.02,), daemon=True)
+        thread.start()
+        try:
+            yield f"http://127.0.0.1:{server.server_address[1]}"
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    @staticmethod
+    def _call(url, method="GET", body=None, headers=None):
+        request = Request(
+            url,
+            method=method,
+            data=json.dumps(body).encode() if body is not None else None,
+            headers={"Content-Type": "application/json", **(headers or {})},
+        )
+        try:
+            with urlopen(request, timeout=5) as response:
+                return response.status, json.loads(response.read() or b"{}")
+        except HTTPError as failure:
+            return failure.code, json.loads(failure.read() or b"{}")
+
+    @staticmethod
+    def _a_product(conn):
+        store = dbm.upsert_store(conn, "shop.example", platform="shopify", currency="USD")
+        product = dbm.upsert_product(
+            conn, store, "p1", "Salomon XT-6", "https://shop.example/p1", brand="Salomon"
+        )
+        variant = dbm.upsert_variant(conn, product, "v1", size_norm="EU44")
+        dbm.record_price(conn, variant, 180.0, None, True, "USD", 180.0, 1.0)
+        return product, variant
+
+    def test_without_an_identity_nothing_can_be_starred(self, conn):
+        """Not even from this machine: an exemption for localhost is invisible
+        from outside, and `--host 0.0.0.0` is a flag that exists."""
+        product, _ = self._a_product(conn)
+        with self._serving(conn) as base:
+            code, _ = self._call(f"{base}/api/favorites", "POST", {"product_id": product})
+
+        assert code == 401
+        assert conn.execute("SELECT COUNT(*) FROM favorites").fetchone()[0] == 0
+
+    def test_a_forged_signature_is_not_an_identity(self, conn):
+        product, _ = self._a_product(conn)
+        with self._serving(conn, bot_token="123:AA") as base:
+            code, _ = self._call(
+                f"{base}/api/favorites", "POST", {"product_id": product},
+                {"X-Telegram-Init-Data": "user=%7B%22id%22%3A5%7D&hash=deadbeef"},
+            )
+
+        assert code == 401
+
+    def test_telegram_says_who_it_is_and_the_star_is_saved(self, conn):
+        product, variant = self._a_product(conn)
+        with self._serving(conn, bot_token=TOKEN) as base:
+            code, body = self._call(
+                f"{base}/api/favorites", "POST",
+                {"product_id": product, "variant_id": variant},
+                {"X-Telegram-Init-Data": signed(user_id=7)},
+            )
+
+        assert (code, body["added"]) == (201, True)
+        assert dbm.favorite_ids(conn, 7) == {product}
+
+    def test_the_owner_flag_stands_in_for_telegram(self, conn):
+        """What debugging outside Telegram uses, and it has to be typed."""
+        product, _ = self._a_product(conn)
+        with self._serving(conn, owner_id=7) as base:
+            code, _ = self._call(f"{base}/api/favorites", "POST", {"product_id": product})
+            listed_code, listed = self._call(f"{base}/api/favorites")
+
+        assert code == 201
+        assert listed_code == 200
+        assert [item["id"] for item in listed["items"]] == [product]
+        assert listed["user"] == 7
+
+    def test_starring_something_that_does_not_exist_is_refused(self, conn):
+        self._a_product(conn)
+        with self._serving(conn, owner_id=7) as base:
+            code, _ = self._call(f"{base}/api/favorites", "POST", {"product_id": 9999})
+
+        assert code == 404
+
+    def test_a_body_without_a_product_is_a_bad_request_not_a_crash(self, conn):
+        with self._serving(conn, owner_id=7) as base:
+            code, _ = self._call(f"{base}/api/favorites", "POST", {"nothing": True})
+
+        assert code == 400
+
+    def test_unstarring_removes_it(self, conn):
+        product, _ = self._a_product(conn)
+        with self._serving(conn, owner_id=7) as base:
+            self._call(f"{base}/api/favorites", "POST", {"product_id": product})
+            code, body = self._call(f"{base}/api/favorites/{product}", "DELETE")
+
+        assert (code, body["removed"]) == (200, True)
+        assert dbm.favorite_ids(conn, 7) == set()
+
+    def test_one_readers_star_is_invisible_to_another(self, conn):
+        product, _ = self._a_product(conn)
+        with self._serving(conn, bot_token=TOKEN) as base:
+            self._call(
+                f"{base}/api/favorites", "POST", {"product_id": product},
+                {"X-Telegram-Init-Data": signed(user_id=7)},
+            )
+            _, theirs = self._call(
+                f"{base}/api/favorites", headers={"X-Telegram-Init-Data": signed(user_id=9)}
+            )
+
+        assert theirs["items"] == []
+
+    def test_reading_the_shelf_still_needs_nobody(self, conn):
+        """Favourites are the only thing that needs a name; browsing never did."""
+        a_shelf(conn, 2)
+        with self._serving(conn) as base:
+            code, body = self._call(f"{base}/api/offers")
+
+        assert (code, body["total"]) == (200, 2)
+
+    @staticmethod
+    def _page(url):
+        with urlopen(url, timeout=5) as response:
+            return response.read().decode("utf-8")
+
+    def test_the_page_arrives_with_the_owners_hearts_already_on_it(self, conn):
+        """No round trip and no flash: the server already knows who this is."""
+        product, _ = self._a_product(conn)
+        a_shelf(conn, 1)
+        with self._serving(conn, owner_id=7) as base:
+            self._call(f"{base}/api/favorites", "POST", {"product_id": product})
+            page = self._page(base + "/")
+
+        assert '"me": 7' in page
+        assert f'"favorites": [{product}]' in page
+
+    def test_a_link_to_the_list_arrives_with_the_list_in_it(self, conn):
+        """?favorites=1 is a link somebody can be sent, so it opens on the answer."""
+        product, _ = self._a_product(conn)
+        with self._serving(conn, owner_id=7) as base:
+            self._call(f"{base}/api/favorites", "POST", {"product_id": product})
+            page = self._page(base + "/?favorites=1")
+            ordinary = self._page(base + "/")
+
+        assert "Salomon XT-6" in page
+        assert '"favorites_items": null' in ordinary, "an unopened list costs nothing"
+
+    def test_a_page_served_to_nobody_says_so(self, conn):
+        a_shelf(conn, 1)
+        with self._serving(conn) as base:
+            page = self._page(base + "/")
+
+        assert '"me": null' in page
+
+    def test_a_starred_row_carries_what_the_card_draws(self, conn):
+        product, _ = self._a_product(conn)
+        with self._serving(conn, owner_id=7) as base:
+            self._call(f"{base}/api/favorites", "POST", {"product_id": product})
+            _, listed = self._call(f"{base}/api/favorites")
+
+        item = listed["items"][0]
+        assert set(item) >= {"id", "title", "url", "image", "shop", "price", "since"}
+        assert item["price"] == 180.0
