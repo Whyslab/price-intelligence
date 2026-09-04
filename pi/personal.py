@@ -32,6 +32,10 @@ from . import landed
 from .config import Filters
 
 # Added to the discount's own score to order one reader's list.
+# Following something by name outweighs every bonus here put together, and
+# deliberately so: the rest are guesses about what somebody might want, and this
+# one is what they said they wanted.
+FOLLOWED_BONUS = 50
 OWN_SIZE_BONUS = 25
 FAVOURITE_BRAND_BONUS = 15
 WANTED_KIND_BONUS = 10
@@ -146,15 +150,24 @@ def ranker(
     min_score: int,
     shipping: landed.Rules = landed.EMPTY,
     eur_usd: float | None = None,
+    following: frozenset[int] | set[int] = frozenset(),
 ):
     """A (deal, row) -> priority-or-None function for `find_deals` to sort by.
 
     None means below this reader's bar. The wanted gender is the one place that
     does filter rather than adjust: asking for women's things and being sent
     men's is not a near miss, it is the wrong answer.
+
+    `following` is the set of products this reader starred, and it passes
+    everything — the bar, the gender, the lot. Every other rule here is an
+    inference from a profile about what somebody probably wants; a star is the
+    person saying it. A shoe classified as men's, in a size they do not take,
+    at 6% off, is still the shoe they asked to be told about.
     """
 
     def rank(deal, row: sqlite3.Row) -> float | None:
+        if deal.product_id in following:
+            return priority(deal, row, reader, shipping, eur_usd) + FOLLOWED_BONUS
         wants_women_only = "women" in reader.genders and "men" not in reader.genders
         if wants_women_only and row["gender"] != "women":
             return None

@@ -617,19 +617,30 @@ def arrange_for(
     that cannot be asked to show what it hid has no way to reveal a
     misclassification. So the deal is computed either way and withheld only
     from the list somebody is interrupted with.
+
+    `watched` is this reader's own list — the owner's watchlist file plus what
+    they starred. Scoring was told the union of everybody's, because a product
+    has to be judged before anyone can be told about it and judging is the
+    shared half; which of them belongs to *this* reader is decided here, and the
+    deal carries the answer so the notification does not tell somebody they are
+    following a thing they never heard of.
     """
     best_per_product: dict[int, tuple[dealm.Deal, sqlite3.Row]] = {}
     for deal, row in scored:
-        if skip_alerted and dealm.already_alerted(conn, deal, user_id):
+        follows = bool(watched and deal.product_id in watched)
+        if skip_alerted and dealm.already_alerted(
+            conn,
+            deal,
+            user_id,
+            dealm.FAVORITE_RE_ALERT_DROP if follows else dealm.RE_ALERT_DROP,
+        ):
             continue
         # A watched article still arrives: naming an article is a clearer
         # statement of intent than any classifier's reading of a title.
-        if (
-            not kids
-            and row["audience"] == "kids"
-            and not (watched and deal.product_id in watched)
-        ):
+        if not kids and row["audience"] == "kids" and not follows:
             continue
+        if deal.watched != follows:
+            deal = replace(deal, watched=follows)
         # One notification per product: the same hoodie discounted in six sizes
         # is one thing worth knowing, so keep only its best-scoring variant.
         previous = best_per_product.get(deal.product_id)
@@ -730,6 +741,7 @@ def caption_for(
     conn: sqlite3.Connection,
     shipping: landed.Rules = landed.EMPTY,
     eur_usd: float | None = None,
+    since_usd: float | None = None,
 ) -> str:
     point = dbm.latest_point(conn, deal.variant_id)
     return format_caption(
@@ -747,6 +759,7 @@ def caption_for(
             shipping, deal.price_usd, row["kind"], row["domain"],
             row["country"], eur_usd,
         ),
+        since_usd=since_usd,
     )
 
 
@@ -926,6 +939,16 @@ async def run(
         watching = watched_products(conn, codes)
         if codes:
             log.info("watching %d article(s), matching %d product(s)", len(codes), len(watching))
+        # What each reader starred on the shelf, and the union of all of it.
+        # The union is what scoring has to be told: a followed product must be
+        # judged before anybody can be told about it, and judging happens once
+        # for everyone. Who actually hears is decided per reader below.
+        followed = dbm.following(conn)
+        anyones = watching.union(*followed.values()) if followed else watching
+        if followed:
+            log.info(
+                "%d reader(s) following %d product(s)", len(followed), len(anyones) - len(watching)
+            )
         # Two passes over the same variants, because the two questions differ.
         # The notification list is trimmed on purpose — capped per shop, one
         # alert per article, nothing announced twice — while the browsable list
@@ -938,7 +961,7 @@ async def run(
         # two million price points. What follows per reader is arrangement.
         scored = score_variants(
             conn, scorable, shelf_config(config), market=market, trust=trust,
-            watched=watching,
+            watched=anyones,
         )
         # The shelf is written whole, children's clothing included: hiding it
         # is the page's decision (pi.db.offers_for), and a row that was never
@@ -967,14 +990,20 @@ async def run(
             log.info("%d readers", len(readers))
 
         queues: list[tuple[personal.Subscriber, list[tuple[dealm.Deal, sqlite3.Row]]]] = []
+        # What each reader's starred things cost the last time they were told,
+        # so the notification can say what moved rather than only what it is
+        # worth against the market.
+        since = {r.user_id: dbm.favorite_prices(conn, r.user_id) for r in readers}
         capped_anyone = False
         for reader in readers:
+            mine = watching | followed.get(reader.user_id, set())
             candidates = arrange_for(
                 conn, scored, shelf_config(config), market, user_id=reader.user_id,
                 rank=personal.ranker(
-                    reader.reader, config.filters.min_score, shipping, eur_usd
+                    reader.reader, config.filters.min_score, shipping, eur_usd,
+                    following=followed.get(reader.user_id, set()),
                 ),
-                watched=watching,
+                watched=mine,
             )
             selected = candidates[:cap]
             overflow = len(candidates) - len(selected)
@@ -1005,7 +1034,10 @@ async def run(
                     print(f"=== {reader.label} ({len(selected)})")
                 for deal, row in selected:
                     print("-" * 60)
-                    print(caption_for(deal, row, conn, shipping, eur_usd))
+                    print(caption_for(
+                        deal, row, conn, shipping, eur_usd,
+                        since_usd=since.get(reader.user_id, {}).get(deal.product_id),
+                    ))
                     print(
                         f"[score {deal.score} · image "
                         f"{'yes' if row['image_url'] else 'no'}]"
@@ -1020,7 +1052,8 @@ async def run(
 
         for reader, selected in queues:
             stats.alerts_sent += await _send_to(
-                conn, config, client, reader, selected, shipping, eur_usd
+                conn, config, client, reader, selected, shipping, eur_usd,
+                since.get(reader.user_id, {}),
             )
 
     _record_block(conn, run_id, limiter)
@@ -1039,8 +1072,10 @@ async def _send_to(
     selected: list[tuple[dealm.Deal, sqlite3.Row]],
     shipping: landed.Rules,
     eur_usd: float | None,
+    since: dict[int, float | None] | None = None,
 ) -> int:
     """Write one reader's queue to their chat. Returns how many arrived."""
+    since = since or {}
     sent = 0
     async with Telegram(config.bot_token, reader.chat_id, client) as telegram:
         for deal, row in selected:
@@ -1050,9 +1085,20 @@ async def _send_to(
             ):
                 continue
             if await telegram.send_deal(
-                caption_for(deal, row, conn, shipping, eur_usd), row["image_url"]
+                caption_for(
+                    deal, row, conn, shipping, eur_usd,
+                    since_usd=since.get(deal.product_id),
+                ),
+                row["image_url"],
             ):
                 sent += 1
+                if deal.product_id in since:
+                    # Next time is measured from this price, not from the one it
+                    # was starred at — otherwise a thing that keeps drifting down
+                    # reports the same total fall over and over.
+                    dbm.record_favorite_price(
+                        conn, reader.user_id, deal.product_id, deal.price_usd
+                    )
             else:
                 conn.execute(
                     "DELETE FROM alerts "

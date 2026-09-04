@@ -42,6 +42,12 @@ from .reference import MAX_DROP, Market, Trust, prior_floor
 MIN_HISTORY_DAYS = 7
 BUCKET_RATIO = 1.05   # bucket width, used only for the UNIQUE backstop
 RE_ALERT_DROP = 0.95  # a repeat needs the price at least 5% below the last alert
+# The same rule for something a reader asked to follow by name. 5% is the bar
+# for an unsolicited interruption about a thing nobody named; being told again
+# about the one product you starred is not an interruption of the same kind, and
+# on a $200 jacket 2% is $4 — small, but exactly the size of movement somebody
+# waiting for a particular thing wants to know about.
+FAVORITE_RE_ALERT_DROP = 0.98
 
 
 def price_bucket(price_usd: float) -> int:
@@ -298,7 +304,12 @@ def evaluate(
     )
 
 
-def already_alerted(conn: sqlite3.Connection, deal: Deal, user_id: int = 0) -> bool:
+def already_alerted(
+    conn: sqlite3.Connection,
+    deal: Deal,
+    user_id: int = 0,
+    re_alert_drop: float = RE_ALERT_DROP,
+) -> bool:
     """True unless the price has fallen a further RE_ALERT_DROP below the best
     price we have already announced for this product *to this reader*.
 
@@ -324,7 +335,7 @@ def already_alerted(conn: sqlite3.Connection, deal: Deal, user_id: int = 0) -> b
     ).fetchone()[0]
     if best is None:
         return False
-    return deal.price_usd >= best * RE_ALERT_DROP
+    return deal.price_usd >= best * re_alert_drop
 
 
 def record_alert(

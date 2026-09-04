@@ -293,3 +293,119 @@ class TestMigratingToPerReaderAlerts:
             assert conn.execute("PRAGMA user_version").fetchone()[0] == dbm.SCHEMA_VERSION
         finally:
             conn.close()
+
+
+class TestFollowingAProduct:
+    """A star on the shelf is the reader saying it, and it outranks every guess.
+
+    The expensive half is shared, so scoring is told the union of everybody's
+    lists; who actually hears is decided in the cheap half. These are the tests
+    of that seam, because getting it wrong either tells everyone about one
+    person's shoe or tells nobody about their own.
+    """
+
+    @staticmethod
+    def _scored(conn, score: int = 20, price: float = 97.0) -> list:
+        """One deal nobody would be interrupted with: 20 points, well under the bar."""
+        product = a_product(conn)
+        conn.execute(
+            "UPDATE products SET gender = 'women', kind = 'shoes', brand_family = 'Salomon'"
+            " WHERE id = ?", (product,),
+        )
+        row = conn.execute(
+            """
+            SELECT v.id AS variant_id, v.product_id, v.size_norm, s.domain, s.country,
+                   p.audience, p.gender, p.kind, p.brand_family, p.brand_norm
+              FROM variants v
+              JOIN products p ON p.id = v.product_id
+              JOIN stores   s ON s.id = p.store_id
+             WHERE v.product_id = ?
+            """,
+            (product,),
+        ).fetchone()
+        deal = a_deal(product_id=product, price=price)
+        deal.score = score
+        return [(deal, row)]
+
+    def _ranker(self, config, following=frozenset()):
+        return personal.ranker(
+            personal.Reader(genders=frozenset({"men"})),
+            config.filters.min_score,
+            following=following,
+        )
+
+    def test_a_starred_thing_arrives_below_every_bar(self, config, conn):
+        """20 points against a bar of 50, and a gender the reader did not ask for."""
+        scored = self._scored(conn, score=20)
+        product = scored[0][0].product_id
+
+        arrived = pipeline.arrange_for(
+            conn, scored, config, market=None, user_id=7,
+            rank=self._ranker(config, {product}), fold_duplicates=False,
+            watched={product},
+        )
+
+        assert len(arrived) == 1
+
+    def test_the_same_thing_does_not_reach_somebody_who_did_not_star_it(self, config, conn):
+        scored = self._scored(conn, score=20)
+
+        assert pipeline.arrange_for(
+            conn, scored, config, market=None, user_id=9,
+            rank=self._ranker(config), fold_duplicates=False,
+        ) == []
+
+    def test_the_notification_says_it_is_theirs_and_not_the_other_readers(
+        self, config, conn
+    ):
+        """`watched` is set at scoring for everybody at once, so the flag on the
+        deal has to be rewritten per reader or it tells the wrong person."""
+        scored = self._scored(conn, score=90)
+        product = scored[0][0].product_id
+
+        mine = pipeline.arrange_for(
+            conn, scored, config, market=None, user_id=7, fold_duplicates=False,
+            watched={product},
+        )
+        theirs = pipeline.arrange_for(
+            conn, scored, config, market=None, user_id=9, fold_duplicates=False,
+        )
+
+        assert mine[0][0].watched is True
+        assert theirs[0][0].watched is False
+
+    def test_a_second_word_about_a_starred_thing_needs_only_two_percent(
+        self, config, conn
+    ):
+        scored = self._scored(conn, score=90, price=97.0)
+        product = scored[0][0].product_id
+        dealm.record_alert(conn, a_deal(product_id=product, price=100.0), dbm.utcnow(), user_id=7)
+
+        starred = pipeline.arrange_for(
+            conn, scored, config, market=None, user_id=7, fold_duplicates=False,
+            watched={product},
+        )
+        ordinary = pipeline.arrange_for(
+            conn, scored, config, market=None, user_id=7, fold_duplicates=False,
+        )
+
+        assert len(starred) == 1, "3% below the last word, and they asked for this one"
+        assert ordinary == [], "the same 3% is not worth interrupting anyone else with"
+
+    def test_two_percent_is_a_bar_and_not_an_absence_of_one(self, config, conn):
+        scored = self._scored(conn, score=90, price=99.0)
+        product = scored[0][0].product_id
+        dealm.record_alert(conn, a_deal(product_id=product, price=100.0), dbm.utcnow(), user_id=7)
+
+        assert pipeline.arrange_for(
+            conn, scored, config, market=None, user_id=7, fold_duplicates=False,
+            watched={product},
+        ) == [], "1% is not news even about a thing somebody is waiting for"
+
+    def test_nobody_following_anything_changes_nothing(self, config, conn):
+        scored = self._scored(conn, score=90)
+
+        assert dbm.following(conn) == {}
+        assert len(pipeline.arrange_for(
+            conn, scored, config, market=None, user_id=7, fold_duplicates=False,
+        )) == 1
