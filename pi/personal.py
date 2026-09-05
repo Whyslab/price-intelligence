@@ -28,7 +28,7 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass
 
-from . import landed
+from . import db, landed
 from .config import Filters
 
 # Added to the discount's own score to order one reader's list.
@@ -220,14 +220,21 @@ def subscribers(
 ) -> list[Subscriber]:
     """Everyone this run should write to, the owner first.
 
-    Anyone who has spoken to the bot and not blocked it is a reader, whether or
-    not they finished the wizard: somebody who pressed /start and skipped the
-    questions is saying they want everything, not that they want nothing.
-
-    The owner is always included even with no profile of their own, because the
-    chat id in `.env` is what a fresh install has instead of a subscriber list,
-    and a run that wrote to nobody would look exactly like a run that found
+    Anyone who has spoken to the bot, not blocked it and is paying is a reader,
+    whether or not they finished the wizard: somebody who pressed /start and
+    skipped the questions is saying they want everything, not that they want
     nothing.
+
+    Paying is what the feed is. A reader who has not subscribed hears from the
+    digest once a day and not from here — the whole difference being sold is
+    that this arrives when the price falls rather than at six in the evening.
+    The grace period counts as paying, which is the entire point of having one:
+    a failed renewal should cost the reader a reminder, not the product.
+
+    The owner is always included, and never asked to pay. The chat id in `.env`
+    is what a fresh install has instead of a subscriber list, a run that wrote
+    to nobody would look exactly like a run that found nothing, and the person
+    who owns the collector is not a customer of it.
     """
     out: list[Subscriber] = []
     seen: set[str] = set()
@@ -242,6 +249,8 @@ def subscribers(
     for row in rows:
         chat_id = str(row["chat_id"])
         if chat_id in seen:
+            continue
+        if chat_id != owner and db.subscription_state(conn, int(row["id"])) == "free":
             continue
         seen.add(chat_id)
         reader = Reader.from_profile(row)

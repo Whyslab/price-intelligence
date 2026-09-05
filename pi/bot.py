@@ -184,17 +184,103 @@ def format_card(row: sqlite3.Row, sizes: list[tuple[str, bool]], now: str,
     return "\n".join(lines)
 
 
+# --- subscription -----------------------------------------------------------
+
+# What it costs, in Telegram Stars. A year is ten months' worth: the discount is
+# the reason to commit, and a reader who commits is one the renewal cannot lose.
+MONTHLY_STARS = 150
+YEARLY_STARS = 1500
+
+
+def subscription_pitch(conn: sqlite3.Connection) -> str:
+    """Why this is worth paying for, in the terms a free channel cannot match.
+
+    Honesty is invisible. "−28%, because that is the real thirty-day low" reads
+    as a worse deal than "−70% 🔥" to somebody who has not yet been burned, so
+    what is sold here is not the honesty but its three visible consequences.
+
+    The numbers are counted from the shelf at the moment of asking rather than
+    written into the text. A claim about the size of the catalogue is the one
+    thing a reader can check in the next thirty seconds, and a stale one is
+    worse than no number at all.
+    """
+    shelf = conn.execute("SELECT COUNT(*) FROM offers").fetchone()[0]
+    compared = conn.execute(
+        "SELECT COUNT(*) FROM offers WHERE reference_source = 'market'"
+    ).fetchone()[0]
+    shops = conn.execute(
+        "SELECT COUNT(*) FROM stores WHERE platform IN ('shopify', 'jsonld', 'asos')"
+    ).fetchone()[0]
+    # Thousands separated with a space, the way Russian writes them. Formatting
+    # each number on its own rather than substituting over the finished text:
+    # doing it to the whole string would eat the commas in the sentences too.
+    def spaced(n: int) -> str:
+        return f"{n:,}".replace(",", " ")
+
+    return "\n".join([
+        "💎 <b>Что даёт подписка</b>",
+        "",
+        f"Сейчас бесплатно вы видите 2 находки в день. На полке лежит "
+        f"<b>{spaced(shelf)}</b> "
+        f"{plural_word(shelf, 'предложение', 'предложения', 'предложений')} из "
+        f"{shops} {plural_word(shops, 'магазина', 'магазинов', 'магазинов')}, "
+        "и подписка открывает их все.",
+        "",
+        "<b>Что умеет только этот бот:</b>",
+        "",
+        f"1️⃣ <b>Дешевле, чем у соседей.</b> {spaced(compared)} "
+        f"{plural_word(compared, 'предложение сравнено', 'предложения сравнены', 'предложений сравнены')} "
+        "с ценой на ту же вещь в других магазинах по артикулу производителя. "
+        "Канал со скидками пересылает ярлык — сравнить ему не с чем.",
+        "",
+        "2️⃣ <b>Цена подтверждена, а не найдена когда-то.</b> На каждой карточке "
+        "написано, когда магазин в последний раз показал эту цену. Товар, "
+        "который сняли с продажи, уходит с полки.",
+        "",
+        "3️⃣ <b>Цена на руках.</b> С доставкой и пошлиной в вашу страну, а не "
+        "только та, что на ярлыке: −50% из Лос-Анджелеса и −50% из Берлина — "
+        "это разные деньги.",
+        "",
+        "<b>Плюс:</b> поиск по артикулу и названию, лента под ваши размеры и "
+        "марки, слежка за отмеченным — о нём напишут, даже если скидка не "
+        "дотягивает до общих порогов.",
+        "",
+        f"⭐ <b>{MONTHLY_STARS} звёзд в месяц</b> или {YEARLY_STARS} за год "
+        "(два месяца в подарок).",
+    ])
+
+
+def subscription_keyboard() -> dict:
+    return {
+        "inline_keyboard": [
+            [{"text": f"⭐ Месяц — {MONTHLY_STARS}", "callback_data": "buy:month"},
+             {"text": f"⭐ Год — {YEARLY_STARS}", "callback_data": "buy:year"}],
+            [{"text": "◀️ Назад", "callback_data": "menu"}],
+        ]
+    }
+
+
 # --- keyboards --------------------------------------------------------------
 
 BOT_LOOKUP_LIMIT = 8
 
 
-def plural(n: int, one: str, few: str, many: str) -> str:
-    """Russian counts, because "26 магазин(ов)" is a developer in the text."""
+def plural_word(n: int, one: str, few: str, many: str) -> str:
+    """Which of the three Russian forms goes with this count, without the count.
+
+    Separate from `plural` because a number is not always written the way
+    `str(int)` writes it: thousands in these texts are spaced, and pasting the
+    count in twice is exactly the bug this split prevents.
+    """
     tail, unit = abs(n) % 100, abs(n) % 10
     if 10 < tail < 20:
-        return f"{n} {many}"
-    return f"{n} {one if unit == 1 else few if 1 < unit < 5 else many}"
+        return many
+    return one if unit == 1 else few if 1 < unit < 5 else many
+
+
+def plural(n: int, one: str, few: str, many: str) -> str:
+    """Russian counts, because "26 магазин(ов)" is a developer in the text."""
+    return f"{n} {plural_word(n, one, few, many)}"
 
 
 def format_lookup(found: dict) -> str:
@@ -296,11 +382,16 @@ def shelf_button(web_url: str | None) -> list[dict] | None:
     return [{"text": label, "url": web_url}]
 
 
-def menu_keyboard(user: sqlite3.Row, web_url: str | None = None) -> dict:
+def menu_keyboard(user: sqlite3.Row, web_url: str | None = None,
+                  subscribed: bool = False) -> dict:
     rows = [[{"text": "💰 Смотреть скидки", "callback_data": "p:0"}]]
     shelf = shelf_button(web_url)
     if shelf:
         rows.append(shelf)
+    if not subscribed:
+        # Offered rather than nagged: one button in the menu, and the reader
+        # arrives at it having already seen what the bot finds.
+        rows.append([{"text": "💎 Подписка", "callback_data": "pitch"}])
     rows += [
         [{"text": "👤 Пол", "callback_data": "ask:genders"},
          {"text": "👟 Тип", "callback_data": "ask:kinds"}],
@@ -508,7 +599,10 @@ class Bot:
         await self.send(
             chat_id,
             "⚙️ <b>Что показывать</b>\n\n" + describe_profile(user),
-            menu_keyboard(user, self.config.web_url),
+            menu_keyboard(
+                user, self.config.web_url,
+                subscribed=dbm.subscription_state(self.conn, user["id"]) != "free",
+            ),
         )
 
     # -- the wizard --
@@ -623,6 +717,10 @@ class Bot:
 
         if data == "wizard":
             await self.ask(chat_id, user, "genders", wizard=True)
+        elif data == "pitch":
+            await self.send(
+                chat_id, subscription_pitch(self.conn), subscription_keyboard()
+            )
         elif data == "menu":
             await self.show_menu(chat_id, user)
         elif data.startswith("p:"):

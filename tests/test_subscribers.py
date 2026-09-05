@@ -13,6 +13,8 @@ from pi import deals as dealm
 from pi import personal, pipeline
 from pi.config import Config, Filters
 
+from .conftest import ts
+
 OWNER_CHAT = "42"
 
 
@@ -58,9 +60,10 @@ class TestWhoTheRunWritesTo:
         assert readers[0].user_id == 0
         assert readers[0].reader.sizes == frozenset({"EU44"}), "filters.toml still counts"
 
-    def test_a_second_person_is_a_second_reader(self, conn):
+    def test_a_second_paying_person_is_a_second_reader(self, conn):
         dbm.upsert_bot_user(conn, 7, OWNER_CHAT, "owner", sizes="EU44")
         dbm.upsert_bot_user(conn, 9, "99", "someone", sizes="EU40")
+        dbm.grant(conn, 9, days=30)
 
         readers = personal.subscribers(conn, OWNER_CHAT, Filters())
 
@@ -80,6 +83,7 @@ class TestWhoTheRunWritesTo:
     def test_skipping_the_wizard_means_everything_not_nothing(self, conn):
         """Pressing /start and answering none of the questions is not unsubscribing."""
         dbm.upsert_bot_user(conn, 9, "99", "quiet")
+        dbm.grant(conn, 9, days=30)
 
         readers = personal.subscribers(conn, OWNER_CHAT, Filters())
 
@@ -88,6 +92,7 @@ class TestWhoTheRunWritesTo:
 
     def test_a_reader_who_blocked_the_bot_is_left_out(self, conn):
         dbm.upsert_bot_user(conn, 9, "99", "gone")
+        dbm.grant(conn, 9, days=30)
         personal.deactivate(conn, "99")
 
         assert "99" not in [r.chat_id for r in personal.subscribers(conn, OWNER_CHAT, Filters())]
@@ -95,6 +100,7 @@ class TestWhoTheRunWritesTo:
     def test_talking_to_the_bot_again_brings_them_back(self, conn):
         """The only evidence a chat reopened is the person turning up in it."""
         dbm.upsert_bot_user(conn, 9, "99", "gone")
+        dbm.grant(conn, 9, days=30)
         personal.deactivate(conn, "99")
 
         dbm.upsert_bot_user(conn, 9, "99", "back")
@@ -409,3 +415,38 @@ class TestFollowingAProduct:
         assert len(pipeline.arrange_for(
             conn, scored, config, market=None, user_id=7, fold_duplicates=False,
         )) == 1
+
+
+class TestTheFeedIsWhatIsSold:
+    """A reader who has not paid hears from the digest, not from the run."""
+
+    def test_a_free_reader_with_a_full_profile_is_not_written_to(self, conn):
+        dbm.upsert_bot_user(conn, 9, "99", "browsing", sizes="EU40", brands="Nike")
+
+        readers = personal.subscribers(conn, OWNER_CHAT, Filters())
+
+        assert "99" not in [r.chat_id for r in readers], (
+            "the feed is the thing being sold; a filled-in profile does not buy it"
+        )
+
+    def test_paying_puts_them_back(self, conn):
+        dbm.upsert_bot_user(conn, 9, "99", "paying", sizes="EU40")
+        dbm.grant(conn, 9, days=30)
+
+        assert "99" in [r.chat_id for r in personal.subscribers(conn, OWNER_CHAT, Filters())]
+
+    def test_grace_keeps_the_feed_running(self, conn):
+        dbm.upsert_bot_user(conn, 9, "99", "lapsing", sizes="EU40")
+        dbm.grant(conn, 9, days=30)
+        conn.execute("UPDATE bot_users SET paid_until = ? WHERE id = 9", (ts(1),))
+
+        assert "99" in [r.chat_id for r in personal.subscribers(conn, OWNER_CHAT, Filters())], (
+            "a failed renewal should cost a reminder, not the product"
+        )
+
+    def test_the_owner_never_has_to_pay(self, conn):
+        dbm.upsert_bot_user(conn, 7, OWNER_CHAT, "owner", sizes="EU44")
+
+        readers = personal.subscribers(conn, OWNER_CHAT, Filters())
+
+        assert [r.chat_id for r in readers] == [OWNER_CHAT]
