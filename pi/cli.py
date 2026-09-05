@@ -600,8 +600,17 @@ def cmd_subscriptions(args, config: Config) -> int:
                         "is_canceled": True,
                     })
                     if not ok:
-                        print(f"не удалось остановить продление: {why}", file=sys.stderr)
-                        return False
+                        # A warning, not a stop. The commonest reason this fails
+                        # is that the reader already pressed /cancel, and
+                        # refusing to give their money back over a renewal that
+                        # is already stopped leaves the operator with nothing to
+                        # do but edit the row by hand — which is the habit the
+                        # rest of this module exists to remove.
+                        print(
+                            f"продление остановить не удалось ({why}); "
+                            "возможно, оно уже отменено — возвращаю деньги",
+                            file=sys.stderr,
+                        )
 
                 ok, why = await call("refundStarPayment", {
                     "user_id": args.refund,
@@ -611,6 +620,12 @@ def cmd_subscriptions(args, config: Config) -> int:
                     print(f"Telegram отказал: {why}", file=sys.stderr)
                 return ok
 
+        if not args.stars:
+            print(
+                "⚠️  --stars не задан: возвращённые звёзды останутся в счётчике "
+                "выручки. Число есть в уведомлении Telegram о возврате.",
+                file=sys.stderr,
+            )
         if not asyncio.run(refund()):
             return 1
         # The subscription goes with the money, and so does the record of it:

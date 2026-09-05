@@ -940,6 +940,12 @@ class Bot:
                 "Telegram: Настройки → Мои звёзды → подписки.",
             )
             return
+        # Forgotten once it is stopped, or the id goes stale in the column and
+        # the refund path — which cancels before it refunds — aborts on a
+        # subscription Telegram has already cancelled. The reader asking for
+        # their money back right after pressing this is the ordinary case, not
+        # an odd one.
+        self._save(user["id"], sub_charge_id=None)
         await self.send(
             chat_id,
             f"Продление отключено. Подписка работает до "
@@ -979,7 +985,15 @@ class Bot:
         # The charge id is Telegram's own, unique per payment and already
         # stored; a renewal carries a new one, so this blocks only true replays.
         if charge_id and user["charge_id"] == charge_id:
-            log.info("payment %s already granted, ignoring the replay", charge_id)
+            log.info("payment %s already granted, confirming again", charge_id)
+            # Not silence: the likeliest reason this update is being replayed is
+            # that sending the confirmation is what died the first time, and the
+            # reader is looking at a payment nothing acknowledged.
+            await self.send(
+                chat_id,
+                f"✅ Подписка активна до <b>{_date(user['paid_until'])}</b>.",
+                menu_keyboard(user, self.config.web_url, subscribed=True),
+            )
             return
 
         plan = str(payment.get("invoice_payload", "")).removeprefix("sub:")

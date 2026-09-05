@@ -603,6 +603,7 @@ class TestStarringSomethingOverHttp:
     def test_the_owner_flag_stands_in_for_telegram(self, conn):
         """What debugging outside Telegram uses, and it has to be typed."""
         product, _ = self._a_product(conn)
+        dbm.comp(conn, 7)  # --owner names a reader; access is a separate thing
         with self._serving(conn, owner_id=7) as base:
             code, _ = self._call(f"{base}/api/favorites", "POST", {"product_id": product})
             listed_code, listed = self._call(f"{base}/api/favorites")
@@ -614,12 +615,14 @@ class TestStarringSomethingOverHttp:
 
     def test_starring_something_that_does_not_exist_is_refused(self, conn):
         self._a_product(conn)
+        dbm.comp(conn, 7)  # --owner names a reader; access is a separate thing
         with self._serving(conn, owner_id=7) as base:
             code, _ = self._call(f"{base}/api/favorites", "POST", {"product_id": 9999})
 
         assert code == 404
 
     def test_a_body_without_a_product_is_a_bad_request_not_a_crash(self, conn):
+        dbm.comp(conn, 7)  # --owner names a reader; access is a separate thing
         with self._serving(conn, owner_id=7) as base:
             code, _ = self._call(f"{base}/api/favorites", "POST", {"nothing": True})
 
@@ -627,6 +630,7 @@ class TestStarringSomethingOverHttp:
 
     def test_unstarring_removes_it(self, conn):
         product, _ = self._a_product(conn)
+        dbm.comp(conn, 7)  # --owner names a reader; access is a separate thing
         with self._serving(conn, owner_id=7) as base:
             self._call(f"{base}/api/favorites", "POST", {"product_id": product})
             code, body = self._call(f"{base}/api/favorites/{product}", "DELETE")
@@ -701,6 +705,7 @@ class TestStarringSomethingOverHttp:
 
     def test_the_owner_is_not_a_customer_of_their_own_collector(self, conn):
         a_shelf(conn, 2)
+        dbm.comp(conn, 7)  # --owner names a reader; access is a separate thing
         with self._serving(conn, owner_id=7) as base:
             code, body = self._call(f"{base}/api/offers")
 
@@ -736,6 +741,7 @@ class TestStarringSomethingOverHttp:
         """No round trip and no flash: the server already knows who this is."""
         product, _ = self._a_product(conn)
         a_shelf(conn, 1)
+        dbm.comp(conn, 7)  # --owner names a reader; access is a separate thing
         with self._serving(conn, owner_id=7) as base:
             self._call(f"{base}/api/favorites", "POST", {"product_id": product})
             page = self._page(base + "/")
@@ -746,6 +752,7 @@ class TestStarringSomethingOverHttp:
     def test_a_link_to_the_list_arrives_with_the_list_in_it(self, conn):
         """?favorites=1 is a link somebody can be sent, so it opens on the answer."""
         product, _ = self._a_product(conn)
+        dbm.comp(conn, 7)  # --owner names a reader; access is a separate thing
         with self._serving(conn, owner_id=7) as base:
             self._call(f"{base}/api/favorites", "POST", {"product_id": product})
             page = self._page(base + "/?favorites=1")
@@ -769,6 +776,7 @@ class TestStarringSomethingOverHttp:
 
     def test_a_page_served_to_the_owner_says_who_they_are(self, conn):
         a_shelf(conn, 1)
+        dbm.comp(conn, 7)  # --owner names a reader; access is a separate thing
         with self._serving(conn, owner_id=7) as base:
             page = self._page(base + "/")
 
@@ -776,6 +784,7 @@ class TestStarringSomethingOverHttp:
 
     def test_a_starred_row_carries_what_the_card_draws(self, conn):
         product, _ = self._a_product(conn)
+        dbm.comp(conn, 7)  # --owner names a reader; access is a separate thing
         with self._serving(conn, owner_id=7) as base:
             self._call(f"{base}/api/favorites", "POST", {"product_id": product})
             _, listed = self._call(f"{base}/api/favorites")
@@ -787,14 +796,21 @@ class TestStarringSomethingOverHttp:
 
 class TestTheOwnerFlagBehindAProxy:
     """`--owner` says "whoever reaches me is that person". A tunnel makes that
-    false while every other signal still says localhost."""
+    false while every other signal still says localhost.
+
+    The guard lives in `_reader`, not in `_paying`: identity is what the flag
+    hands out, and every verb — including the one that deletes — resolves it
+    there. Put on `_paying` alone it was remembered twice out of three times.
+    """
 
     # The server harness lives on the class above; borrowed rather than copied.
     _serving = staticmethod(TestStarringSomethingOverHttp._serving)
     _call = staticmethod(TestStarringSomethingOverHttp._call)
+    _a_product = staticmethod(TestStarringSomethingOverHttp._a_product)
 
     def test_a_direct_request_is_believed(self, conn):
         a_shelf(conn, 2)
+        dbm.comp(conn, 7)  # --owner names a reader; access is a separate thing
         with self._serving(conn, owner_id=7) as base:
             code, body = self._call(f"{base}/api/offers")
 
@@ -802,6 +818,7 @@ class TestTheOwnerFlagBehindAProxy:
 
     def test_a_proxied_request_is_not(self, conn):
         a_shelf(conn, 2)
+        dbm.comp(conn, 7)  # --owner names a reader; access is a separate thing
         with self._serving(conn, owner_id=7) as base:
             code, _ = self._call(
                 f"{base}/api/offers", headers={"X-Forwarded-For": "203.0.113.9"}
@@ -813,6 +830,7 @@ class TestTheOwnerFlagBehindAProxy:
 
     def test_cloudflares_own_header_counts_too(self, conn):
         a_shelf(conn, 1)
+        dbm.comp(conn, 7)  # --owner names a reader; access is a separate thing
         with self._serving(conn, owner_id=7) as base:
             code, _ = self._call(
                 f"{base}/api/offers", headers={"CF-Connecting-IP": "203.0.113.9"}
@@ -833,3 +851,45 @@ class TestTheOwnerFlagBehindAProxy:
             )
 
         assert (code, body["total"]) == (200, 1)
+
+    def test_the_delete_verb_is_guarded_too(self, conn):
+        """The verb that was missed: it destroys, and its answer is an oracle."""
+        product, _ = self._a_product(conn)
+        dbm.comp(conn, 7)
+        dbm.add_favorite(conn, 7, product, None)
+        with self._serving(conn, owner_id=7) as base:
+            code, _ = self._call(
+                f"{base}/api/favorites/{product}", "DELETE",
+                headers={"CF-Connecting-IP": "203.0.113.9"},
+            )
+
+        # Through a tunnel this was `for i in $(seq 1 200000); do curl -X DELETE`
+        # emptying the owner's list, and the removed flag flipping true→false
+        # said which ids had been on it.
+        assert code == 401
+        assert dbm.favorite_ids(conn, 7) == {product}
+
+    def test_the_owner_can_still_unstar_directly(self, conn):
+        product, _ = self._a_product(conn)
+        dbm.comp(conn, 7)
+        dbm.add_favorite(conn, 7, product, None)
+        with self._serving(conn, owner_id=7) as base:
+            code, _ = self._call(f"{base}/api/favorites/{product}", "DELETE")
+
+        assert code == 200
+        assert dbm.favorite_ids(conn, 7) == set()
+
+    def test_the_page_does_not_name_the_owner_through_a_proxy(self, conn):
+        a_shelf(conn, 1)
+        dbm.comp(conn, 7)
+        with self._serving(conn, owner_id=7) as base:
+            page = self._page_with(base + "/", {"X-Forwarded-For": "203.0.113.9"})
+
+        assert "Полка открывается по подписке" in page
+        assert '"me": 7' not in page
+
+    @staticmethod
+    def _page_with(url, headers):
+        request = Request(url, headers=headers)
+        with urlopen(request, timeout=5) as response:
+            return response.read().decode("utf-8")

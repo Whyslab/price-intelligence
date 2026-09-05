@@ -507,7 +507,16 @@ class Handler(BaseHTTPRequestHandler):
         signed = webauth.verify(
             self.headers.get("X-Telegram-Init-Data", ""), self.bot_token
         )
-        return signed if signed is not None else self.owner_id
+        if signed is not None:
+            return signed
+        # The owner flag is an identity nobody proved, so it may only be
+        # believed when this process is talking to the person directly. Applied
+        # here rather than at each call site: every verb resolves identity
+        # through this method, and a guard that has to be remembered three times
+        # gets remembered twice — un-starring was the one that was missed, and
+        # through a tunnel it let the internet empty the owner's list one id at
+        # a time, learning which ids were on it from the answer.
+        return self.owner_id if self._direct() else None
 
     def _paying(self, conn: sqlite3.Connection) -> bool:
         """Whether this request may see the shelf at all.
@@ -525,24 +534,26 @@ class Handler(BaseHTTPRequestHandler):
         reader = self._reader()
         if reader is None:
             return False
-        # `exempt_id` is safe anywhere: Telegram had to sign the request naming
-        # that person for `_reader` to have returned it at all.
+        # `exempt_id` is safe anywhere, because Telegram had to sign the request
+        # naming that person for `_reader` to have returned it at all.
         if self.exempt_id is not None and reader == self.exempt_id:
             return True
-        # `owner_id` asserts an identity nobody proved, so it may only be
-        # believed when this process is talking to the person directly.
+        # `owner_id` is deliberately not a second way through. It says "whoever
+        # reaches me is that person", which was true while the only way to reach
+        # this process was to be sitting at it, and stopped being true the day a
+        # tunnel pointed at 127.0.0.1. `_direct` narrows that, but it is a
+        # blocklist and blocklists fail open: an ssh -L forward, a socat, an
+        # nginx without proxy_set_header — none of them announce themselves, and
+        # each would hand the whole shelf away.
         #
-        # Binding to 127.0.0.1 used to be that guarantee. It is not one any
-        # more: `scripts/tunnel.sh` points cloudflared at 127.0.0.1, so the
-        # whole internet arrives on the loopback address, every request is
-        # anonymous-therefore-owner, and the paywall is decoration. What a proxy
-        # cannot hide is that it is one — it says so in a header.
-        if self.owner_id is not None and reader == self.owner_id and self._direct():
-            return True
+        # So the inference is gone rather than qualified. The flag still names a
+        # reader, which is all it was ever for; an operator who wants the shelf
+        # opens the mini-app, or gives themselves access with `pi grant`.
         return dbm.is_subscribed(conn, reader)
 
     # Headers a reverse proxy adds and a browser talking to us directly does
-    # not. cloudflared sends the first two.
+    # not. cloudflared sends the first two. Not a security boundary on its own —
+    # see `_paying` — but enough to keep an unproven identity off a tunnel.
     _PROXY_HEADERS = ("X-Forwarded-For", "CF-Connecting-IP", "X-Real-IP", "Forwarded")
 
     def _direct(self) -> bool:

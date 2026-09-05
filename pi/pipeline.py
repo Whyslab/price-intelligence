@@ -1377,6 +1377,12 @@ def _readers_line(conn: sqlite3.Connection) -> str:
     )
     if grace:
         line += f" · в отсрочке {grace}"
+    broken = dbm.unreadable_dates(conn)
+    if broken:
+        line += (
+            f"\n⚠️ У {broken} читател(я/ей) нечитаемая дата подписки — они "
+            "считаются неоплатившими. Поправить: pi grant <id>"
+        )
     return line + f"\n⭐ Получено звёзд всего: {stars:,}".replace(",", " ")
 
 

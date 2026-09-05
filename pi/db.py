@@ -933,17 +933,25 @@ def _moment(stamp: str) -> datetime:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
 
-def _paid_until(conn: sqlite3.Connection) -> list[tuple[int, datetime]]:
+def _paid_until(
+    conn: sqlite3.Connection, only_active_plans: bool = False
+) -> list[tuple[int, datetime]]:
     """Every reader with a paid-to date, parsed. The one place that reads them.
 
     Readers are counted in the dozens, so filtering them in Python costs
     nothing — and it buys the thing the SQL version could not have: exactly one
     interpretation of a timestamp in the whole subscription module.
+
+    `only_active_plans` drops the long-lapsed, whose `plan` is already 'free'
+    and who therefore cannot be the answer to "who should be expired". Without
+    it the list grows with every reader who ever paid, forever, to build an
+    `IN (...)` that matches none of them.
     """
+    sql = "SELECT id, paid_until FROM bot_users WHERE paid_until IS NOT NULL"
+    if only_active_plans:
+        sql += " AND plan != 'free'"
     out = []
-    for row in conn.execute(
-        "SELECT id, paid_until FROM bot_users WHERE paid_until IS NOT NULL"
-    ):
+    for row in conn.execute(sql):
         try:
             out.append((int(row["id"]), _moment(row["paid_until"])))
         except ValueError:
@@ -952,6 +960,24 @@ def _paid_until(conn: sqlite3.Connection) -> list[tuple[int, datetime]]:
                 "unsubscribed", row["id"], row["paid_until"],
             )
     return out
+
+
+def unreadable_dates(conn: sqlite3.Connection) -> int:
+    """How many readers have a paid_until nothing can parse.
+
+    Surfaced in the daily summary rather than only in the log. A row like this
+    logs a warning on every state check — hourly, forever — and a warning
+    nobody counts is a warning nobody acts on.
+    """
+    bad = 0
+    for row in conn.execute(
+        "SELECT paid_until FROM bot_users WHERE paid_until IS NOT NULL"
+    ):
+        try:
+            _moment(row["paid_until"])
+        except ValueError:
+            bad += 1
+    return bad
 
 
 def subscription_state(
@@ -1025,25 +1051,32 @@ def grant(
     refuses to cancel while the monthly charge goes on firing.
     """
     moment = datetime.now(UTC)
-    row = get_bot_user(conn, user_id)
-    start = moment
-    if row is not None and row["paid_until"]:
-        paid_until = datetime.fromisoformat(row["paid_until"])
-        start = max(moment, paid_until)
-    fields: dict[str, object] = {
-        "plan": "paid",
-        "paid_until": (start + timedelta(days=days)).isoformat(timespec="seconds"),
-        "plan_since": (row["plan_since"] if row and row["plan_since"] else moment.isoformat(timespec="seconds")),
-        "stars_paid": (row["stars_paid"] if row else 0) + stars,
-    }
-    if charge_id:
-        fields["charge_id"] = charge_id
-        if recurring:
-            fields["sub_charge_id"] = charge_id
-    assigns = ", ".join(f"{key} = :{key}" for key in fields)
-    cursor = conn.execute(
-        f"UPDATE bot_users SET {assigns} WHERE id = :id", {**fields, "id": user_id}
-    )
+    # Read and write together. `--refund` clears four columns at once while this
+    # computes a date from a row it read earlier; interleaved, the write here
+    # would put back both the date and the charge id that were cleared to stop a
+    # second refund.
+    with transaction(conn):
+        row = get_bot_user(conn, user_id)
+        start = moment
+        if row is not None and row["paid_until"]:
+            start = max(moment, _moment(row["paid_until"]))
+        fields: dict[str, object] = {
+            "plan": "paid",
+            "paid_until": (start + timedelta(days=days)).isoformat(timespec="seconds"),
+            "plan_since": (
+                row["plan_since"] if row and row["plan_since"]
+                else moment.isoformat(timespec="seconds")
+            ),
+            "stars_paid": (row["stars_paid"] if row else 0) + stars,
+        }
+        if charge_id:
+            fields["charge_id"] = charge_id
+            if recurring:
+                fields["sub_charge_id"] = charge_id
+        assigns = ", ".join(f"{key} = :{key}" for key in fields)
+        cursor = conn.execute(
+            f"UPDATE bot_users SET {assigns} WHERE id = :id", {**fields, "id": user_id}
+        )
     if cursor.rowcount != 1:
         # An UPDATE against a reader who is not there matches nothing and says
         # nothing, and the caller has already taken the money. Everywhere this
@@ -1116,7 +1149,11 @@ def expire_due(conn: sqlite3.Connection, now: str | None = None) -> int:
     """
     moment = _moment(now) if now else datetime.now(UTC)
     cutoff = moment - timedelta(days=SUBSCRIPTION_GRACE_DAYS)
-    due = [user_id for user_id, until in _paid_until(conn) if until < cutoff]
+    due = [
+        user_id
+        for user_id, until in _paid_until(conn, only_active_plans=True)
+        if until < cutoff
+    ]
     if not due:
         return 0
     marks = ",".join("?" * len(due))
