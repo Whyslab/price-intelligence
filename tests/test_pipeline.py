@@ -593,6 +593,27 @@ def test_the_summary_counts_notifications_not_seeded_rows(config, conn):
     assert "Уведомлений за сутки: 1" in report
 
 
+def test_the_summary_reports_the_last_run_that_collected_anything(conn):
+    """A `pi verify` run sweeps no shop, and must not be read as a collapse.
+
+    Live 05.09: a verify run left the daily summary saying "0 магазинов ок,
+    товаров просмотрено: 0" — which is indistinguishable from every shop having
+    failed at once, and it is the message that goes out unprompted every morning.
+    """
+    conn.execute(
+        "INSERT INTO runs (started_at, finished_at, stores_ok, products_seen, scope) "
+        "VALUES (?, ?, 137, 240000, 'sweep')", (ts(), ts()),
+    )
+    conn.execute(
+        "INSERT INTO runs (started_at, finished_at, stores_ok, products_seen, scope) "
+        "VALUES (?, ?, 0, 0, 'verify')", (ts(), ts()),
+    )
+
+    report = pipeline.health_report(conn)
+    assert "137 магазинов ок" in report
+    assert "Товаров просмотрено: 240,000" in report
+
+
 def test_seeding_is_not_limited_by_the_per_store_cap(config, conn):
     """The cap stops one shop filling a notification run. Seeding is not a run:
     anything it trims comes straight back as news on the next sweep."""
