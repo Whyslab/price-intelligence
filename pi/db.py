@@ -14,7 +14,7 @@ from .domains import same_shop
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 SCHEMA_SQL = Path(__file__).with_name("schema.sql")
 
 
@@ -542,7 +542,12 @@ def upsert_product(
             url       = excluded.url,
             -- keep the last known image if this fetch happens to lack one
             image_url = COALESCE(excluded.image_url, products.image_url),
-            category  = excluded.category
+            category  = excluded.category,
+            -- Back in the catalogue, so it was never gone. Cleared here rather
+            -- than anywhere cleverer because this runs for every product of
+            -- every fetch — full, partial or a single-product check — and the
+            -- rule is the same for all three: seeing it is proof enough.
+            missing_since = NULL
         """,
         (store_id, external_id, title, brand, url, image_url, category),
     )
@@ -673,6 +678,120 @@ def prune_history(conn: sqlite3.Connection, keep_days: int = 180) -> int:
         (cutoff,),
     )
     return cur.rowcount
+
+
+def mark_missing(
+    conn: sqlite3.Connection, store_id: int, seen: Sequence[int], ts: str
+) -> int:
+    """Record that this shop no longer lists its other products. Returns how many.
+
+    The caller must have read the shop's **whole** catalogue — see
+    `FetchResult.enumerated`. Absence from a slice means nothing at all, and
+    this is the one place in the project where a wrong reading eventually
+    deletes somebody's data.
+
+    Products already marked keep their original date: the grace period runs
+    from when a product first went missing, not from the last time we noticed.
+
+    Their offers go immediately. A card cannot both be gone from the shop and
+    sit on the shelf saying "checked today", and that card — allikestore.com's
+    -93% Wotherspoon, a 404 for a fortnight — is the single worst thing this
+    project has ever shown anybody.
+    """
+    conn.execute("DROP TABLE IF EXISTS temp.pi_seen")
+    conn.execute("CREATE TEMP TABLE pi_seen (id INTEGER PRIMARY KEY)")
+    conn.executemany(
+        "INSERT OR IGNORE INTO pi_seen (id) VALUES (?)", ((pid,) for pid in seen)
+    )
+    gone = conn.execute(
+        """
+        UPDATE products SET missing_since = ?
+         WHERE store_id = ?
+           AND missing_since IS NULL
+           AND id NOT IN (SELECT id FROM pi_seen)
+        """,
+        (ts, store_id),
+    ).rowcount
+    conn.execute(
+        """
+        DELETE FROM offers WHERE product_id IN (
+            SELECT id FROM products
+             WHERE store_id = ? AND missing_since IS NOT NULL
+        )
+        """,
+        (store_id,),
+    )
+    conn.execute("DROP TABLE IF EXISTS temp.pi_seen")
+    return gone
+
+
+def mark_product_missing(conn: sqlite3.Connection, product_id: int, ts: str) -> bool:
+    """One product, checked on its own page and answered with a 404.
+
+    The same verdict `mark_missing` reaches for a whole shop at once, reached
+    the expensive way for the shops a full catalogue read never covers.
+    """
+    changed = conn.execute(
+        "UPDATE products SET missing_since = ? WHERE id = ? AND missing_since IS NULL",
+        (ts, product_id),
+    ).rowcount
+    conn.execute("DELETE FROM offers WHERE product_id = ?", (product_id,))
+    return changed > 0
+
+
+def drop_delisted(conn: sqlite3.Connection, grace_days: int) -> int:
+    """Delete products missing for longer than the grace period. Returns how many.
+
+    The irreversible end of the three steps, and the reason there are three:
+    a product is taken off the shelf the moment it goes missing, held while it
+    might come back, and only then deleted with its variants and history. A
+    shop that drops a shoe for a week and restocks it loses nothing.
+    """
+    cutoff = (
+        datetime.now(UTC) - timedelta(days=grace_days)
+    ).isoformat(timespec="seconds")
+    return conn.execute(
+        "DELETE FROM products WHERE missing_since IS NOT NULL AND missing_since < ?",
+        (cutoff,),
+    ).rowcount
+
+
+def confirm_offer(conn: sqlite3.Connection, product_id: int, ts: str) -> None:
+    """Stamp an offer with a real check of this product, not of its shop.
+
+    `record_offers` has to use the shop's `last_ok`, because scoring runs over
+    the whole catalogue while a sweep reads a slice of it. `pi verify` opens
+    one product's own page, so it can say something stronger, and this is the
+    only place allowed to.
+    """
+    conn.execute("UPDATE offers SET checked_at = ? WHERE product_id = ?", (ts, product_id))
+
+
+def stale_offers(conn: sqlite3.Connection, limit: int, platforms: Sequence[str]) -> list[sqlite3.Row]:
+    """What is on the shelf and has gone longest without being looked at.
+
+    Ordered by how long ago, then by score: a dead card at -80% on the first
+    screen does more damage than a dead one at -31% on the fifth. One row per
+    product — the check opens a page, and a page is a product.
+    """
+    if not platforms:
+        return []
+    marks = ",".join("?" * len(platforms))
+    return conn.execute(
+        f"""
+        SELECT p.id AS product_id, p.url, p.external_id, p.store_id,
+               s.domain, s.platform, s.currency,
+               MIN(o.checked_at) AS checked_at, MAX(o.score) AS score
+          FROM offers o
+          JOIN products p ON p.id = o.product_id
+          JOIN stores   s ON s.id = p.store_id
+         WHERE p.missing_since IS NULL AND s.platform IN ({marks})
+         GROUP BY p.id
+         ORDER BY checked_at ASC, score DESC
+         LIMIT ?
+        """,
+        [*platforms, limit],
+    ).fetchall()
 
 
 def drop_orphans(conn: sqlite3.Connection) -> dict[str, int]:

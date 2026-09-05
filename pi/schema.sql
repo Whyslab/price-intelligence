@@ -51,12 +51,20 @@ CREATE TABLE IF NOT EXISTS products (
     -- menswear. Held as a column rather than thrown away at collection, so a
     -- misreading costs a `pi reclassify` and not a fresh crawl of the shop.
     audience     TEXT,
+    -- When the shop stopped listing this product, ISO-8601, NULL while it is
+    -- still on sale. Only ever set from a pass that read the shop's entire
+    -- catalogue and found this product absent from it — a partial read proves
+    -- nothing, and saying otherwise would delete half a shop over a timeout.
+    -- Cleared the moment the product turns up again: catalogues hiccup, and one
+    -- absence is not a verdict.
+    missing_since TEXT,
     UNIQUE (store_id, external_id)
 );
 CREATE INDEX IF NOT EXISTS ix_products_brand ON products(brand);
 CREATE INDEX IF NOT EXISTS ix_products_brand_family ON products(brand_family);
 CREATE INDEX IF NOT EXISTS ix_products_kind ON products(kind, gender);
 CREATE INDEX IF NOT EXISTS ix_products_audience ON products(audience);
+CREATE INDEX IF NOT EXISTS ix_products_missing ON products(missing_since);
 
 CREATE TABLE IF NOT EXISTS variants (
     id          INTEGER PRIMARY KEY,

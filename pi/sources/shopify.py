@@ -266,6 +266,59 @@ def parse_products(payload: dict, base: str) -> list[ScrapedProduct]:
     return out
 
 
+async def fetch_product(
+    client: httpx.AsyncClient,
+    domain: str,
+    handle: str,
+    limiter: RateLimiter | NullLimiter | None = None,
+) -> tuple[str, ScrapedProduct | None]:
+    """One product by its handle. Returns ("ok" | "gone" | "unreachable", product).
+
+    The single-product form of the catalogue endpoint, and the only affordable
+    way to ask about a product in a shop too large to read in one pass. One
+    request, one answer, through the same limiter as everything else — the
+    Shopify quota counts our IP, and a check that ignored it would simply take
+    the sweep's requests.
+
+    The three answers are kept apart on purpose. A 404 is the shop saying the
+    product is gone, and that is what this is asked for. A timeout, a 429 or a
+    503 is our side of the conversation failing, and reading it as "gone" would
+    eventually delete a shop's catalogue because its server had a bad minute.
+    """
+    limiter = limiter or NullLimiter()
+    if await limiter.confirm_blocked():
+        return "unreachable", None
+    base = f"https://{domain}".rstrip("/")
+    try:
+        async with limiter.slot(domain):
+            limiter.note_attempt(domain)
+            resp = await client.get(f"{base}/products/{handle}.json")
+    except httpx.HTTPError as exc:
+        log.debug("%s/%s: %s", domain, handle, exc)
+        return "unreachable", None
+
+    if resp.status_code in (404, 410):
+        # The shop answered, and clearly. That is a successful conversation.
+        limiter.note_success(domain)
+        return "gone", None
+    if resp.status_code != 200:
+        if resp.status_code in (429, 503):
+            await limiter.penalise(_retry_after(resp, fallback=None), host=domain)
+        return "unreachable", None
+    limiter.note_success(domain)
+    try:
+        payload = resp.json()
+    except ValueError:
+        return "unreachable", None
+    raw = payload.get("product")
+    if not isinstance(raw, dict):
+        return "unreachable", None
+    parsed = parse_products({"products": [raw]}, base)
+    # Still published, but with nothing left that has a price: no variant can be
+    # bought, which is the same thing as gone as far as a shelf is concerned.
+    return ("ok", parsed[0]) if parsed else ("gone", None)
+
+
 async def fetch(
     client: httpx.AsyncClient,
     domain: str,
@@ -342,7 +395,14 @@ async def fetch(
         url = f"{base}/products.json?limit={PAGE_SIZE}&page={page_number}"
 
     if exhausted:
-        return FetchResult(domain=domain, products=products, currency=currency)
+        # Everything the shop lists, but only when this pass began at the
+        # beginning. Resuming at page 40 and reaching the end reads the tail of
+        # a catalogue, and calling that an enumeration would mark the first
+        # thirty-nine pages as withdrawn.
+        return FetchResult(
+            domain=domain, products=products, currency=currency,
+            enumerated=cursor <= 1,
+        )
 
     # Stopped without reaching the end: the page cap, or a refusal part way
     # through. Either way say where to resume. Reporting this as a finished

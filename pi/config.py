@@ -50,6 +50,11 @@ class Filters:
     # Share of a shop's catalogue sitting at one identical discount, round or
     # not, before the same conclusion is drawn.
     blanket_sale_share: float = 0.3
+    # How long a product missing from a shop's catalogue is held before it is
+    # deleted with its history. The only irreversible thing this project does,
+    # so it waits: shops drop a shoe for a week and restock it, and two weeks is
+    # far longer than any hiccup observed on this database.
+    delisted_grace_days: int = 14
     brands_allow: tuple[str, ...] = ()
     brands_deny: tuple[str, ...] = ()
     sizes: tuple[str, ...] = ()

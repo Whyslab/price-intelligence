@@ -64,6 +64,19 @@ def _mock_rates():
     )
 
 
+def _mock_product_pages(payload, domain="shop.example"):
+    """Answer /products/<handle>.json the way a real Shopify shop does.
+
+    A run verifies the oldest cards on its own shelf by opening one product at
+    a time, so a fake shop that only serves its catalogue is no longer a
+    complete fake shop.
+    """
+    for raw in payload["products"]:
+        respx.get(f"https://{domain}/products/{raw['handle']}.json").mock(
+            return_value=httpx.Response(200, json={"product": raw})
+        )
+
+
 def _mock_telegram():
     photo = respx.post(f"https://api.telegram.org/bot{TOKEN}/sendPhoto").mock(
         return_value=httpx.Response(200, json={"ok": True})
@@ -210,6 +223,7 @@ async def test_prices_are_converted_from_the_shops_currency(config, shopify_payl
 @respx.mock
 async def test_the_same_deal_is_not_sent_twice(config, shopify_payload):
     _mock_rates()
+    _mock_product_pages(shopify_payload)
     photo, _ = _mock_telegram()
     respx.get("https://shop.example/products.json?limit=250").mock(
         return_value=httpx.Response(200, json=shopify_payload)
@@ -431,6 +445,7 @@ async def test_deals_past_the_cap_are_reconsidered_not_lost(config, shopify_payl
     respx.get("https://shop.example/products.json?limit=250").mock(
         return_value=httpx.Response(200, json={"products": catalogue})
     )
+    _mock_product_pages({"products": catalogue})
 
     conn = dbm.connect(config.db_path)
     known_store(conn)
@@ -1006,6 +1021,7 @@ async def test_a_run_leaves_what_is_on_offer_on_the_shelf(config, shopify_payloa
 @respx.mock
 async def test_an_offer_is_withdrawn_when_the_sale_ends(config, shopify_payload):
     _mock_rates()
+    _mock_product_pages(shopify_payload)
     _mock_telegram()
     respx.get("https://shop.example/products.json?limit=250").mock(
         return_value=httpx.Response(200, json=shopify_payload)
@@ -1024,6 +1040,10 @@ async def test_an_offer_is_withdrawn_when_the_sale_ends(config, shopify_payload)
     respx.get("https://shop.example/products.json?limit=250").mock(
         return_value=httpx.Response(200, json=full_price)
     )
+    # The product's own page says the same thing as the catalogue, because it is
+    # the same shop: a run also checks cards one at a time, and a mock still
+    # serving yesterday's price would put the sale straight back on the shelf.
+    _mock_product_pages(full_price)
     make_due(conn)
     await pipeline.run(config, conn)
 
@@ -1203,3 +1223,236 @@ class TestWhatBelongsOnAShelfButNotInAMessage:
     def test_the_discount_threshold_is_not_touched(self, config):
         shelf = pipeline.shelf_config(self._with_saving(config, 40.0))
         assert shelf.filters.min_discount_pct == config.filters.min_discount_pct
+
+
+class TestAProductThatStoppedBeingSold:
+    """Three steps between "the shop stopped listing it" and "delete it".
+
+    The card leaves the shelf at once, the row is held while the product might
+    come back, and only then is it deleted. Live 04.09: allikestore.com's −93%
+    Wotherspoon had been a 404 for a fortnight and was still the first tile on
+    the page, because nothing in the project ever asked whether a product was
+    still for sale.
+    """
+
+    @staticmethod
+    def _without(payload, index):
+        """The same catalogue with one product taken out of it."""
+        short = json.loads(json.dumps(payload))
+        del short["products"][index]
+        return short
+
+    @respx.mock
+    async def test_a_full_catalogue_read_marks_what_is_missing_from_it(
+        self, config, shopify_payload
+    ):
+        _mock_rates()
+        _mock_telegram()
+        _mock_product_pages(shopify_payload)
+        respx.get("https://shop.example/products.json?limit=250").mock(
+            return_value=httpx.Response(200, json=shopify_payload)
+        )
+        conn = dbm.connect(config.db_path)
+        known_store(conn)
+        await pipeline.run(config, conn)
+        gone = shopify_payload["products"][0]
+        (product_id,) = conn.execute(
+            "SELECT id FROM products WHERE external_id = ?", (str(gone["id"]),)
+        ).fetchone()
+
+        short = self._without(shopify_payload, 0)
+        respx.get("https://shop.example/products.json?limit=250").mock(
+            return_value=httpx.Response(200, json=short)
+        )
+        _mock_product_pages(short)
+        make_due(conn)
+        stats = await pipeline.run(config, conn)
+
+        assert stats.withdrawn == 1
+        missing = conn.execute(
+            "SELECT missing_since FROM products WHERE id = ?", (product_id,)
+        ).fetchone()[0]
+        assert missing, "a product the shop no longer lists is marked, not left alone"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM offers WHERE product_id = ?", (product_id,)
+        ).fetchone()[0] == 0, "and its card leaves the shelf the same run"
+
+    @respx.mock
+    async def test_a_partial_read_marks_nothing(self, config, shopify_payload):
+        """Absence from a slice of a catalogue means nothing at all.
+
+        A pass resuming at page three and reaching the end has read the tail of
+        a shop, not the shop. Marking everything it did not contain would
+        withdraw the first two pages.
+        """
+        _mock_rates()
+        _mock_telegram()
+        _mock_product_pages(shopify_payload)
+        respx.get("https://shop.example/products.json?limit=250").mock(
+            return_value=httpx.Response(200, json=shopify_payload)
+        )
+        conn = dbm.connect(config.db_path)
+        known_store(conn)
+        await pipeline.run(config, conn)
+
+        # The next run resumes part-way in, and the shop answers with one
+        # product — a short page, so the pass ends "complete" without ever
+        # having been an enumeration.
+        one = {"products": shopify_payload["products"][1:2]}
+        respx.get("https://shop.example/products.json?limit=250&page=3").mock(
+            return_value=httpx.Response(200, json=one)
+        )
+        _mock_product_pages(one)
+        dbm.upsert_store(conn, "shop.example", sitemap_cursor=3, last_ok=ts(1))
+        stats = await pipeline.run(config, conn)
+
+        assert stats.stores_ok == 1, "the shop answered — this is a real pass, not a failure"
+        assert stats.products_seen == 1, "and it read the one product page three holds"
+        assert stats.withdrawn == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM products WHERE missing_since IS NOT NULL"
+        ).fetchone()[0] == 0
+
+    @respx.mock
+    async def test_a_product_that_comes_back_is_no_longer_missing(
+        self, config, shopify_payload
+    ):
+        _mock_rates()
+        _mock_telegram()
+        short = self._without(shopify_payload, 0)
+        respx.get("https://shop.example/products.json?limit=250").mock(
+            return_value=httpx.Response(200, json=short)
+        )
+        _mock_product_pages(short)
+        conn = dbm.connect(config.db_path)
+        known_store(conn)
+        await pipeline.run(config, conn)
+
+        gone = shopify_payload["products"][0]
+        product_id = dbm.upsert_product(
+            conn, store_id=known_store(conn), external_id=str(gone["id"]),
+            title=gone["title"], url=f"https://shop.example/products/{gone['handle']}",
+        )
+        with dbm.transaction(conn):
+            assert dbm.mark_product_missing(conn, product_id, dbm.utcnow())
+
+        respx.get("https://shop.example/products.json?limit=250").mock(
+            return_value=httpx.Response(200, json=shopify_payload)
+        )
+        _mock_product_pages(shopify_payload)
+        make_due(conn)
+        await pipeline.run(config, conn)
+
+        assert conn.execute(
+            "SELECT missing_since FROM products WHERE id = ?", (product_id,)
+        ).fetchone()[0] is None, "a restocked product is on sale again, not half deleted"
+
+    def test_the_grace_period_is_honoured(self, conn):
+        """Deleted after the grace period, kept before it. This one is final."""
+        store_id = dbm.upsert_store(conn, "shop.example", platform="shopify")
+        kept, dropped = (
+            dbm.upsert_product(
+                conn, store_id=store_id, external_id=name, title=name,
+                url=f"https://shop.example/products/{name}",
+            )
+            for name in ("recent", "old")
+        )
+        with dbm.transaction(conn):
+            dbm.mark_product_missing(conn, kept, ts(13))
+            dbm.mark_product_missing(conn, dropped, ts(15))
+
+        assert dbm.drop_delisted(conn, grace_days=14) == 1
+        left = {row[0] for row in conn.execute("SELECT id FROM products")}
+        assert left == {kept}
+
+
+class TestOpeningACardToSeeIfItIsStillThere:
+    """What the free signal cannot cover, `pi verify` asks about directly.
+
+    A shop too large to read in one pass, and every jsonld shop, never produce
+    an enumeration — so their cards would sit on the shelf forever on the
+    strength of the day they were first seen.
+    """
+
+    @respx.mock
+    async def _shelf_with_one_card(self, config, shopify_payload):
+        _mock_rates()
+        _mock_telegram()
+        _mock_product_pages(shopify_payload)
+        respx.get("https://shop.example/products.json?limit=250").mock(
+            return_value=httpx.Response(200, json=shopify_payload)
+        )
+        conn = dbm.connect(config.db_path)
+        known_store(conn)
+        await pipeline.run(config, conn)
+        assert conn.execute("SELECT COUNT(*) FROM offers").fetchone()[0] > 0
+        return conn
+
+    @respx.mock
+    async def test_a_dead_page_takes_the_card_off_the_shelf(self, config, shopify_payload):
+        conn = await self._shelf_with_one_card(config, shopify_payload)
+        _mock_rates()
+        _mock_telegram()
+        for raw in shopify_payload["products"]:
+            respx.get(f"https://shop.example/products/{raw['handle']}.json").mock(
+                return_value=httpx.Response(404)
+            )
+
+        stats = await pipeline.run(config, conn, collect=False, verify_budget=50)
+
+        assert stats.withdrawn > 0
+        assert conn.execute("SELECT COUNT(*) FROM offers").fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM products WHERE missing_since IS NOT NULL"
+        ).fetchone()[0] > 0
+
+    @respx.mock
+    async def test_a_shop_that_is_merely_down_loses_nothing(self, config, shopify_payload):
+        """503 is "ask me later", not "this product is gone".
+
+        The difference is the whole safety of the feature: a shop having a bad
+        afternoon must not have its catalogue marked for deletion.
+        """
+        conn = await self._shelf_with_one_card(config, shopify_payload)
+        before = conn.execute("SELECT COUNT(*) FROM offers").fetchone()[0]
+        _mock_rates()
+        _mock_telegram()
+        pages = [
+            respx.get(f"https://shop.example/products/{raw['handle']}.json").mock(
+                return_value=httpx.Response(503)
+            )
+            for raw in shopify_payload["products"]
+        ]
+
+        stats = await pipeline.run(config, conn, collect=False, verify_budget=50)
+
+        assert any(page.called for page in pages), "the cards were asked about"
+        assert stats.withdrawn == 0
+        assert conn.execute("SELECT COUNT(*) FROM offers").fetchone()[0] == before
+        assert conn.execute(
+            "SELECT COUNT(*) FROM products WHERE missing_since IS NOT NULL"
+        ).fetchone()[0] == 0
+
+    @respx.mock
+    async def test_a_price_found_by_opening_a_card_is_judged_the_same_run(
+        self, config, shopify_payload
+    ):
+        """Verification writes prices, so verification has to lead to scoring.
+
+        Running it after the scoring step would leave a drop it found sitting
+        unnoticed until the price moved a second time.
+        """
+        conn = await self._shelf_with_one_card(config, shopify_payload)
+        _mock_rates()
+        photo, _ = _mock_telegram()
+        deeper = json.loads(json.dumps(shopify_payload))
+        for product in deeper["products"]:
+            for variant in product["variants"]:
+                variant["price"] = f"{float(variant['price']) / 3:.2f}"
+        _mock_product_pages(deeper)
+
+        stats = await pipeline.run(config, conn, collect=False, verify_budget=50)
+
+        assert stats.verified > 0
+        assert stats.alerts_sent > 0, "a drop found one card at a time still goes out"
+        assert photo.called

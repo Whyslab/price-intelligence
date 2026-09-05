@@ -125,6 +125,7 @@ def cmd_run(args, config: Config) -> int:
             rescan=args.rescan,
             limit=args.limit,
             jsonld_budget=args.jsonld_budget,
+            verify_budget=args.verify_budget,
         )
     )
     print(
@@ -134,6 +135,28 @@ def cmd_run(args, config: Config) -> int:
     )
     for domain, error in stats.failures[:15]:
         print(f"  ! {domain}: {error}")
+    return 0
+
+
+def cmd_verify(args, config: Config) -> int:
+    """Check the oldest cards on the shelf still exist, without sweeping anything.
+
+    A price this finds is scored and sent like any other: it goes through the
+    same run, only with the collection step left out.
+    """
+    conn = dbm.connect(config.db_path)
+    stats = asyncio.run(
+        pipeline.run(
+            config, conn,
+            collect=False,
+            dry_run=args.dry_run,
+            verify_budget=args.limit,
+        )
+    )
+    print(
+        f"\nпроверено {stats.verified} · снято с полки {stats.withdrawn} · "
+        f"отправлено {stats.alerts_sent}"
+    )
     return 0
 
 
@@ -415,9 +438,14 @@ def cmd_prune(args, config: Config) -> int:
     before = config.db_path.stat().st_size if config.db_path.exists() else 0
 
     points = dbm.prune_history(conn, args.keep_days)
+    grace = args.delisted_grace_days
+    if grace is None:
+        grace = config.filters.delisted_grace_days
+    delisted = dbm.drop_delisted(conn, grace)
     orphans = dbm.drop_orphans(conn)
     print(
         f"удалено: {points:,} точек истории старше {args.keep_days} дн, "
+        f"{delisted:,} товаров, снятых с продажи больше {grace} дн назад, "
         f"{orphans['variants']:,} вариантов и {orphans['products']:,} товаров без цен"
     )
     if not args.no_vacuum:
@@ -461,7 +489,23 @@ def build_parser() -> argparse.ArgumentParser:
         default=int(os.getenv("PI_JSONLD_BUDGET", jsonld.DEFAULT_BUDGET)),
         help="product pages to crawl per non-Shopify store per run",
     )
+    p.add_argument(
+        "--verify-budget", type=int, default=pipeline.VERIFY_BUDGET,
+        help=f"cards to open one by one to check they still exist "
+             f"(default {pipeline.VERIFY_BUDGET}, 0 to skip)",
+    )
     p.set_defaults(func=cmd_run)
+
+    p = sub.add_parser(
+        "verify",
+        help="open the oldest cards on the shelf one by one and drop the dead ones",
+    )
+    p.add_argument(
+        "--limit", type=int, default=pipeline.VERIFY_BUDGET,
+        help=f"how many cards to check (default {pipeline.VERIFY_BUDGET})",
+    )
+    p.add_argument("--dry-run", action="store_true", help="print the messages instead of sending")
+    p.set_defaults(func=cmd_verify)
 
     p = sub.add_parser(
         "seed",
@@ -478,6 +522,11 @@ def build_parser() -> argparse.ArgumentParser:
              "variant is always kept)",
     )
     p.add_argument("--no-vacuum", action="store_true", help="skip VACUUM (faster, frees nothing)")
+    p.add_argument(
+        "--delisted-grace-days", type=int,
+        help="delete products their shop stopped listing this many days ago "
+             "(default: delisted_grace_days in filters.toml)",
+    )
     p.set_defaults(func=cmd_prune)
 
     p = sub.add_parser(

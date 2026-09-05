@@ -41,6 +41,11 @@ class RunStats:
     products_seen: int = 0
     points_written: int = 0
     alerts_sent: int = 0
+    # Products a shop stopped listing this run, and products a targeted check
+    # confirmed are still there. Both are about the shelf being a shelf rather
+    # than a graveyard, so both belong in the run's own summary.
+    withdrawn: int = 0
+    verified: int = 0
     failures: list[tuple[str, str]] = field(default_factory=list)
 
 
@@ -251,6 +256,80 @@ async def collect_store(
     return FetchResult(domain=store["domain"], error=f"no adapter for platform {platform!r}")
 
 
+# How many product pages one verification pass opens. Its own budget, deliberately
+# separate from the collector's: both spend the same per-IP Shopify quota, and a
+# check that came out of the collector's allowance would quietly shrink the sweep
+# every hour to keep the shelf tidy. Sixty an hour is about 1,400 a day, which
+# covers the 731 jsonld offers twice over and takes a steady bite out of the
+# large Shopify catalogues that a single pass never finishes.
+VERIFY_BUDGET = 60
+
+# Which platforms can answer a question about one product. ASOS is left out: its
+# adapter reads sale sections, so there is no per-product page to ask.
+VERIFIABLE = ("shopify", "jsonld")
+
+
+async def verify_offers(
+    conn: sqlite3.Connection,
+    client: httpx.AsyncClient,
+    rates: Rates,
+    limiter: RateLimiter | None = None,
+    limit: int = VERIFY_BUDGET,
+) -> dict:
+    """Open the least recently checked cards on the shelf and see if they exist.
+
+    The free signal — absence from a full catalogue read — covers the shops
+    whose catalogue fits in one pass, which is most of them. It cannot cover a
+    shop too large to read in one go, because the pass that would have listed
+    the product never got that far, and it cannot cover a jsonld shop at all,
+    because those are crawled page by page and a failed page is indistinguishable
+    from a deleted one. What is left is asked directly, oldest first.
+
+    Everything here is one request per product, so the order is the whole
+    design: least recently confirmed first, and among equals the highest score,
+    because a dead card at -80% on the first screen does more damage than a dead
+    one at -31% on the fifth.
+    """
+    rows = dbm.stale_offers(conn, limit, VERIFIABLE)
+    report = {"checked": 0, "gone": 0, "unreachable": 0, "changed": []}
+    for row in rows:
+        if row["platform"] == "shopify":
+            handle = (row["url"] or "").rstrip("/").rsplit("/", 1)[-1]
+            if not handle:
+                continue
+            status, product = await shopify.fetch_product(
+                client, row["domain"], handle, limiter
+            )
+        else:
+            status, product = await jsonld.fetch_product(client, row["url"])
+
+        if status == "unreachable":
+            report["unreachable"] += 1
+            continue
+        if status == "gone":
+            with dbm.transaction(conn):
+                dbm.mark_product_missing(conn, row["product_id"], dbm.utcnow())
+            report["gone"] += 1
+            log.info("%-38s no longer sells %s", row["domain"], row["url"])
+            continue
+
+        with dbm.transaction(conn):
+            _, changed, _ = store_result(
+                conn,
+                row["store_id"],
+                FetchResult(
+                    domain=row["domain"], products=[product], currency=row["currency"]
+                ),
+                rates,
+            )
+            # The one place allowed to say a *product* was checked rather than
+            # its shop. Everywhere else that would be a lie, and it was.
+            dbm.confirm_offer(conn, row["product_id"], dbm.utcnow())
+        report["changed"] += changed
+        report["checked"] += 1
+    return report
+
+
 # A figure this far above everything else the same shop quotes is not a price.
 # Measured on the live catalogue: www.stadiumgoods.com published a run of
 # t-shirts at 333,085,723 — 165,000 times its own median — and because that was
@@ -356,7 +435,7 @@ def store_result(
 CANDIDATES_SQL = """
     SELECT v.id AS variant_id, v.product_id, v.sku, v.size, v.size_norm, v.color,
            p.title, p.brand, p.url, p.image_url, p.store_id,
-           p.brand_norm, p.brand_family, p.gender, p.kind, p.audience,
+           p.brand_norm, p.brand_family, p.gender, p.kind, p.audience, p.missing_since,
            s.name AS store_name, s.domain, s.country, s.currency
     FROM pi_candidates c
     JOIN variants v ON v.id = c.id
@@ -387,6 +466,12 @@ def _candidates(
     kept: dict[int, sqlite3.Row] = {}
     rejected: list[tuple[int]] = []
     for row in conn.execute(CANDIDATES_SQL):
+        # A product the shop has stopped listing cannot be a find, however good
+        # its last price was. Belt as well as braces: its variants are not in
+        # the changed set either, because nothing fetched them.
+        if row["missing_since"]:
+            rejected.append((row["variant_id"],))
+            continue
         wanted = filters.wants_brand(row["brand"]) and filters.wants_size(row["size_norm"])
         if wanted or (watched and row["product_id"] in watched):
             kept[row["variant_id"]] = row
@@ -776,6 +861,7 @@ def all_scorable_variants(conn: sqlite3.Connection) -> list[int]:
             WHERE pp.ts = (SELECT MAX(ts) FROM price_points WHERE variant_id = v.id)
               AND pp.in_stock = 1
               AND s.last_ok IS NOT NULL
+              AND p.missing_since IS NULL
             """
         ).fetchall()
     ]
@@ -791,24 +877,35 @@ async def run(
     rescan: bool = False,
     limit: int | None = None,
     jsonld_budget: int = jsonld.DEFAULT_BUDGET,
+    verify_budget: int = VERIFY_BUDGET,
+    collect: bool = True,
 ) -> RunStats:
     """One full sweep: collect, score, notify.
 
     Only variants whose price moved this run are scored, which is both cheap and
     correct — a deal appears when a price changes. `rescan` scores everything
     instead, for when the filters changed rather than the prices.
+
+    `collect=False` sweeps no store at all and goes straight to opening cards
+    one by one. That is `pi verify`, and it goes through this function rather
+    than beside it for one reason: a price found by opening a product's own page
+    has to be judged, recorded on the shelf and sent by exactly the same code
+    that judges a price found by reading a catalogue, or the two would drift.
     """
     stats = RunStats()
-    if not rescan and _last_run_was_capped(conn):
+    if collect and not rescan and _last_run_was_capped(conn):
         log.info("the previous run hit its alert cap — scoring everything this time")
         rescan = True
-    stores = dbm.get_stores(conn, platforms=("shopify", "jsonld", "asos"), domains=domains)
+    stores = (
+        dbm.get_stores(conn, platforms=("shopify", "jsonld", "asos"), domains=domains)
+        if collect else []
+    )
     # Naming stores explicitly is a deliberate act, so it skips both the queue
     # and the budget: `--stores` means these, now. The budget is still recorded,
     # because the next run adapts from the last recorded one and a hand-run
     # sweep should not look to it like a collapse in capacity.
     budget = config.max_shopify_stores
-    if not domains:
+    if collect and not domains:
         stores, skipped = _drop_hopeless(stores)
         if skipped:
             log.info(
@@ -831,24 +928,28 @@ async def run(
                 "the per-IP quota does not stretch to all of them at once",
                 budget, deferred,
             )
-    if not stores:
+    if collect and not stores:
         log.warning("no readable stores — run `detect` first")
         return stats
 
+    scope = "verify" if not collect else "stores" if domains else "sweep"
     run_id = conn.execute(
         "INSERT INTO runs (started_at, shopify_budget, scope) VALUES (?, ?, ?)",
-        (dbm.utcnow(), budget, "stores" if domains else "sweep"),
+        (dbm.utcnow(), budget, scope),
     ).lastrowid
 
     rates = load_rates(config.db_path.parent / "fx_cache.json")
     log.info("exchange rates: %s (%s)", rates.source, rates.fetched_at.date())
     by_platform = Counter(s["platform"] for s in stores)
-    log.info(
-        "sweeping %d stores (%s), Shopify budget %.1f req/s overall, %.2f per shop",
-        len(stores),
-        ", ".join(f"{n} {p}" for p, n in by_platform.most_common()),
-        config.shopify_rate, config.shopify_host_rate,
-    )
+    if stores:
+        log.info(
+            "sweeping %d stores (%s), Shopify budget %.1f req/s overall, %.2f per shop",
+            len(stores),
+            ", ".join(f"{n} {p}" for p, n in by_platform.most_common()),
+            config.shopify_rate, config.shopify_host_rate,
+        )
+    else:
+        log.info("checking %d card(s) one by one, no catalogue read", verify_budget)
 
     # Separate pools per platform. A jsonld store crawls hundreds of product
     # pages and holds its slot for a minute or more; sharing one pool let those
@@ -900,6 +1001,19 @@ async def run(
 
             with dbm.transaction(conn):
                 written, ids, products = store_result(conn, store["id"], result, rates)
+                # Free, because the crawl already happened. One full read of
+                # shop.simon.com confirms all 7,423 of its products at once,
+                # and there is no other affordable way: the per-IP quota holds
+                # a dozen catalogue reads an hour, not 33,000 product checks.
+                withdrawn = (
+                    dbm.mark_missing(conn, store["id"], products, dbm.utcnow())
+                    if result.enumerated else 0
+                )
+            if withdrawn:
+                log.info(
+                    "%-38s %d product(s) no longer listed", store["domain"], withdrawn
+                )
+                stats.withdrawn += withdrawn
             classified.extend(products)
             if store["id"] not in first_sight:
                 changed.extend(ids)
@@ -933,6 +1047,19 @@ async def run(
             _record_block(conn, run_id, limiter)
             _finish_run(conn, run_id, stats)
             return stats
+
+        # Before scoring rather than after it, so that a price this pass found
+        # by opening a product's own page is judged in the same run. At the end
+        # it would sit unscored until the price moved again.
+        if verify_budget:
+            checks = await verify_offers(conn, client, rates, limiter, verify_budget)
+            changed.extend(checks["changed"])
+            stats.verified += checks["checked"]
+            stats.withdrawn += checks["gone"]
+            log.info(
+                "checked %d card(s) one by one: %d gone, %d unreachable",
+                checks["checked"] + checks["gone"], checks["gone"], checks["unreachable"],
+            )
 
         scorable = all_scorable_variants(conn) if rescan else changed
         codes = read_watchlist(config.watchlist_file)

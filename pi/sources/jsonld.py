@@ -629,6 +629,36 @@ async def has_readable_products(
     return "product pages carry no machine-readable price (rendered in JavaScript)"
 
 
+async def fetch_product(
+    client: httpx.AsyncClient, url: str
+) -> tuple[str, ScrapedProduct | None]:
+    """One product page. Returns ("ok" | "gone" | "unreachable", product).
+
+    These shops are read as a bounded crawl, so their catalogues are never
+    enumerated and absence from a pass proves nothing. Opening the page itself
+    is the only way to ask, and 731 offers across 17 shops is few enough to ask
+    about one at a time.
+
+    A page that will not parse is "unreachable", not "gone". Markup we cannot
+    read is our limitation; only the shop's own 404 is the shop's answer.
+    """
+    try:
+        resp = await client.get(url, follow_redirects=True)
+    except httpx.HTTPError as exc:
+        log.debug("%s: %s", url, exc)
+        return "unreachable", None
+    if resp.status_code in (404, 410):
+        return "gone", None
+    if resp.status_code != 200:
+        return "unreachable", None
+    parsed = parse_product(resp.text, url)
+    if parsed is None:
+        return "unreachable", None
+    product, found_currency = parsed
+    product.currency = found_currency
+    return "ok", product
+
+
 async def fetch(
     client: httpx.AsyncClient,
     domain: str,

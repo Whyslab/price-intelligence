@@ -61,6 +61,23 @@ class FetchResult:
     currency: str | None = None
     error: str | None = None
     next_cursor: int = 0
+    # Does `products` list everything this shop currently sells?
+    #
+    # A much stronger claim than `complete`, and only one adapter can make it.
+    # `complete` says this pass reached the end of what it was reading, which is
+    # true of a pass that started half way through and of one that read a
+    # bounded sample. This says the shop's entire catalogue is in the list, so a
+    # product's *absence* from it means the shop has stopped selling it — which
+    # is the whole basis for eventually deleting anything.
+    #
+    # Shopify sets it: /products.json is the catalogue, read from the first page
+    # to the last, and any refusal part way through ends the pass without it.
+    # jsonld does not, and cannot: its pages are fetched one by one and a failed
+    # page silently drops a product, so a shop with a slow minute would look
+    # like a shop that had emptied its shelves. Those get `pi verify` instead.
+    # ASOS does not either: it reads the sale sections, and a shoe absent from a
+    # sale is not a shoe that is gone.
+    enumerated: bool = False
 
     @property
     def ok(self) -> bool:
