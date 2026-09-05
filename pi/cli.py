@@ -536,6 +536,76 @@ def cmd_digest(args, config: Config) -> int:
     return 0
 
 
+def cmd_subscriptions(args, config: Config) -> int:
+    """Remind, expire, and refund. Run daily by a timer.
+
+    The bot cannot do this itself: it only wakes when somebody writes to it, and
+    a subscription ending is precisely the event nobody writes about.
+    """
+    conn = dbm.connect(config.db_path)
+
+    if args.refund:
+        row = dbm.get_bot_user(conn, args.refund)
+        if row is None or not row["charge_id"]:
+            print(f"нет платежа, который можно вернуть у {args.refund}", file=sys.stderr)
+            return 1
+
+        async def refund() -> bool:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.post(
+                    f"https://api.telegram.org/bot{config.bot_token}/refundStarPayment",
+                    json={"user_id": args.refund,
+                          "telegram_payment_charge_id": row["charge_id"]},
+                )
+                body = resp.json()
+                if not body.get("ok"):
+                    print(f"Telegram отказал: {body.get('description')}", file=sys.stderr)
+                return bool(body.get("ok"))
+
+        if not asyncio.run(refund()):
+            return 1
+        # The subscription goes with the money. Left standing, a refunded reader
+        # keeps everything they were refunded for until the date runs out.
+        conn.execute(
+            "UPDATE bot_users SET plan = 'free', paid_until = NULL WHERE id = ?",
+            (args.refund,),
+        )
+        print(f"возврат проведён, подписка {args.refund} снята")
+        return 0
+
+    due = dbm.expiring_soon(conn, within_days=args.remind_days)
+    expired = dbm.expire_due(conn)
+    print(f"напомнить: {len(due)} · вернулось на бесплатный: {expired}")
+    if args.dry_run or not due:
+        for row in due:
+            print(f"  {row['id']} ({row['username'] or row['chat_id']}) до {row['paid_until']}")
+        return 0
+    if not config.telegram_ready:
+        print("TELEGRAM_BOT_TOKEN not set", file=sys.stderr)
+        return 1
+
+    async def remind() -> int:
+        sent = 0
+        async with httpx.AsyncClient(timeout=30) as client:
+            for row in due:
+                async with Telegram(config.bot_token, row["chat_id"], client) as tg:
+                    if await tg.send_text(
+                        "⏳ Подписка заканчивается "
+                        f"<b>{row['paid_until'][:10]}</b>.\n\n"
+                        "Если продление настроено, Telegram спишет звёзды сам. "
+                        "Если нет — оформить можно командой /subscription.\n\n"
+                        "После окончания останутся две находки в день; профиль "
+                        "и отмеченное никуда не денутся."
+                    ):
+                        sent += 1
+                    elif tg.chat_is_gone:
+                        personal.deactivate(conn, row["chat_id"])
+        return sent
+
+    print(f"отправлено напоминаний: {asyncio.run(remind())}")
+    return 0
+
+
 def cmd_backup(args, config: Config) -> int:
     conn = dbm.connect(config.db_path)
     dest = Path(args.out) if args.out else config.db_path.with_name("pi-snapshot.db")
@@ -623,6 +693,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--out", help="where to write it (default: data/pi-snapshot.db)")
     p.set_defaults(func=cmd_backup)
+
+    p = sub.add_parser(
+        "subscriptions", help="remind before a subscription ends, expire the lapsed"
+    )
+    p.add_argument("--remind-days", type=int, default=3,
+                   help="how far ahead to remind (default 3)")
+    p.add_argument("--dry-run", action="store_true", help="list them, send nothing")
+    p.add_argument("--refund", type=int, metavar="USER_ID",
+                   help="refund this reader's last payment and drop their subscription")
+    p.set_defaults(func=cmd_subscriptions)
 
     p = sub.add_parser("digest", help="send the free tier's finds of the day")
     p.add_argument("--count", type=int, default=2, help="how many finds (default 2)")

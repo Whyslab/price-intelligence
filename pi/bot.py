@@ -105,6 +105,13 @@ def _age(then: str | None, now: str) -> str:
     return f"{hours / 24:.0f} дн назад"
 
 
+def _date(stamp: str | None) -> str:
+    """A stored timestamp as a date a person reads. Used for "paid until"."""
+    if not stamp:
+        return "—"
+    return datetime.fromisoformat(stamp).strftime("%d.%m.%Y")
+
+
 def format_entry(row: sqlite3.Row, now: str) -> str:
     """One offer as the caption under its photo.
 
@@ -190,6 +197,13 @@ def format_card(row: sqlite3.Row, sizes: list[tuple[str, bool]], now: str,
 # the reason to commit, and a reader who commits is one the renewal cannot lose.
 MONTHLY_STARS = 150
 YEARLY_STARS = 1500
+
+# Telegram accepts exactly one subscription period for Stars — thirty days — and
+# rejects the invoice outright for anything else. Written out rather than left
+# as a number so the next person does not try to make it 31.
+SUBSCRIPTION_PERIOD = 30 * 24 * 3600
+PLAN_DAYS = {"month": 30, "year": 365}
+PLAN_STARS = {"month": MONTHLY_STARS, "year": YEARLY_STARS}
 
 
 def subscription_pitch(conn: sqlite3.Connection) -> str:
@@ -458,7 +472,7 @@ class Bot:
 
     # -- transport --
 
-    async def _call(self, method: str, payload: dict) -> dict | None:
+    async def _call(self, method: str, payload: dict) -> dict | list | str | None:
         assert self._client is not None
         try:
             resp = await self._client.post(
@@ -595,6 +609,149 @@ class Bot:
             return
         await self.send(chat_id, caption, keyboard)
 
+    # -- paying --
+
+    async def send_invoice(self, chat_id: str, plan: str) -> None:
+        """Offer one plan as a Telegram invoice, in Stars.
+
+        Built with `createInvoiceLink` rather than `sendInvoice` for both plans,
+        even though only the monthly one needs it. A subscription can only be
+        created that way, and having the two plans travel different code paths
+        would mean the one that renews itself is the one nobody exercises.
+
+        `provider_token` is absent: Stars are Telegram's own currency and there
+        is no acquirer to name. `amount` is the number of stars, not hundredths
+        of anything — XTR has no minor unit, and multiplying by 100 here is the
+        classic way to charge a reader a hundred times the price.
+        """
+        stars = PLAN_STARS.get(plan)
+        if stars is None:
+            return
+        payload = {
+            "title": "Price Intelligence — подписка",
+            "description": (
+                "Вся полка со скидками, поиск по артикулу, лента под ваши "
+                "размеры и марки, слежка за отмеченным."
+                if plan == "month" else
+                "То же самое на год — два месяца в подарок."
+            ),
+            "payload": f"sub:{plan}",
+            "currency": "XTR",
+            "prices": [{"label": "Подписка", "amount": stars}],
+        }
+        if plan == "month":
+            payload["subscription_period"] = SUBSCRIPTION_PERIOD
+        link = await self._call("createInvoiceLink", payload)
+        if not link:
+            await self.send(
+                chat_id,
+                "Не получилось выставить счёт. Попробуйте ещё раз через минуту.",
+            )
+            return
+        period = "месяц" if plan == "month" else "год"
+        await self.send(
+            chat_id,
+            f"⭐ <b>{stars} звёзд</b> за {period}."
+            + (
+                "\n\nПродление автоматическое, отменить можно в любой момент "
+                "командой /cancel."
+                if plan == "month" else
+                "\n\nРазовый платёж, ничего не продлевается само."
+            ),
+            {"inline_keyboard": [[{"text": f"Оплатить {stars} ⭐", "url": link}]]},
+        )
+
+    async def show_subscription(self, chat_id: str, user: sqlite3.Row) -> None:
+        """What this reader has, in the plainest words available."""
+        state = dbm.subscription_state(self.conn, user["id"])
+        if state == "free":
+            await self.send(chat_id, subscription_pitch(self.conn), subscription_keyboard())
+            return
+        row = dbm.get_bot_user(self.conn, user["id"])
+        until = _date(row["paid_until"])
+        if state == "grace":
+            await self.send(
+                chat_id,
+                f"⚠️ Подписка закончилась {until}, и продление не прошло.\n\n"
+                "Лента пока идёт, витрина уже закрыта. Оплатите, чтобы вернуть "
+                "всё — размеры, марки и отмеченное на месте.",
+                subscription_keyboard(),
+            )
+            return
+        await self.send(
+            chat_id,
+            f"💎 Подписка активна до <b>{until}</b>.\n\n"
+            f"Всего оплачено: {row['stars_paid']} ⭐. Отменить продление — /cancel.",
+        )
+
+    async def cancel_subscription(self, chat_id: str, user: sqlite3.Row) -> None:
+        """Stop the renewal without taking away what is already paid for.
+
+        Cancelling is the reader saying "not next month", not "give me back this
+        one". Telegram holds the recurring charge, and `paid_until` is left
+        exactly where it is: they keep everything until the day they bought.
+        """
+        row = dbm.get_bot_user(self.conn, user["id"])
+        if not row["charge_id"] or dbm.subscription_state(self.conn, user["id"]) == "free":
+            await self.send(chat_id, "Отменять нечего — подписки сейчас нет.")
+            return
+        stopped = await self._call("editUserStarSubscription", {
+            "user_id": user["id"],
+            "telegram_payment_charge_id": row["charge_id"],
+            "is_canceled": True,
+        })
+        if stopped is None:
+            await self.send(
+                chat_id,
+                "Не получилось отменить продление отсюда. Это можно сделать в "
+                "Telegram: Настройки → Мои звёзды → подписки.",
+            )
+            return
+        await self.send(
+            chat_id,
+            f"Продление отключено. Подписка работает до "
+            f"<b>{_date(row['paid_until'])}</b>, дальше бот вернётся к двум "
+            "находкам в день. Профиль и отмеченное останутся.",
+        )
+
+    async def on_pre_checkout(self, query: dict) -> None:
+        """Say yes within ten seconds, or Telegram cancels the payment for us.
+
+        There is nothing to check. The goods are the same for every reader and
+        cannot run out, so the only thing a refusal here could express is a bug
+        — and the reader would see a failed payment rather than the bug.
+        """
+        await self._call(
+            "answerPreCheckoutQuery",
+            {"pre_checkout_query_id": query["id"], "ok": True},
+        )
+
+    async def on_paid(self, message: dict, user: sqlite3.Row) -> None:
+        """Money arrived: extend the subscription and say what was bought.
+
+        Handles the renewals as well as the first payment. Telegram sends the
+        same message shape every thirty days for a subscription, so this must be
+        additive — `grant` adds to whichever is later, now or the date already
+        paid to, and that is what makes a renewal a renewal rather than a reset.
+        """
+        payment = message["successful_payment"]
+        plan = str(payment.get("invoice_payload", "")).removeprefix("sub:")
+        days = PLAN_DAYS.get(plan, 30)
+        row = dbm.grant(
+            self.conn, user["id"], days=days,
+            charge_id=payment.get("telegram_payment_charge_id"),
+            stars=int(payment.get("total_amount") or 0),
+        )
+        until = _date(row["paid_until"])
+        renewal = payment.get("is_recurring") and not payment.get("is_first_recurring")
+        await self.send(
+            str(message["chat"]["id"]),
+            (f"✅ Подписка продлена до <b>{until}</b>." if renewal else
+             f"✅ Готово. Подписка активна до <b>{until}</b>.\n\n"
+             "Полка, поиск по артикулу и лента под ваш профиль открыты."),
+            menu_keyboard(row, self.config.web_url, subscribed=True),
+        )
+
     async def show_menu(self, chat_id: str, user: sqlite3.Row):
         await self.send(
             chat_id,
@@ -655,6 +812,19 @@ class Bot:
         user = self._user(sender, chat_id)
         text = (message.get("text") or "").strip()
 
+        # Before anything is read as a command: a payment arrives as a message
+        # with no text at all, and falling through would look up the empty
+        # string as an article number.
+        if "successful_payment" in message:
+            await self.on_paid(message, user)
+            return
+
+        if text.startswith("/subscription"):
+            await self.show_subscription(chat_id, user)
+            return
+        if text.startswith("/cancel"):
+            await self.cancel_subscription(chat_id, user)
+            return
         if text.startswith("/start"):
             await self.send(
                 chat_id,
@@ -717,6 +887,8 @@ class Bot:
 
         if data == "wizard":
             await self.ask(chat_id, user, "genders", wizard=True)
+        elif data.startswith("buy:"):
+            await self.send_invoice(chat_id, data[4:])
         elif data == "pitch":
             await self.send(
                 chat_id, subscription_pitch(self.conn), subscription_keyboard()
@@ -754,6 +926,8 @@ class Bot:
                 await self.on_message(update["message"])
             elif "callback_query" in update:
                 await self.on_callback(update["callback_query"])
+            elif "pre_checkout_query" in update:
+                await self.on_pre_checkout(update["pre_checkout_query"])
         except Exception:
             # One malformed update must not take the bot down: it would stay
             # down until somebody noticed, and nobody watches a bot that works.
@@ -768,7 +942,13 @@ class Bot:
                 updates = await self._call(
                     "getUpdates",
                     {"offset": self.offset, "timeout": 50,
-                     "allowed_updates": ["message", "callback_query"]},
+                     # pre_checkout_query has to be asked for. It is not in the
+                     # default set, and without it Telegram waits ten seconds
+                     # for an answer that never comes and cancels every payment
+                     # — silently, from the bot's side.
+                     "allowed_updates": [
+                         "message", "callback_query", "pre_checkout_query",
+                     ]},
                 )
                 if updates is None:
                     await asyncio.sleep(5)  # network trouble; do not spin
