@@ -1053,6 +1053,59 @@ def grant(
     return get_bot_user(conn, user_id)
 
 
+# What "access, indefinitely" is written as. A date rather than a null or a flag,
+# because every question this module answers is "until when?" — a second way of
+# saying yes would have to be handled in `subscription_state`, `expire_due`,
+# `expiring_soon`, the reminder and the summary, and the one that gets forgotten
+# is the bug.
+COMP_DAYS = 365 * 50
+
+
+def comp(
+    conn: sqlite3.Connection, user_id: int, days: int = COMP_DAYS
+) -> sqlite3.Row:
+    """Give somebody access without them paying for it.
+
+    Exists because the alternative is a hand-written UPDATE, and that is not a
+    hypothetical: `paid_until = datetime('now','+30 days')` is the obvious thing
+    to type, it stores a timestamp in a shape nothing else here writes, and it
+    used to take down the notification pass for every reader at once. A command
+    that writes the right shape is the fix that removes the reason to type it.
+
+    Creates the reader if they have never spoken to the bot, using their user id
+    as the chat id — in a private chat Telegram makes those the same number, so
+    the bot can write to them the moment they say /start, and the subscription
+    is already waiting.
+
+    No stars are recorded: nothing was paid, and the revenue line must not say
+    otherwise.
+    """
+    if get_bot_user(conn, user_id) is None:
+        upsert_bot_user(conn, user_id, chat_id=str(user_id))
+    return grant(conn, user_id, days=days)
+
+
+def revoke(conn: sqlite3.Connection, user_id: int) -> bool:
+    """Take access away now, keeping the profile and the starred things.
+
+    Does not touch `stars_paid` or `charge_id`: this is not a refund, and
+    somebody comped by mistake never paid anything to give back. A reader whose
+    money must go back is `pi subscriptions --refund`.
+    """
+    cursor = conn.execute(
+        "UPDATE bot_users SET plan = 'free', paid_until = NULL WHERE id = ?",
+        (user_id,),
+    )
+    return cursor.rowcount > 0
+
+
+def readers(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Everyone the bot knows, newest last. For the owner to look at."""
+    return conn.execute(
+        "SELECT * FROM bot_users ORDER BY created_at, id"
+    ).fetchall()
+
+
 def expire_due(conn: sqlite3.Connection, now: str | None = None) -> int:
     """Return readers whose grace has run out to the free plan, and count them.
 

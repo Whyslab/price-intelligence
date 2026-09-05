@@ -304,6 +304,62 @@ def subscription_keyboard() -> dict:
     }
 
 
+# --- the owner's panel ------------------------------------------------------
+
+def admin_keyboard() -> dict:
+    return {"inline_keyboard": [
+        [{"text": "👥 Читатели", "callback_data": "adm:readers"},
+         {"text": "📊 Сводка", "callback_data": "adm:health"}],
+        [{"text": "➕ Выдать доступ", "callback_data": "adm:grant"},
+         {"text": "➖ Забрать доступ", "callback_data": "adm:revoke"}],
+        [{"text": "◀️ Обычное меню", "callback_data": "menu"}],
+    ]}
+
+
+def admin_panel(conn: sqlite3.Connection, web_url: str | None) -> str:
+    """The panel's own text: who is here, and what the shelf is reachable at."""
+    people = dbm.readers(conn)
+    states = [dbm.subscription_state(conn, row["id"]) for row in people]
+    lines = [
+        "🛠 <b>Админ-панель</b>",
+        "",
+        f"Читателей: <b>{len(people)}</b>"
+        f" · платят {states.count('paid')}"
+        f" · в отсрочке {states.count('grace')}"
+        f" · бесплатных {states.count('free')}",
+    ]
+    if web_url:
+        # Worth having in front of the owner: on a temporary tunnel this address
+        # changes every time cloudflared restarts, and a stale one in somebody's
+        # chat is the usual reason "the shelf button is broken".
+        lines.append(f"Витрина: {escape(web_url)}")
+    else:
+        lines.append("Витрина: адрес не задан (PI_WEB_URL)")
+    return "\n".join(lines)
+
+
+def format_readers(conn: sqlite3.Connection, rows: list[sqlite3.Row]) -> str:
+    """Everyone the bot knows, with what they have and until when."""
+    if not rows:
+        return "Пока никого. Читатель появляется здесь, когда напишет /start."
+    mark = {"paid": "💎", "grace": "⏳", "free": "·"}
+    lines = ["👥 <b>Читатели</b>", ""]
+    for row in rows[-40:]:
+        state = dbm.subscription_state(conn, row["id"])
+        who = escape(row["username"] or str(row["id"]))
+        line = f"{mark[state]} <code>{row['id']}</code> {who}"
+        if state != "free":
+            line += f" — до {_date(row['paid_until'])}"
+        if row["stars_paid"]:
+            line += f" · {row['stars_paid']} ⭐"
+        if not row["active"]:
+            line += " · заблокировал бота"
+        lines.append(line)
+    if len(rows) > 40:
+        lines.append(f"\n…и ещё {len(rows) - 40}, показаны последние 40.")
+    return "\n".join(lines)
+
+
 # --- keyboards --------------------------------------------------------------
 
 BOT_LOOKUP_LIMIT = 8
@@ -427,7 +483,7 @@ def shelf_button(web_url: str | None) -> list[dict] | None:
 
 
 def menu_keyboard(user: sqlite3.Row, web_url: str | None = None,
-                  subscribed: bool = False) -> dict:
+                  subscribed: bool = False, owner: bool = False) -> dict:
     rows = [[{"text": "💰 Смотреть скидки", "callback_data": "p:0"}]]
     shelf = shelf_button(web_url)
     if shelf:
@@ -442,6 +498,8 @@ def menu_keyboard(user: sqlite3.Row, web_url: str | None = None,
         [{"text": "📏 Размеры", "callback_data": "ask:sizes"},
          {"text": "🏷 Марки", "callback_data": "ask:brands"}],
     ]
+    if owner:
+        rows.append([{"text": "🛠 Админ-панель", "callback_data": "adm:panel"}])
     return {"inline_keyboard": rows}
 
 
@@ -691,6 +749,112 @@ class Bot:
             {"inline_keyboard": [[{"text": f"Оплатить {stars} ⭐", "url": link}]]},
         )
 
+    # -- the owner's panel --
+
+    def is_owner(self, user: sqlite3.Row) -> bool:
+        """Whether this is the person who runs the collector.
+
+        Compared against the chat id in `.env`, which is the same number as the
+        user id in a private chat and is the only statement of who owns this
+        installation that exists anywhere. There is no second admin and no way
+        to make one from inside the bot — an owner list that can be edited by
+        whoever is already on it is a door, not a lock.
+        """
+        return bool(self.config.chat_id) and str(user["id"]) == str(self.config.chat_id)
+
+    async def show_admin(self, chat_id: str, user: sqlite3.Row) -> None:
+        if not self.is_owner(user):
+            # Not "you may not": nothing says the command exists. Somebody
+            # guessing at /admin learns only that the bot did not understand.
+            await self.send(chat_id, "Не понял. Пришлите артикул или название.")
+            return
+        await self.send(
+            chat_id, admin_panel(self.conn, self.config.web_url), admin_keyboard()
+        )
+
+    async def admin_action(self, chat_id: str, user: sqlite3.Row, action: str) -> None:
+        if not self.is_owner(user):
+            return
+        if action == "readers":
+            await self.send(
+                chat_id,
+                format_readers(self.conn, dbm.readers(self.conn)),
+                admin_keyboard(),
+            )
+            return
+        if action == "health":
+            from . import pipeline
+
+            await self.send(chat_id, pipeline.health_report(self.conn), admin_keyboard())
+            return
+        if action in ("grant", "revoke"):
+            self._save(user["id"], wizard_step=f"admin_{action}")
+            asking = (
+                "Кому выдать доступ? Пришлите Telegram id.\n\n"
+                "Можно добавить срок в днях: <code>12345678 90</code>.\n"
+                "Без срока — доступ без ограничения по времени."
+                if action == "grant" else
+                "У кого забрать доступ? Пришлите Telegram id.\n\n"
+                "Профиль и отмеченное останутся; деньги это не возвращает — "
+                "для возврата есть <code>pi subscriptions --refund</code>."
+            )
+            await self.send(
+                chat_id, asking,
+                {"inline_keyboard": [[{"text": "Отмена", "callback_data": "adm:cancel"}]]},
+            )
+            return
+        if action == "panel":
+            await self.send(
+                chat_id, admin_panel(self.conn, self.config.web_url), admin_keyboard()
+            )
+            return
+        if action == "cancel":
+            self._save(user["id"], wizard_step=None)
+            await self.send(
+                chat_id, admin_panel(self.conn, self.config.web_url), admin_keyboard()
+            )
+
+    async def admin_input(self, chat_id: str, user: sqlite3.Row, step: str, text: str):
+        """The id typed after "grant" or "revoke" was pressed."""
+        self._save(user["id"], wizard_step=None)
+        parts = text.split()
+        if not parts or not parts[0].lstrip("-").isdigit():
+            await self.send(chat_id, "Это не похоже на id. Отменил.", admin_keyboard())
+            return
+        target = int(parts[0])
+
+        if step == "admin_revoke":
+            if dbm.revoke(self.conn, target):
+                await self.send(
+                    chat_id, f"Доступ у <code>{target}</code> забран.", admin_keyboard()
+                )
+            else:
+                await self.send(
+                    chat_id, f"Читателя <code>{target}</code> не знаю.", admin_keyboard()
+                )
+            return
+
+        days = dbm.COMP_DAYS
+        if len(parts) > 1 and parts[1].isdigit():
+            days = int(parts[1])
+        row = dbm.comp(self.conn, target, days=days)
+        until = _date(row["paid_until"])
+        forever = days >= dbm.COMP_DAYS
+        await self.send(
+            chat_id,
+            f"Доступ выдан <code>{target}</code>"
+            + ("." if forever else f" до <b>{until}</b>.")
+            + "\n\nЕсли он ещё не писал боту, доступ уже ждёт его: всё "
+              "заработает, как только он нажмёт /start.",
+            admin_keyboard(),
+        )
+        # Tell them, but only if the bot is allowed to write to them first.
+        await self.send(
+            str(target),
+            "💎 Вам открыт полный доступ: вся полка, поиск по артикулу и лента "
+            "под ваш профиль.\n\nНастроить подборку — /settings.",
+        )
+
     async def forget(self, chat_id: str, user: sqlite3.Row) -> None:
         """Delete everything kept about one reader, on their word alone.
 
@@ -843,6 +1007,7 @@ class Bot:
             menu_keyboard(
                 user, self.config.web_url,
                 subscribed=dbm.subscription_state(self.conn, user["id"]) != "free",
+                owner=self.is_owner(user),
             ),
         )
 
@@ -909,6 +1074,9 @@ class Bot:
         if text.startswith("/cancel"):
             await self.cancel_subscription(chat_id, user)
             return
+        if text.startswith("/admin"):
+            await self.show_admin(chat_id, user)
+            return
         if text.startswith("/terms"):
             await self.send(chat_id, TERMS)
             return
@@ -944,6 +1112,9 @@ class Bot:
             return
 
         step = user["wizard_step"]
+        if step in ("admin_grant", "admin_revoke"):
+            await self.admin_input(chat_id, user, step, text)
+            return
         if step in ("sizes", "brands"):
             value = self._clean(step, text)
             user = self._save(user["id"], **{step: value})
@@ -984,6 +1155,8 @@ class Bot:
 
         if data == "wizard":
             await self.ask(chat_id, user, "genders", wizard=True)
+        elif data.startswith("adm:"):
+            await self.admin_action(chat_id, user, data[4:])
         elif data.startswith("buy:"):
             await self.send_invoice(chat_id, data[4:])
         elif data == "pitch":

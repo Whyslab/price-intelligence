@@ -540,6 +540,30 @@ def cmd_digest(args, config: Config) -> int:
     return 0
 
 
+def cmd_grant(args, config: Config) -> int:
+    """Give or take access from the terminal, without touching SQL by hand.
+
+    The reason this exists is a bug it prevents: comping somebody with
+    `UPDATE bot_users SET paid_until = datetime('now','+30 days')` writes a
+    timestamp in a shape nothing else in this project writes, and that one row
+    used to be enough to stop the notification pass for every reader.
+    """
+    conn = dbm.connect(config.db_path)
+    if args.revoke:
+        if dbm.revoke(conn, args.user_id):
+            print(f"доступ у {args.user_id} забран")
+            return 0
+        print(f"читателя {args.user_id} нет в базе", file=sys.stderr)
+        return 1
+
+    row = dbm.comp(conn, args.user_id, days=args.days)
+    when = "без ограничения по времени" if args.days >= dbm.COMP_DAYS else (
+        f"до {row['paid_until'][:10]}"
+    )
+    print(f"доступ выдан {args.user_id} — {when}")
+    return 0
+
+
 def cmd_subscriptions(args, config: Config) -> int:
     """Remind, expire, and refund. Run daily by a timer.
 
@@ -731,6 +755,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--out", help="where to write it (default: data/pi-snapshot.db)")
     p.set_defaults(func=cmd_backup)
+
+    p = sub.add_parser("grant", help="give or take access without anybody paying")
+    p.add_argument("user_id", type=int, help="Telegram user id")
+    p.add_argument("--days", type=int, default=dbm.COMP_DAYS,
+                   help="how long for (default: no time limit)")
+    p.add_argument("--revoke", action="store_true", help="take it away instead")
+    p.set_defaults(func=cmd_grant)
 
     p = sub.add_parser(
         "subscriptions", help="remind before a subscription ends, expire the lapsed"

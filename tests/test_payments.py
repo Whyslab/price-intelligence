@@ -336,3 +336,106 @@ class TestTheDailySummary:
         conn.execute("UPDATE bot_users SET paid_until = ? WHERE id = 1", (ts(90),))
 
         assert "платят 0" in pipeline.health_report(conn)
+
+
+class TestTheOwnersPanel:
+    """`/admin` opens for one person, and for nobody else says it exists."""
+
+    @pytest.fixture
+    def owner(self, conn, tmp_path, calls, monkeypatch):
+        """A bot whose .env owner is user 7 — the id the fixtures send from."""
+        from dataclasses import replace
+
+        instance = bot.Bot(replace(_config(tmp_path), chat_id="7"), conn)
+
+        async def record(method, payload):
+            calls.append((method, payload))
+            return {"username": "test"}
+
+        monkeypatch.setattr(instance, "_call", record)
+        return instance
+
+    @pytest.mark.asyncio
+    async def test_a_stranger_is_not_told_the_command_exists(self, robot, calls):
+        # robot's config.chat_id is "42"; the sender is user 7.
+        await robot.handle(_message("/admin"))
+        assert "Не понял" in calls[0][1]["text"]
+        assert "дмин" not in calls[0][1]["text"]
+
+    @pytest.mark.asyncio
+    async def test_the_owner_gets_the_panel(self, owner, calls, conn):
+        dbm.upsert_bot_user(conn, 8, "8")
+        dbm.grant(conn, 8, days=30)
+
+        await owner.handle(_message("/admin"))
+
+        text, keyboard = calls[0][1]["text"], calls[0][1]["reply_markup"]
+        assert "Админ-панель" in text
+        assert "платят 1" in text
+        buttons = [b["callback_data"] for row in keyboard["inline_keyboard"] for b in row]
+        assert {"adm:readers", "adm:grant", "adm:revoke"} <= set(buttons)
+
+    @pytest.mark.asyncio
+    async def test_granting_access_from_the_panel(self, owner, calls, conn):
+        await owner.handle(_press("adm:grant"))
+        calls.clear()
+
+        await owner.handle(_message("999"))
+
+        assert dbm.is_subscribed(conn, 999) is True
+        # Told the owner, and told the new reader.
+        recipients = [p["chat_id"] for m, p in calls if m == "sendMessage"]
+        assert "999" in recipients
+
+    @pytest.mark.asyncio
+    async def test_a_grant_can_be_given_a_number_of_days(self, owner, conn):
+        await owner.handle(_press("adm:grant"))
+        await owner.handle(_message("999 45"))
+
+        from datetime import UTC, datetime, timedelta
+        left = datetime.fromisoformat(
+            dbm.get_bot_user(conn, 999)["paid_until"]
+        ) - datetime.now(UTC)
+        assert timedelta(days=44) < left <= timedelta(days=45)
+
+    @pytest.mark.asyncio
+    async def test_granting_to_somebody_who_never_wrote_still_works(self, owner, conn):
+        """The subscription waits for them; grant() alone would have raised."""
+        await owner.handle(_press("adm:grant"))
+        await owner.handle(_message("31337"))
+
+        row = dbm.get_bot_user(conn, 31337)
+        assert row is not None and row["chat_id"] == "31337"
+        assert dbm.is_subscribed(conn, 31337) is True
+
+    @pytest.mark.asyncio
+    async def test_revoking_keeps_the_profile(self, owner, calls, conn):
+        dbm.upsert_bot_user(conn, 999, "999", sizes="EU44")
+        dbm.grant(conn, 999, days=30, stars=150)
+
+        await owner.handle(_press("adm:revoke"))
+        await owner.handle(_message("999"))
+
+        row = dbm.get_bot_user(conn, 999)
+        assert dbm.is_subscribed(conn, 999) is False
+        assert row["sizes"] == "EU44"
+        # Not a refund: what they paid is still on the record.
+        assert row["stars_paid"] == 150
+
+    @pytest.mark.asyncio
+    async def test_a_stranger_pressing_the_button_gets_nothing(self, robot, calls):
+        await robot.handle(_press("adm:readers"))
+        # Only the callback acknowledgement; no panel, no reader list.
+        assert [m for m, _ in calls] == ["answerCallbackQuery"]
+
+    @pytest.mark.asyncio
+    async def test_nonsense_instead_of_an_id_is_refused(self, owner, calls, conn):
+        await owner.handle(_press("adm:grant"))
+        calls.clear()
+
+        await owner.handle(_message("вася"))
+
+        assert "не похоже на id" in calls[0][1]["text"]
+        assert dbm.readers(conn) == [] or all(
+            r["id"] == 7 for r in dbm.readers(conn)
+        )
