@@ -197,7 +197,11 @@ def cmd_web(args, config: Config) -> int:
         # The person who runs the collector is not a customer of it. Their id
         # comes from .env, which for a private chat is the same number, and it
         # grants nothing on its own — Telegram still has to sign the request.
-        exempt_id=int(config.chat_id) if (config.chat_id or "").lstrip("-").isdigit() else None,
+        # Only a positive id, which is what a person's is. A bot posting into a
+        # channel has a negative chat id, and taking that as the owner's user id
+        # matches nobody — locking the owner out of their own shelf with nothing
+        # anywhere saying why.
+        exempt_id=int(config.chat_id) if (config.chat_id or "").isdigit() else None,
     )
     return 0
 
@@ -552,33 +556,67 @@ def cmd_subscriptions(args, config: Config) -> int:
 
         async def refund() -> bool:
             async with httpx.AsyncClient(timeout=30) as client:
-                resp = await client.post(
-                    f"https://api.telegram.org/bot{config.bot_token}/refundStarPayment",
-                    json={"user_id": args.refund,
-                          "telegram_payment_charge_id": row["charge_id"]},
-                )
-                body = resp.json()
-                if not body.get("ok"):
-                    print(f"Telegram отказал: {body.get('description')}", file=sys.stderr)
-                return bool(body.get("ok"))
+                base = f"https://api.telegram.org/bot{config.bot_token}"
+
+                async def call(method: str, payload: dict) -> tuple[bool, str]:
+                    resp = await client.post(f"{base}/{method}", json=payload)
+                    body = resp.json()
+                    return bool(body.get("ok")), str(body.get("description") or "")
+
+                # Stop the renewal first. Refunding a subscription without
+                # cancelling it gives the money back and leaves the charge armed:
+                # thirty days later Telegram fires it, the bot grants a fresh
+                # month, and the refunded reader is back on the paid shelf. It is
+                # possible Telegram cancels on refund by itself — this must not
+                # be the code that depends on finding out.
+                if row["sub_charge_id"]:
+                    ok, why = await call("editUserStarSubscription", {
+                        "user_id": args.refund,
+                        "telegram_payment_charge_id": row["sub_charge_id"],
+                        "is_canceled": True,
+                    })
+                    if not ok:
+                        print(f"не удалось остановить продление: {why}", file=sys.stderr)
+                        return False
+
+                ok, why = await call("refundStarPayment", {
+                    "user_id": args.refund,
+                    "telegram_payment_charge_id": row["charge_id"],
+                })
+                if not ok:
+                    print(f"Telegram отказал: {why}", file=sys.stderr)
+                return ok
 
         if not asyncio.run(refund()):
             return 1
-        # The subscription goes with the money. Left standing, a refunded reader
-        # keeps everything they were refunded for until the date runs out.
+        # The subscription goes with the money, and so does the record of it:
+        # a charge id left standing gets refunded twice by the next operator,
+        # and stars that came back must stop counting as revenue.
         conn.execute(
-            "UPDATE bot_users SET plan = 'free', paid_until = NULL WHERE id = ?",
-            (args.refund,),
+            """
+            UPDATE bot_users
+               SET plan = 'free', paid_until = NULL,
+                   charge_id = NULL, sub_charge_id = NULL,
+                   stars_paid = MAX(0, stars_paid - ?)
+             WHERE id = ?
+            """,
+            (int(args.stars or 0), args.refund),
         )
         print(f"возврат проведён, подписка {args.refund} снята")
         return 0
 
     due = dbm.expiring_soon(conn, within_days=args.remind_days)
-    expired = dbm.expire_due(conn)
-    print(f"напомнить: {len(due)} · вернулось на бесплатный: {expired}")
-    if args.dry_run or not due:
+    if args.dry_run:
+        # Nothing is written, including the expiry sweep. "list them, send
+        # nothing" that moves rows is a dry run in name only.
+        print(f"напомнить: {len(due)} (ничего не записано и не отправлено)")
         for row in due:
             print(f"  {row['id']} ({row['username'] or row['chat_id']}) до {row['paid_until']}")
+        return 0
+
+    expired = dbm.expire_due(conn)
+    print(f"напомнить: {len(due)} · вернулось на бесплатный: {expired}")
+    if not due:
         return 0
     if not config.telegram_ready:
         print("TELEGRAM_BOT_TOKEN not set", file=sys.stderr)
@@ -702,6 +740,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dry-run", action="store_true", help="list them, send nothing")
     p.add_argument("--refund", type=int, metavar="USER_ID",
                    help="refund this reader's last payment and drop their subscription")
+    p.add_argument("--stars", type=int, default=0, metavar="N",
+                   help="with --refund: how many stars went back, so the revenue "
+                        "line stops counting them (Telegram's refund notice says)")
     p.set_defaults(func=cmd_subscriptions)
 
     p = sub.add_parser("digest", help="send the free tier's finds of the day")

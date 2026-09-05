@@ -1401,7 +1401,8 @@ def health_report(conn: sqlite3.Connection) -> str:
     # today counted as being inside the last day whatever its hour.
     a_day_ago = (datetime.now(UTC) - timedelta(days=1)).isoformat(timespec="seconds")
     day = conn.execute(
-        "SELECT COUNT(*) FROM alerts WHERE sent = 1 AND ts > ?", (a_day_ago,)
+        "SELECT COUNT(*) FROM alerts WHERE sent = 1 AND user_id != ? AND ts > ?",
+        (dbm.DIGEST_READER, a_day_ago),
     ).fetchone()[0]
     stale = conn.execute(
         """

@@ -63,12 +63,12 @@ def _message(text: str) -> dict:
     return {"message": {"chat": {"id": 42}, "from": {"id": 7, "username": "u"}, "text": text}}
 
 
-def _paid(plan: str = "month", stars: int = 150, **extra) -> dict:
+def _paid(plan: str = "month", stars: int = 150, charge: str = "chg_abc", **extra) -> dict:
     payment = {
         "currency": "XTR",
         "total_amount": stars,
         "invoice_payload": f"sub:{plan}",
-        "telegram_payment_charge_id": "chg_abc",
+        "telegram_payment_charge_id": charge,
     }
     payment.update(extra)
     return {"message": {
@@ -139,10 +139,33 @@ class TestPaying:
     async def test_a_renewal_adds_a_month_rather_than_resetting_one(self, robot, conn):
         await robot.handle(_paid())
         first = dbm.get_bot_user(conn, 7)["paid_until"]
-        await robot.handle(_paid(is_recurring=True))
+        # A real renewal is a new charge. Telegram gives it its own id.
+        await robot.handle(_paid(charge="chg_second", is_recurring=True))
         second = dbm.get_bot_user(conn, 7)["paid_until"]
         assert second > first
         assert dbm.get_bot_user(conn, 7)["stars_paid"] == 300
+
+    @pytest.mark.asyncio
+    async def test_the_same_charge_twice_is_one_month(self, robot, conn):
+        """A restart before the next getUpdates replays the payment."""
+        await robot.handle(_paid())
+        once = dbm.get_bot_user(conn, 7)["paid_until"]
+
+        await robot.handle(_paid())
+
+        row = dbm.get_bot_user(conn, 7)
+        assert row["paid_until"] == once
+        assert row["stars_paid"] == 150
+
+    @pytest.mark.asyncio
+    async def test_only_the_monthly_charge_is_the_one_cancel_stops(self, robot, conn):
+        await robot.handle(_paid("month", charge="chg_month"))
+        await robot.handle(_paid("year", stars=1500, charge="chg_year"))
+        row = dbm.get_bot_user(conn, 7)
+        # `charge_id` is the last payment, for refunds. `sub_charge_id` is the
+        # one that renews itself, which is what /cancel has to name.
+        assert row["charge_id"] == "chg_year"
+        assert row["sub_charge_id"] == "chg_month"
 
     @pytest.mark.asyncio
     async def test_a_payment_is_not_read_as_an_article_number(self, robot, calls):

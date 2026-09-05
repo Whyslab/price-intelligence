@@ -148,3 +148,60 @@ def test_the_migration_is_idempotent(conn):
     dbm.migrate(conn)
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(bot_users)")}
     assert {"plan", "paid_until", "plan_since", "stars_paid", "charge_id"} <= columns
+
+
+class TestATimestampWrittenByHand:
+    """`UPDATE ... paid_until = datetime('now','+30 days')` is the obvious thing
+    to type, and SQLite answers it with a space and no offset."""
+
+    @staticmethod
+    def _by_hand(conn, user_id: int, days: int) -> None:
+        conn.execute(
+            f"UPDATE bot_users SET plan='paid', "
+            f"paid_until = datetime('now','+{days} days') WHERE id = ?",
+            (user_id,),
+        )
+
+    def test_it_is_read_as_a_subscription(self, conn):
+        user = _reader(conn)
+        self._by_hand(conn, user, 30)
+        assert dbm.subscription_state(conn, user) == "paid"
+
+    def test_it_does_not_take_down_the_notification_pass(self, conn):
+        """One naive datetime raised against an aware one and killed the run."""
+        user = _reader(conn)
+        self._by_hand(conn, user, 30)
+        from pi import personal
+        from pi.config import Filters
+
+        readers = personal.subscribers(conn, "999", Filters())
+        assert user in [r.user_id for r in readers]
+
+    def test_it_is_not_expired_a_day_early(self, conn):
+        user = _reader(conn)
+        self._by_hand(conn, user, 30)
+        assert dbm.expire_due(conn) == 0
+        assert dbm.get_bot_user(conn, user)["plan"] == "paid"
+
+    def test_its_reminder_is_not_skipped(self, conn):
+        user = _reader(conn)
+        self._by_hand(conn, user, 2)
+        assert [r["id"] for r in dbm.expiring_soon(conn, within_days=3)] == [user]
+
+    def test_an_unreadable_date_is_free_rather_than_an_exception(self, conn):
+        user = _reader(conn)
+        conn.execute(
+            "UPDATE bot_users SET plan='paid', paid_until='soon' WHERE id = ?", (user,)
+        )
+        assert dbm.subscription_state(conn, user) == "free"
+        assert dbm.expire_due(conn) == 0
+        assert dbm.expiring_soon(conn) == []
+
+
+def test_granting_to_a_reader_who_is_not_there_is_loud(conn):
+    """The caller has already taken the money; an UPDATE matching nothing must
+    not be the last word on it."""
+    import pytest
+
+    with pytest.raises(LookupError):
+        dbm.grant(conn, 4242, days=30, stars=150)

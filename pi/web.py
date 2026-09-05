@@ -525,12 +525,31 @@ class Handler(BaseHTTPRequestHandler):
         reader = self._reader()
         if reader is None:
             return False
-        # Both flavours of owner. `owner_id` only exists on localhost, where the
-        # machine is asserting who it belongs to; `exempt_id` works anywhere
-        # because Telegram still has to sign the request naming that person.
-        if reader in {self.owner_id, self.exempt_id} - {None}:
+        # `exempt_id` is safe anywhere: Telegram had to sign the request naming
+        # that person for `_reader` to have returned it at all.
+        if self.exempt_id is not None and reader == self.exempt_id:
+            return True
+        # `owner_id` asserts an identity nobody proved, so it may only be
+        # believed when this process is talking to the person directly.
+        #
+        # Binding to 127.0.0.1 used to be that guarantee. It is not one any
+        # more: `scripts/tunnel.sh` points cloudflared at 127.0.0.1, so the
+        # whole internet arrives on the loopback address, every request is
+        # anonymous-therefore-owner, and the paywall is decoration. What a proxy
+        # cannot hide is that it is one — it says so in a header.
+        if self.owner_id is not None and reader == self.owner_id and self._direct():
             return True
         return dbm.is_subscribed(conn, reader)
+
+    # Headers a reverse proxy adds and a browser talking to us directly does
+    # not. cloudflared sends the first two.
+    _PROXY_HEADERS = ("X-Forwarded-For", "CF-Connecting-IP", "X-Real-IP", "Forwarded")
+
+    def _direct(self) -> bool:
+        """Whether this request reached us without passing through anything."""
+        if any(self.headers.get(name) for name in self._PROXY_HEADERS):
+            return False
+        return self.client_address[0] in ("127.0.0.1", "::1")
 
     def _body(self) -> dict:
         """The JSON a write sent, or {}."""
@@ -616,6 +635,15 @@ class Handler(BaseHTTPRequestHandler):
                     self._json({"error": "not signed in"}, 401)
                     return
                 with self._open() as conn:
+                    # Gated like the shelf, because it *is* the shelf. A starred
+                    # row carries the title, the shop, the live price and the
+                    # discount — the same fields the card draws. Left on the
+                    # identity check alone, a reader who never paid could star
+                    # product ids in a loop and read the whole priced catalogue
+                    # back through here, past four 402s.
+                    if not self._paying(conn):
+                        self._json(SUBSCRIPTION_REQUIRED, 402)
+                        return
                     items = dbm.favorites_for(conn, user_id)
                 self._json({"user": user_id, "items": [favorite_json(i) for i in items]})
                 return
@@ -647,6 +675,13 @@ class Handler(BaseHTTPRequestHandler):
             except (KeyError, TypeError, ValueError):
                 variant_id = None
             with self._open_rw() as conn:
+                # Starring is a subscriber feature: `pipeline` only sends
+                # followed-price alerts to `subscribers()`, so a free reader
+                # gets nothing from a star except a row they could read a price
+                # out of. Removing one stays open — see do_DELETE.
+                if not self._paying(conn):
+                    self._json(SUBSCRIPTION_REQUIRED, 402)
+                    return
                 exists = conn.execute(
                     "SELECT 1 FROM products WHERE id = ?", (product_id,)
                 ).fetchone()
@@ -677,6 +712,10 @@ class Handler(BaseHTTPRequestHandler):
             if product_id is None:
                 self._json({"error": "not a product id"}, 400)
                 return
+            # Deliberately not behind the paywall. Somebody whose subscription
+            # lapsed must still be able to take their own things off their own
+            # list, and un-starring reveals nothing: it reads no product row and
+            # answers with the id the caller already sent.
             with self._open_rw() as conn:
                 removed = dbm.remove_favorite(conn, user_id, product_id)
                 conn.commit()

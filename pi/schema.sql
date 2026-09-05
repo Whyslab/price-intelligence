@@ -206,9 +206,17 @@ CREATE TABLE IF NOT EXISTS bot_users (
     -- Stars received from this reader, ever. Cumulative on purpose: refunding
     -- the last month should not erase that the year before was paid for.
     stars_paid  INTEGER NOT NULL DEFAULT 0,
-    -- Telegram's id for the most recent charge. Required to refund it, and a
-    -- refund is the one thing that cannot be done from any other record.
-    charge_id   TEXT
+    -- Telegram's id for the most recent charge, whichever plan it was. Required
+    -- to refund it, and a refund is the one thing that cannot be done from any
+    -- other record.
+    charge_id   TEXT,
+    -- The charge that renews itself, which is not always the most recent one. A
+    -- monthly subscriber who then buys a year makes a second, one-off payment;
+    -- cancelling against that id asks Telegram to stop a subscription that the
+    -- id does not name, Telegram refuses, and the reader is told the bot cannot
+    -- help while the monthly charge keeps firing. Kept apart so /cancel always
+    -- names the thing that is actually recurring.
+    sub_charge_id TEXT
 );
 
 -- What one reader asked to be told about, whatever the thresholds say.

@@ -14,7 +14,7 @@ from .domains import load_excluded, same_host, same_shop
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 SCHEMA_SQL = Path(__file__).with_name("schema.sql")
 
 
@@ -412,6 +412,13 @@ def get_stores(
     return kept
 
 
+# The reader the free digest files its publications under. Defined here as well
+# as in pi.digest because the two counters below have to exclude it, and a
+# module that counts alerts importing the module that sends them would be a
+# cycle. See pi.digest.FREE_READER for what it means.
+DIGEST_READER = -1
+
+
 def productive_store_ids(conn: sqlite3.Connection, days: int) -> set[int]:
     """Stores that actually produced a notification in the last N days.
 
@@ -421,7 +428,10 @@ def productive_store_ids(conn: sqlite3.Connection, days: int) -> set[int]:
     hourly sweep would turn back into a six-hourly one for the shops that matter.
 
     Seeded rows are excluded — `sent = 0` marks a discount that was already
-    standing when collection began, which says nothing about the shop.
+    standing when collection began, which says nothing about the shop. So are
+    the free digest's, for exactly the same reason: being picked as one of two
+    advertisements says nothing about the shop either, and letting it count
+    would give sweep priority to whichever shops the digest happened to choose.
     """
     since = (datetime.now(UTC) - timedelta(days=days)).isoformat(timespec="seconds")
     rows = conn.execute(
@@ -429,9 +439,9 @@ def productive_store_ids(conn: sqlite3.Connection, days: int) -> set[int]:
         SELECT DISTINCT p.store_id
           FROM alerts a
           JOIN products p ON p.id = a.product_id
-         WHERE a.sent = 1 AND a.ts >= ?
+         WHERE a.sent = 1 AND a.user_id != ? AND a.ts >= ?
         """,
-        (since,),
+        (DIGEST_READER, since),
     )
     return {row["store_id"] for row in rows}
 
@@ -902,6 +912,48 @@ def upsert_bot_user(
 SUBSCRIPTION_GRACE_DAYS = 3
 
 
+def _moment(stamp: str) -> datetime:
+    """A stored timestamp as an aware datetime, whatever shape it was written in.
+
+    `grant` writes `2026-09-05T12:56:00+00:00`, and everything in this project
+    that writes a timestamp writes that. A human comping a subscriber does not:
+    `UPDATE bot_users SET paid_until = datetime('now','+30 days')` is the obvious
+    thing to type, and SQLite answers it with a space instead of the T and no
+    offset at all.
+
+    Both shapes have to be read, and neither may be compared as a string. ' '
+    sorts below 'T', so the two forms of the same instant do not compare equal
+    or even consistently — a hand-written row reads as earlier than an ISO one
+    and gets swept out of a subscription up to a day early. And a naive datetime
+    raises against an aware one, which took down the whole hourly notification
+    pass for every reader, from one row.
+    """
+    parsed = datetime.fromisoformat(stamp.strip().replace(" ", "T", 1))
+    # SQLite's datetime() is UTC. So is everything this project writes.
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def _paid_until(conn: sqlite3.Connection) -> list[tuple[int, datetime]]:
+    """Every reader with a paid-to date, parsed. The one place that reads them.
+
+    Readers are counted in the dozens, so filtering them in Python costs
+    nothing — and it buys the thing the SQL version could not have: exactly one
+    interpretation of a timestamp in the whole subscription module.
+    """
+    out = []
+    for row in conn.execute(
+        "SELECT id, paid_until FROM bot_users WHERE paid_until IS NOT NULL"
+    ):
+        try:
+            out.append((int(row["id"]), _moment(row["paid_until"])))
+        except ValueError:
+            log.warning(
+                "reader %s has an unreadable paid_until (%r) and is treated as "
+                "unsubscribed", row["id"], row["paid_until"],
+            )
+    return out
+
+
 def subscription_state(
     conn: sqlite3.Connection, user_id: int, now: str | None = None
 ) -> str:
@@ -921,8 +973,15 @@ def subscription_state(
     row = get_bot_user(conn, user_id)
     if row is None or row["paid_until"] is None:
         return "free"
-    moment = datetime.fromisoformat(now) if now else datetime.now(UTC)
-    until = datetime.fromisoformat(row["paid_until"])
+    moment = _moment(now) if now else datetime.now(UTC)
+    try:
+        until = _moment(row["paid_until"])
+    except ValueError:
+        log.warning(
+            "reader %s has an unreadable paid_until (%r) and is treated as "
+            "unsubscribed", user_id, row["paid_until"],
+        )
+        return "free"
     if moment <= until:
         return "paid"
     if moment <= until + timedelta(days=SUBSCRIPTION_GRACE_DAYS):
@@ -947,6 +1006,7 @@ def grant(
     days: int = 30,
     charge_id: str | None = None,
     stars: int = 0,
+    recurring: bool = False,
 ) -> sqlite3.Row:
     """Extend a subscription, returning the reader.
 
@@ -958,6 +1018,11 @@ def grant(
     `stars_paid` accumulates and `plan_since` is set once and never moved: a
     reader who leaves and comes back is not a new reader, and a refund of the
     last month should not erase that the year before was paid for.
+
+    `recurring` says this charge is the one that renews itself, and only such a
+    charge is remembered as `sub_charge_id`. A monthly subscriber who also buys
+    a year would otherwise leave /cancel holding a one-off id, which Telegram
+    refuses to cancel while the monthly charge goes on firing.
     """
     moment = datetime.now(UTC)
     row = get_bot_user(conn, user_id)
@@ -973,8 +1038,18 @@ def grant(
     }
     if charge_id:
         fields["charge_id"] = charge_id
+        if recurring:
+            fields["sub_charge_id"] = charge_id
     assigns = ", ".join(f"{key} = :{key}" for key in fields)
-    conn.execute(f"UPDATE bot_users SET {assigns} WHERE id = :id", {**fields, "id": user_id})
+    cursor = conn.execute(
+        f"UPDATE bot_users SET {assigns} WHERE id = :id", {**fields, "id": user_id}
+    )
+    if cursor.rowcount != 1:
+        # An UPDATE against a reader who is not there matches nothing and says
+        # nothing, and the caller has already taken the money. Everywhere this
+        # is reached the row was upserted first, so this cannot happen — which
+        # is exactly why it must be loud if it ever does.
+        raise LookupError(f"no reader {user_id} to grant a subscription to")
     return get_bot_user(conn, user_id)
 
 
@@ -986,11 +1061,15 @@ def expire_due(conn: sqlite3.Connection, now: str | None = None) -> int:
     their list, not an empty bot, and that is the cheapest subscriber there is
     to win back.
     """
-    moment = datetime.fromisoformat(now) if now else datetime.now(UTC)
-    cutoff = (moment - timedelta(days=SUBSCRIPTION_GRACE_DAYS)).isoformat(timespec="seconds")
+    moment = _moment(now) if now else datetime.now(UTC)
+    cutoff = moment - timedelta(days=SUBSCRIPTION_GRACE_DAYS)
+    due = [user_id for user_id, until in _paid_until(conn) if until < cutoff]
+    if not due:
+        return 0
+    marks = ",".join("?" * len(due))
     cursor = conn.execute(
-        "UPDATE bot_users SET plan = 'free' WHERE plan != 'free' AND paid_until < ?",
-        (cutoff,),
+        f"UPDATE bot_users SET plan = 'free' WHERE plan != 'free' AND id IN ({marks})",
+        due,
     )
     return cursor.rowcount
 
@@ -1003,19 +1082,24 @@ def expiring_soon(
     What the reminder is sent from. Readers already past their date are not
     here: they are in grace and have had the reminder already.
     """
-    moment = datetime.fromisoformat(now) if now else datetime.now(UTC)
-    return conn.execute(
-        """
-        SELECT * FROM bot_users
-        WHERE plan != 'free' AND active = 1
-          AND paid_until >= ? AND paid_until < ?
-        ORDER BY paid_until
-        """,
-        (
-            moment.isoformat(timespec="seconds"),
-            (moment + timedelta(days=within_days)).isoformat(timespec="seconds"),
-        ),
-    ).fetchall()
+    moment = _moment(now) if now else datetime.now(UTC)
+    horizon = moment + timedelta(days=within_days)
+    due = sorted(
+        (until, user_id)
+        for user_id, until in _paid_until(conn)
+        if moment <= until < horizon
+    )
+    if not due:
+        return []
+    ids = [user_id for _, user_id in due]
+    marks = ",".join("?" * len(ids))
+    rows = {
+        row["id"]: row
+        for row in conn.execute(
+            f"SELECT * FROM bot_users WHERE active = 1 AND id IN ({marks})", ids
+        )
+    }
+    return [rows[user_id] for user_id in ids if user_id in rows]
 
 
 def offers_for(

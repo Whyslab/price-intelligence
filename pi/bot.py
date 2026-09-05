@@ -750,12 +750,23 @@ class Bot:
         exactly where it is: they keep everything until the day they bought.
         """
         row = dbm.get_bot_user(self.conn, user["id"])
-        if not row["charge_id"] or dbm.subscription_state(self.conn, user["id"]) == "free":
-            await self.send(chat_id, "Отменять нечего — подписки сейчас нет.")
+        # The recurring charge, not the most recent one. A monthly subscriber
+        # who also bought a year has a one-off id in `charge_id`; asking
+        # Telegram to cancel that names nothing it can stop, so it refuses,
+        # the reader is told the bot cannot help, and the monthly charge goes
+        # on firing.
+        if not row["sub_charge_id"]:
+            await self.send(
+                chat_id,
+                "Отменять нечего: автопродления нет. Годовая подписка "
+                "не продлевается сама и просто закончится в свой срок."
+                if dbm.subscription_state(self.conn, user["id"]) != "free"
+                else "Отменять нечего — подписки сейчас нет.",
+            )
             return
         stopped = await self._call("editUserStarSubscription", {
             "user_id": user["id"],
-            "telegram_payment_charge_id": row["charge_id"],
+            "telegram_payment_charge_id": row["sub_charge_id"],
             "is_canceled": True,
         })
         if stopped is None:
@@ -793,17 +804,32 @@ class Bot:
         paid to, and that is what makes a renewal a renewal rather than a reset.
         """
         payment = message["successful_payment"]
+        charge_id = payment.get("telegram_payment_charge_id")
+        chat_id = str(message["chat"]["id"])
+
+        # Telegram redelivers an update until `getUpdates` is called again with
+        # the next offset, and that offset lives only in memory. So a restart
+        # between granting and the next poll — a deploy, an OOM, or
+        # scripts/tunnel.sh restarting this unit every time the tunnel comes up
+        # — replays the payment and buys the reader a second month for nothing.
+        # The charge id is Telegram's own, unique per payment and already
+        # stored; a renewal carries a new one, so this blocks only true replays.
+        if charge_id and user["charge_id"] == charge_id:
+            log.info("payment %s already granted, ignoring the replay", charge_id)
+            return
+
         plan = str(payment.get("invoice_payload", "")).removeprefix("sub:")
         days = PLAN_DAYS.get(plan, 30)
         row = dbm.grant(
             self.conn, user["id"], days=days,
-            charge_id=payment.get("telegram_payment_charge_id"),
+            charge_id=charge_id,
             stars=int(payment.get("total_amount") or 0),
+            recurring=(plan == "month"),
         )
         until = _date(row["paid_until"])
         renewal = payment.get("is_recurring") and not payment.get("is_first_recurring")
         await self.send(
-            str(message["chat"]["id"]),
+            chat_id,
             (f"✅ Подписка продлена до <b>{until}</b>." if renewal else
              f"✅ Готово. Подписка активна до <b>{until}</b>.\n\n"
              "Полка, поиск по артикулу и лента под ваш профиль открыты."),

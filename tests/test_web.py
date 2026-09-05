@@ -588,6 +588,8 @@ class TestStarringSomethingOverHttp:
 
     def test_telegram_says_who_it_is_and_the_star_is_saved(self, conn):
         product, variant = self._a_product(conn)
+        dbm.upsert_bot_user(conn, 7, "7")
+        dbm.grant(conn, 7, days=30)
         with self._serving(conn, bot_token=TOKEN) as base:
             code, body = self._call(
                 f"{base}/api/favorites", "POST",
@@ -632,8 +634,49 @@ class TestStarringSomethingOverHttp:
         assert (code, body["removed"]) == (200, True)
         assert dbm.favorite_ids(conn, 7) == set()
 
+    def test_starring_is_a_subscriber_feature(self, conn):
+        """A free reader gets nothing from a star, and could read prices out of it."""
+        product, variant = self._a_product(conn)
+        with self._serving(conn, bot_token=TOKEN) as base:
+            code, _ = self._call(
+                f"{base}/api/favorites", "POST",
+                {"product_id": product, "variant_id": variant},
+                {"X-Telegram-Init-Data": signed(user_id=7)},
+            )
+            listed, _ = self._call(
+                f"{base}/api/favorites", headers={"X-Telegram-Init-Data": signed(user_id=7)}
+            )
+
+        # Left on the identity check alone, this was the whole shelf: star ids
+        # in a loop, then read title, shop, live price and discount back out.
+        assert (code, listed) == (402, 402)
+        assert dbm.favorite_ids(conn, 7) == set()
+
+    def test_unstarring_stays_open_after_a_subscription_lapses(self, conn):
+        product, _ = self._a_product(conn)
+        dbm.upsert_bot_user(conn, 7, "7")
+        dbm.grant(conn, 7, days=30)
+        with self._serving(conn, bot_token=TOKEN) as base:
+            self._call(
+                f"{base}/api/favorites", "POST", {"product_id": product},
+                {"X-Telegram-Init-Data": signed(user_id=7)},
+            )
+            conn.execute("UPDATE bot_users SET paid_until = ? WHERE id = 7", (ts(90),))
+            code, _ = self._call(
+                f"{base}/api/favorites/{product}", "DELETE",
+                headers={"X-Telegram-Init-Data": signed(user_id=7)},
+            )
+
+        # Somebody must always be able to take their own things off their own
+        # list, and un-starring reveals nothing.
+        assert code == 200
+        assert dbm.favorite_ids(conn, 7) == set()
+
     def test_one_readers_star_is_invisible_to_another(self, conn):
         product, _ = self._a_product(conn)
+        for user_id in (7, 9):
+            dbm.upsert_bot_user(conn, user_id, str(user_id))
+            dbm.grant(conn, user_id, days=30)
         with self._serving(conn, bot_token=TOKEN) as base:
             self._call(
                 f"{base}/api/favorites", "POST", {"product_id": product},
@@ -740,3 +783,53 @@ class TestStarringSomethingOverHttp:
         item = listed["items"][0]
         assert set(item) >= {"id", "title", "url", "image", "shop", "price", "since"}
         assert item["price"] == 180.0
+
+
+class TestTheOwnerFlagBehindAProxy:
+    """`--owner` says "whoever reaches me is that person". A tunnel makes that
+    false while every other signal still says localhost."""
+
+    # The server harness lives on the class above; borrowed rather than copied.
+    _serving = staticmethod(TestStarringSomethingOverHttp._serving)
+    _call = staticmethod(TestStarringSomethingOverHttp._call)
+
+    def test_a_direct_request_is_believed(self, conn):
+        a_shelf(conn, 2)
+        with self._serving(conn, owner_id=7) as base:
+            code, body = self._call(f"{base}/api/offers")
+
+        assert (code, body["total"]) == (200, 2)
+
+    def test_a_proxied_request_is_not(self, conn):
+        a_shelf(conn, 2)
+        with self._serving(conn, owner_id=7) as base:
+            code, _ = self._call(
+                f"{base}/api/offers", headers={"X-Forwarded-For": "203.0.113.9"}
+            )
+
+        # cloudflared points at 127.0.0.1, so the peer address says localhost
+        # for the whole internet. What a proxy cannot hide is being one.
+        assert code == 402
+
+    def test_cloudflares_own_header_counts_too(self, conn):
+        a_shelf(conn, 1)
+        with self._serving(conn, owner_id=7) as base:
+            code, _ = self._call(
+                f"{base}/api/offers", headers={"CF-Connecting-IP": "203.0.113.9"}
+            )
+
+        assert code == 402
+
+    def test_a_signed_exempt_reader_is_believed_through_a_proxy(self, conn):
+        """Unlike --owner, this identity was proved, so a proxy changes nothing."""
+        a_shelf(conn, 1)
+        with self._serving(conn, bot_token=TOKEN, exempt_id=7) as base:
+            code, body = self._call(
+                f"{base}/api/offers",
+                headers={
+                    "X-Telegram-Init-Data": signed(user_id=7),
+                    "X-Forwarded-For": "203.0.113.9",
+                },
+            )
+
+        assert (code, body["total"]) == (200, 1)

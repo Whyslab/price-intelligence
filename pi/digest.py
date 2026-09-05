@@ -36,7 +36,7 @@ log = logging.getLogger(__name__)
 # "everybody" on this column, and rows carrying it suppress a find for every
 # reader there is. The digest must be able to show a paying reader's find to a
 # free one, and must not close anything for anybody but itself.
-FREE_READER = -1
+FREE_READER = dbm.DIGEST_READER
 
 # How deep to look before choosing. Enough that the shop-and-brand rule has room
 # to skip past a single sale filling the top of the shelf, small enough that the
