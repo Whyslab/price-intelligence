@@ -284,3 +284,32 @@ def _a_product(conn, with_variant: bool = False):
     if not with_variant:
         return product
     return product, dbm.upsert_variant(conn, product, "v1", sku="SKU1", size="US10")
+
+
+class TestTheDailySummary:
+    def test_the_summary_counts_who_pays(self, conn):
+        from pi import pipeline
+
+        for user_id in (1, 2, 3):
+            dbm.upsert_bot_user(conn, user_id, str(user_id))
+        dbm.grant(conn, 2, days=30, stars=150)
+        dbm.grant(conn, 3, days=30, stars=150)
+        conn.execute("UPDATE bot_users SET paid_until = ? WHERE id = 3", (ts(1),))
+
+        report = pipeline.health_report(conn)
+
+        assert "Читателей: 3" in report
+        assert "платят 1" in report
+        assert "в отсрочке 1" in report
+        assert "Получено звёзд всего: 300" in report
+
+    def test_a_lapsed_plan_column_does_not_inflate_the_count(self, conn):
+        from pi import pipeline
+
+        dbm.upsert_bot_user(conn, 1, "1")
+        dbm.grant(conn, 1, days=30, stars=150)
+        # `pi subscriptions` corrects `plan` once a day, so between runs the
+        # column says "paid" for somebody who is not. The summary must not.
+        conn.execute("UPDATE bot_users SET paid_until = ? WHERE id = 1", (ts(90),))
+
+        assert "платят 0" in pipeline.health_report(conn)

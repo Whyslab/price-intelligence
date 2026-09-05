@@ -1355,6 +1355,31 @@ def degradation_notice(conn: sqlite3.Connection) -> str | None:
     return "\n".join(lines)
 
 
+def _readers_line(conn: sqlite3.Connection) -> str:
+    """Readers and money, on one line of the daily summary.
+
+    Counted with the same three-state arithmetic the rest of the project uses
+    rather than off `plan`, because a plan with a date in the past is not a
+    subscription — and `pi subscriptions` only corrects the column once a day,
+    so reading it directly would over-report every morning.
+    """
+    rows = conn.execute("SELECT id FROM bot_users WHERE active = 1").fetchall()
+    states = [dbm.subscription_state(conn, row["id"]) for row in rows]
+    paying = states.count("paid")
+    grace = states.count("grace")
+    soon = len(dbm.expiring_soon(conn, within_days=7))
+    stars = conn.execute(
+        "SELECT COALESCE(SUM(stars_paid), 0) FROM bot_users"
+    ).fetchone()[0]
+    line = (
+        f"👥 Читателей: {len(rows)} · платят {paying}"
+        f" · истекает за неделю {soon}"
+    )
+    if grace:
+        line += f" · в отсрочке {grace}"
+    return line + f"\n⭐ Получено звёзд всего: {stars:,}".replace(",", " ")
+
+
 def health_report(conn: sqlite3.Connection) -> str:
     """A short HTML summary of how collection is going."""
     counts = dict(
@@ -1417,6 +1442,8 @@ def health_report(conn: sqlite3.Connection) -> str:
             lines.append("ℹ️ Уведомлений было больше лимита; следующий обход пришлёт остальные.")
     lines += [
         f"Уведомлений за сутки: {day}",
+        "",
+        _readers_line(conn),
         "",
         f"Shopify не обновлялись сутки: {stale} из {shopify_total}",
         f"В базе: {products:,} товаров, {points:,} точек истории",
