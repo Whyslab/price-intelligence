@@ -338,8 +338,24 @@ class TestTheDailySummary:
         assert "платят 0" in pipeline.health_report(conn)
 
 
+def _dm(text: str) -> dict:
+    """A real private chat: Telegram gives it the same id as the person."""
+    return {"message": {"chat": {"id": 7}, "from": {"id": 7, "username": "u"}, "text": text}}
+
+
+def _dm_press(data: str) -> dict:
+    return {"callback_query": {
+        "id": "1", "data": data, "from": {"id": 7, "username": "u"},
+        "message": {"chat": {"id": 7}, "message_id": 5},
+    }}
+
+
+def _group(text: str, chat: int = -1001999888777) -> dict:
+    return {"message": {"chat": {"id": chat}, "from": {"id": 7, "username": "u"}, "text": text}}
+
+
 class TestTheOwnersPanel:
-    """`/admin` opens for one person, and for nobody else says it exists."""
+    """`/admin` opens for one person, in one chat, and elsewhere says nothing."""
 
     @pytest.fixture
     def owner(self, conn, tmp_path, calls, monkeypatch):
@@ -367,7 +383,7 @@ class TestTheOwnersPanel:
         dbm.upsert_bot_user(conn, 8, "8")
         dbm.grant(conn, 8, days=30)
 
-        await owner.handle(_message("/admin"))
+        await owner.handle(_dm("/admin"))
 
         text, keyboard = calls[0][1]["text"], calls[0][1]["reply_markup"]
         assert "Админ-панель" in text
@@ -377,10 +393,10 @@ class TestTheOwnersPanel:
 
     @pytest.mark.asyncio
     async def test_granting_access_from_the_panel(self, owner, calls, conn):
-        await owner.handle(_press("adm:grant"))
+        await owner.handle(_dm_press("adm:grant"))
         calls.clear()
 
-        await owner.handle(_message("999"))
+        await owner.handle(_dm("999"))
 
         assert dbm.is_subscribed(conn, 999) is True
         # Told the owner, and told the new reader.
@@ -389,8 +405,8 @@ class TestTheOwnersPanel:
 
     @pytest.mark.asyncio
     async def test_a_grant_can_be_given_a_number_of_days(self, owner, conn):
-        await owner.handle(_press("adm:grant"))
-        await owner.handle(_message("999 45"))
+        await owner.handle(_dm_press("adm:grant"))
+        await owner.handle(_dm("999 45"))
 
         from datetime import UTC, datetime, timedelta
         left = datetime.fromisoformat(
@@ -401,8 +417,8 @@ class TestTheOwnersPanel:
     @pytest.mark.asyncio
     async def test_granting_to_somebody_who_never_wrote_still_works(self, owner, conn):
         """The subscription waits for them; grant() alone would have raised."""
-        await owner.handle(_press("adm:grant"))
-        await owner.handle(_message("31337"))
+        await owner.handle(_dm_press("adm:grant"))
+        await owner.handle(_dm("31337"))
 
         row = dbm.get_bot_user(conn, 31337)
         assert row is not None and row["chat_id"] == "31337"
@@ -413,8 +429,8 @@ class TestTheOwnersPanel:
         dbm.upsert_bot_user(conn, 999, "999", sizes="EU44")
         dbm.grant(conn, 999, days=30, stars=150)
 
-        await owner.handle(_press("adm:revoke"))
-        await owner.handle(_message("999"))
+        await owner.handle(_dm_press("adm:revoke"))
+        await owner.handle(_dm("999"))
 
         row = dbm.get_bot_user(conn, 999)
         assert dbm.is_subscribed(conn, 999) is False
@@ -430,12 +446,190 @@ class TestTheOwnersPanel:
 
     @pytest.mark.asyncio
     async def test_nonsense_instead_of_an_id_is_refused(self, owner, calls, conn):
-        await owner.handle(_press("adm:grant"))
+        await owner.handle(_dm_press("adm:grant"))
         calls.clear()
 
-        await owner.handle(_message("вася"))
+        await owner.handle(_dm("вася"))
 
         assert "не похоже на id" in calls[0][1]["text"]
         assert dbm.readers(conn) == [] or all(
             r["id"] == 7 for r in dbm.readers(conn)
         )
+
+
+class TestForgedButtonPayloads:
+    """`callback_data` looks like the bot's own payload and is not.
+
+    It is a client-supplied field: any MTProto client can send arbitrary bytes
+    for any message carrying an inline keyboard, and /start hands one to
+    everybody.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_forged_field_cannot_buy_a_subscription(self, robot, conn):
+        await robot.handle(_press("set:paid_until:2099-01-01T00:00:00+00:00"))
+
+        # This alone was the whole paywall — no admin path, no owner, one button.
+        assert dbm.is_subscribed(conn, 7) is False
+        assert dbm.get_bot_user(conn, 7)["paid_until"] is None
+
+    @pytest.mark.asyncio
+    async def test_a_forged_field_cannot_reach_the_admin_step(self, robot, conn):
+        await robot.handle(_press("set:wizard_step:admin_grant"))
+
+        assert dbm.get_bot_user(conn, 7)["wizard_step"] is None
+
+    @pytest.mark.asyncio
+    async def test_the_real_buttons_still_work(self, robot, conn):
+        await robot.handle(_press("set:genders:women"))
+
+        assert dbm.get_bot_user(conn, 7)["genders"] == "women"
+
+    @pytest.mark.asyncio
+    async def test_save_refuses_a_column_the_bot_never_writes(self, robot):
+        with pytest.raises(ValueError, match="refusing to write"):
+            robot._save(7, stars_paid=999999)
+
+
+class TestTheAdminStepIsNotJustAColumn:
+    """Even with the step set, being the owner is asked again."""
+
+    @pytest.mark.asyncio
+    async def test_a_stranger_holding_the_step_grants_nothing(self, robot, conn):
+        dbm.upsert_bot_user(conn, 7, "7")
+        # Set the way the forged callback used to set it, bypassing the panel.
+        conn.execute("UPDATE bot_users SET wizard_step = 'admin_grant' WHERE id = 7")
+
+        await robot.handle(_message("7"))
+
+        assert dbm.is_subscribed(conn, 7) is False
+        assert dbm.get_bot_user(conn, 7)["wizard_step"] is None
+
+    @pytest.mark.asyncio
+    async def test_a_stranger_holding_the_step_revokes_nobody(self, robot, conn):
+        dbm.upsert_bot_user(conn, 7, "7")
+        dbm.upsert_bot_user(conn, 8, "8")
+        dbm.grant(conn, 8, days=30)
+        conn.execute("UPDATE bot_users SET wizard_step = 'admin_revoke' WHERE id = 7")
+
+        await robot.handle(_message("8"))
+
+        assert dbm.is_subscribed(conn, 8) is True
+
+
+class TestTheOwnerInAGroup:
+    @pytest.fixture
+    def owner(self, conn, tmp_path, calls, monkeypatch):
+        from dataclasses import replace
+
+        instance = bot.Bot(replace(_config(tmp_path), chat_id="7"), conn)
+
+        async def record(method, payload):
+            calls.append((method, payload))
+            return {"username": "test"}
+
+        monkeypatch.setattr(instance, "_call", record)
+        return instance
+
+    @pytest.mark.asyncio
+    async def test_the_panel_is_not_published_to_a_group(self, owner, calls, conn):
+        dbm.upsert_bot_user(conn, 8, "8")
+        dbm.grant(conn, 8, days=30)
+
+        await owner.handle(_group("/admin"))
+
+        text = calls[0][1]["text"]
+        # The panel lists every reader's id, username, paid-to date and stars.
+        assert "только в личном чате" in text
+        assert "Читателей" not in text
+
+    @pytest.mark.asyncio
+    async def test_speaking_in_a_group_does_not_move_the_owners_feed(
+        self, owner, conn
+    ):
+        await owner.handle(_dm("/start"))
+        assert dbm.get_bot_user(conn, 7)["chat_id"] == "7"
+
+        await owner.handle(_group("/start"))
+
+        # It used to become the group's, and the hourly feed went there with it.
+        assert dbm.get_bot_user(conn, 7)["chat_id"] == "7"
+
+
+class TestGivingAccessToSomethingThatIsNotAPerson:
+    def test_a_channel_id_is_refused(self, conn):
+        with pytest.raises(ValueError, match="not a reader"):
+            dbm.comp(conn, -1001234567890)
+
+    @pytest.mark.asyncio
+    async def test_the_panel_refuses_it_too(self, owner, calls, conn):
+        await owner.handle(_dm_press("adm:grant"))
+        calls.clear()
+
+        await owner.handle(_dm("-1001234567890"))
+
+        assert "отрицательные id" in calls[0][1]["text"]
+        assert dbm.get_bot_user(conn, -1001234567890) is None
+
+    @pytest.fixture
+    def owner(self, conn, tmp_path, calls, monkeypatch):
+        from dataclasses import replace
+
+        instance = bot.Bot(replace(_config(tmp_path), chat_id="7"), conn)
+
+        async def record(method, payload):
+            calls.append((method, payload))
+            return {"username": "test"}
+
+        monkeypatch.setattr(instance, "_call", record)
+        return instance
+
+
+class TestTakingAccessFromSomebodyWhoIsStillBeingCharged:
+    def test_revoke_refuses_while_the_charge_is_live(self, conn):
+        dbm.upsert_bot_user(conn, 8, "8")
+        dbm.grant(conn, 8, days=30, charge_id="ch1", stars=150, recurring=True)
+
+        with pytest.raises(dbm.StillRecurring):
+            dbm.revoke(conn, 8)
+
+        # Otherwise it only appears to work: the next charge fires, on_paid
+        # grants a month, and they have access again while still paying.
+        assert dbm.is_subscribed(conn, 8) is True
+
+    def test_a_comped_reader_is_revoked_normally(self, conn):
+        dbm.comp(conn, 8, days=30)
+
+        assert dbm.revoke(conn, 8) is True
+        assert dbm.is_subscribed(conn, 8) is False
+
+    def test_cancelling_first_makes_revoke_work(self, conn):
+        dbm.upsert_bot_user(conn, 8, "8")
+        dbm.grant(conn, 8, days=30, charge_id="ch1", recurring=True)
+        conn.execute("UPDATE bot_users SET sub_charge_id = NULL WHERE id = 8")
+
+        assert dbm.revoke(conn, 8) is True
+
+
+class TestCompsAreNotCustomers:
+    def test_the_summary_counts_them_apart(self, conn):
+        from pi import pipeline
+
+        dbm.upsert_bot_user(conn, 1, "1")
+        dbm.grant(conn, 1, days=30, stars=150)
+        dbm.comp(conn, 2)
+        dbm.comp(conn, 3)
+
+        report = pipeline.health_report(conn)
+
+        # The number this line exists to give is "how many customers".
+        assert "платят 1" in report
+        assert "подарено 2" in report
+
+    def test_a_comp_is_not_shown_as_a_date_in_2076(self, conn):
+        dbm.comp(conn, 2)
+
+        listed = bot.format_readers(conn, dbm.readers(conn))
+
+        assert "бессрочно" in listed
+        assert "2076" not in listed

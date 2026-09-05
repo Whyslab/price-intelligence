@@ -550,13 +550,28 @@ def cmd_grant(args, config: Config) -> int:
     """
     conn = dbm.connect(config.db_path)
     if args.revoke:
-        if dbm.revoke(conn, args.user_id):
+        try:
+            taken = dbm.revoke(conn, args.user_id, force=args.force)
+        except dbm.StillRecurring:
+            print(
+                f"у {args.user_id} активное автопродление: доступ вернётся при "
+                f"следующем списании.\n"
+                f"  вернуть деньги: pi subscriptions --refund {args.user_id}\n"
+                f"  забрать всё равно: pi grant {args.user_id} --revoke --force",
+                file=sys.stderr,
+            )
+            return 1
+        if taken:
             print(f"доступ у {args.user_id} забран")
             return 0
         print(f"читателя {args.user_id} нет в базе", file=sys.stderr)
         return 1
 
-    row = dbm.comp(conn, args.user_id, days=args.days)
+    try:
+        row = dbm.comp(conn, args.user_id, days=args.days)
+    except ValueError as exc:
+        print(exc, file=sys.stderr)
+        return 1
     when = "без ограничения по времени" if args.days >= dbm.COMP_DAYS else (
         f"до {row['paid_until'][:10]}"
     )
@@ -776,6 +791,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--days", type=int, default=dbm.COMP_DAYS,
                    help="how long for (default: no time limit)")
     p.add_argument("--revoke", action="store_true", help="take it away instead")
+    p.add_argument("--force", action="store_true",
+                   help="with --revoke: take access even from a live recurring "
+                        "subscription (it will come back on the next charge)")
     p.set_defaults(func=cmd_grant)
 
     p = sub.add_parser(

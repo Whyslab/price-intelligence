@@ -1113,18 +1113,64 @@ def comp(
     No stars are recorded: nothing was paid, and the revenue line must not say
     otherwise.
     """
+    if user_id <= 0:
+        # Telegram gives groups and channels negative ids. Comping one makes it
+        # a subscriber with an empty profile — which means no filtering — and
+        # the next run publishes the whole discount feed into it. Refused here
+        # rather than only in the caller, because there are two callers.
+        raise ValueError(f"{user_id} is not a reader — group and channel ids are negative")
     if get_bot_user(conn, user_id) is None:
         upsert_bot_user(conn, user_id, chat_id=str(user_id))
     return grant(conn, user_id, days=days)
 
 
-def revoke(conn: sqlite3.Connection, user_id: int) -> bool:
+class StillRecurring(Exception):
+    """Raised when taking access away would not take it away."""
+
+
+def is_comped(row: sqlite3.Row | None) -> bool:
+    """Whether this access was given rather than bought.
+
+    A comp is a date beyond any plan anyone can buy, which is what `COMP_DAYS`
+    makes it. Deliberately not a second column or a flag: the whole subscription
+    module answers one question — until when? — and a second way of saying yes
+    would have to be taught to `subscription_state`, `expire_due`,
+    `expiring_soon`, the reminder and the summary, and the one that got
+    forgotten would be the bug.
+
+    This is for reporting only. Nothing about access depends on it — a comped
+    reader is a subscriber in every code path that matters.
+    """
+    if row is None or not row["paid_until"]:
+        return False
+    try:
+        until = _moment(row["paid_until"])
+    except ValueError:
+        return False
+    # Anything past the longest thing that can be sold, plus a wide margin, was
+    # given. The yearly plan is 365 days; five years is nobody's purchase.
+    return until > datetime.now(UTC) + timedelta(days=365 * 5)
+
+
+def revoke(conn: sqlite3.Connection, user_id: int, force: bool = False) -> bool:
     """Take access away now, keeping the profile and the starred things.
 
     Does not touch `stars_paid` or `charge_id`: this is not a refund, and
     somebody comped by mistake never paid anything to give back. A reader whose
     money must go back is `pi subscriptions --refund`.
+
+    Refuses outright while a recurring charge is live, because otherwise this
+    only appears to work: Telegram was never told to stop, so the next month's
+    charge fires, `on_paid` grants a fresh month, and the reader has access
+    again — silently, and still paying for it. Revoking worked permanently on
+    comped readers and temporarily on exactly the ones it mattered for.
     """
+    row = get_bot_user(conn, user_id)
+    if row is not None and row["sub_charge_id"] and not force:
+        raise StillRecurring(
+            f"reader {user_id} has a live recurring subscription; "
+            "refund it instead, or pass force to take access anyway"
+        )
     cursor = conn.execute(
         "UPDATE bot_users SET plan = 'free', paid_until = NULL WHERE id = ?",
         (user_id,),

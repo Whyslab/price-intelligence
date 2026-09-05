@@ -320,12 +320,15 @@ def admin_panel(conn: sqlite3.Connection, web_url: str | None) -> str:
     """The panel's own text: who is here, and what the shelf is reachable at."""
     people = dbm.readers(conn)
     states = [dbm.subscription_state(conn, row["id"]) for row in people]
+    comped = sum(1 for row in people if dbm.is_comped(row))
+    paying = states.count("paid") - comped
     lines = [
         "🛠 <b>Админ-панель</b>",
         "",
         f"Читателей: <b>{len(people)}</b>"
-        f" · платят {states.count('paid')}"
-        f" · в отсрочке {states.count('grace')}"
+        f" · платят {paying}"
+        + (f" · подарено {comped}" if comped else "")
+        + f" · в отсрочке {states.count('grace')}"
         f" · бесплатных {states.count('free')}",
     ]
     if web_url:
@@ -346,9 +349,13 @@ def format_readers(conn: sqlite3.Connection, rows: list[sqlite3.Row]) -> str:
     lines = ["👥 <b>Читатели</b>", ""]
     for row in rows[-40:]:
         state = dbm.subscription_state(conn, row["id"])
+        comped = dbm.is_comped(row)
         who = escape(row["username"] or str(row["id"]))
-        line = f"{mark[state]} <code>{row['id']}</code> {who}"
-        if state != "free":
+        line = f"{'🎁' if comped else mark[state]} <code>{row['id']}</code> {who}"
+        if comped:
+            # A date in 2076 reads as a bug to a human, and it is not one.
+            line += " — доступ выдан, бессрочно"
+        elif state != "free":
             line += f" — до {_date(row['paid_until'])}"
         if row["stars_paid"]:
             line += f" · {row['stars_paid']} ⭐"
@@ -608,14 +615,52 @@ class Bot:
 
     # -- state --
 
+    @staticmethod
+    def _is_private(sender: dict, chat_id: str) -> bool:
+        """Whether this is a one-to-one chat. Telegram gives a person's private
+        chat the same id as the person."""
+        return str(chat_id) == str(sender.get("id"))
+
     def _user(self, sender: dict, chat_id: str) -> sqlite3.Row:
+        """The reader behind this update, with their feed still pointed at them.
+
+        The stored chat id is only ever their private one. It used to be
+        whatever chat they last spoke in, so the owner saying anything in a
+        group moved their own hourly notifications into that group until they
+        next wrote to the bot directly — and a group is exactly where somebody
+        would type /admin without thinking.
+        """
+        private = self._is_private(sender, chat_id)
         return dbm.upsert_bot_user(
-            self.conn, sender["id"], chat_id, sender.get("username")
+            self.conn,
+            sender["id"],
+            str(chat_id) if private else str(sender["id"]),
+            sender.get("username"),
         )
 
     PROFILE_FIELDS = ("genders", "kinds", "sizes", "brands")
+    # Every column this bot is allowed to write, and nothing else.
+    #
+    # `_save` used to forward whatever it was handed straight into an UPDATE
+    # built from the caller's own keys, and one caller was the `set:` button,
+    # whose field name arrives off the wire. `callback_data` looks like the
+    # bot's own payload and is not: it is a client-supplied field, and any
+    # MTProto client can send arbitrary bytes for any message carrying an inline
+    # keyboard — which /start hands to everybody. So `set:paid_until:2099-01-01`
+    # was a free subscription, and `set:wizard_step:admin_grant` was the admin
+    # panel. Neither needed the panel to exist; the second only needed it to be
+    # worth reaching.
+    WRITABLE: ClassVar[frozenset[str]] = frozenset(
+        {"genders", "kinds", "sizes", "brands", "wizard_step", "onboarded",
+         "active", "sub_charge_id"}
+    )
 
     def _save(self, user_id: int, **fields) -> sqlite3.Row:
+        unknown = set(fields) - self.WRITABLE
+        if unknown:
+            # Loud, and before the write. A column name this bot never writes
+            # arriving here means somebody sent it, not that somebody typo'd.
+            raise ValueError(f"refusing to write {sorted(unknown)} on bot_users")
         row = dbm.get_bot_user(self.conn, user_id)
         # Saying what you want *is* being set up. Keeping a separate "finished
         # the wizard" flag meant answering a question in /settings changed
@@ -751,6 +796,16 @@ class Bot:
 
     # -- the owner's panel --
 
+    def _may_admin(self, user: sqlite3.Row, chat_id: str) -> bool:
+        """Both halves: the right person, and a chat only they can read.
+
+        `is_owner` authenticates the sender; the reply goes to the chat. In a
+        direct message those are the same and in a group they are not — the
+        panel lists every reader's id, username, paid-to date and stars, and
+        answering it into a group publishes all of that to everybody in it.
+        """
+        return self.is_owner(user) and self._is_private({"id": user["id"]}, chat_id)
+
     def is_owner(self, user: sqlite3.Row) -> bool:
         """Whether this is the person who runs the collector.
 
@@ -763,7 +818,10 @@ class Bot:
         return bool(self.config.chat_id) and str(user["id"]) == str(self.config.chat_id)
 
     async def show_admin(self, chat_id: str, user: sqlite3.Row) -> None:
-        if not self.is_owner(user):
+        if self.is_owner(user) and not self._may_admin(user, chat_id):
+            await self.send(chat_id, "Панель открывается только в личном чате.")
+            return
+        if not self._may_admin(user, chat_id):
             # Not "you may not": nothing says the command exists. Somebody
             # guessing at /admin learns only that the bot did not understand.
             await self.send(chat_id, "Не понял. Пришлите артикул или название.")
@@ -773,7 +831,7 @@ class Bot:
         )
 
     async def admin_action(self, chat_id: str, user: sqlite3.Row, action: str) -> None:
-        if not self.is_owner(user):
+        if not self._may_admin(user, chat_id):
             return
         if action == "readers":
             await self.send(
@@ -815,16 +873,48 @@ class Bot:
             )
 
     async def admin_input(self, chat_id: str, user: sqlite3.Row, step: str, text: str):
-        """The id typed after "grant" or "revoke" was pressed."""
+        """The id typed after "grant" or "revoke" was pressed.
+
+        Asks who this is, rather than trusting that only `admin_action` could
+        have set the step. It could not, once `set:` was found to write any
+        column: `set:wizard_step:admin_grant` put a stranger one message away
+        from comping themselves. The column is fixed, and this check is what
+        makes that fix not the only thing holding.
+        """
+        if not self._may_admin(user, chat_id):
+            self._save(user["id"], wizard_step=None)
+            return
         self._save(user["id"], wizard_step=None)
         parts = text.split()
-        if not parts or not parts[0].lstrip("-").isdigit():
-            await self.send(chat_id, "Это не похоже на id. Отменил.", admin_keyboard())
+        if not parts or not parts[0].isdigit():
+            # Positive only. A negative id is a group or a channel, and comping
+            # one makes it a subscriber with an empty profile — which means no
+            # filtering — so the next run publishes the entire discount feed
+            # into it. One typo does that.
+            await self.send(
+                chat_id,
+                "Это не похоже на id читателя. Нужно число без минуса — "
+                "отрицательные id принадлежат группам и каналам.",
+                admin_keyboard(),
+            )
             return
         target = int(parts[0])
 
         if step == "admin_revoke":
-            if dbm.revoke(self.conn, target):
+            recurring = dbm.get_bot_user(self.conn, target)
+            if recurring is not None and recurring["sub_charge_id"]:
+                # Access would come back on its own: Telegram was never told to
+                # stop, so the next charge fires and `on_paid` grants a month.
+                await self.send(
+                    chat_id,
+                    f"У <code>{target}</code> активное автопродление. "
+                    "Забрать доступ отсюда нельзя — он вернётся при следующем "
+                    "списании.\n\nНужен возврат: "
+                    "<code>pi subscriptions --refund " + str(target) + "</code>",
+                    admin_keyboard(),
+                )
+                return
+            if dbm.revoke(self.conn, target, force=True):
                 await self.send(
                     chat_id, f"Доступ у <code>{target}</code> забран.", admin_keyboard()
                 )
@@ -848,7 +938,10 @@ class Bot:
               "заработает, как только он нажмёт /start.",
             admin_keyboard(),
         )
-        # Tell them, but only if the bot is allowed to write to them first.
+        # Tell them. This fails harmlessly for somebody who has never written to
+        # the bot — Telegram refuses to open a chat a bot started — and `_call`
+        # logs that and moves on. The message above already said their access is
+        # waiting either way.
         await self.send(
             str(target),
             "💎 Вам открыт полный доступ: вся полка, поиск по артикулу и лента "
@@ -1190,6 +1283,11 @@ class Bot:
             await self.next_step(chat_id, user, data[5:])
         elif data.startswith("set:"):
             _, field, value = data.split(":", 2)
+            if field not in self.PROFILE_FIELDS:
+                # The button only ever carries one of four names. Anything else
+                # was composed by hand.
+                log.warning("ignoring set:%s — not a profile field", field)
+                return
             user = self._save(user["id"], **{field: value or None})
             await self.next_step(chat_id, user, field)
             if not user["wizard_step"]:
@@ -1246,5 +1344,16 @@ async def serve(config: Config, conn: sqlite3.Connection) -> int:
     if not config.bot_token:
         log.error("TELEGRAM_BOT_TOKEN is not set")
         return 1
+    if not (config.chat_id or "").isdigit():
+        # Said once, at startup, rather than discovered by an owner whose own
+        # /admin answers "не понял" forever. A negative chat id is a group or a
+        # channel — a perfectly ordinary thing to point the feed at — and it can
+        # never equal the user id the panel authenticates against.
+        log.warning(
+            "TELEGRAM_CHAT_ID is %r, which is not a personal user id: /admin "
+            "will not open for anybody. Set it to your own Telegram user id "
+            "(@userinfobot) to use the owner's panel.",
+            config.chat_id,
+        )
     await Bot(config, conn).poll()
     return 0

@@ -1363,9 +1363,13 @@ def _readers_line(conn: sqlite3.Connection) -> str:
     subscription — and `pi subscriptions` only corrects the column once a day,
     so reading it directly would over-report every morning.
     """
-    rows = conn.execute("SELECT id FROM bot_users WHERE active = 1").fetchall()
+    rows = conn.execute("SELECT * FROM bot_users WHERE active = 1").fetchall()
     states = [dbm.subscription_state(conn, row["id"]) for row in rows]
-    paying = states.count("paid")
+    # Comps are separated out, or the one number this summary exists to give —
+    # how many customers there are — stops meaning that the first time a friend
+    # is given access.
+    comped = sum(1 for row in rows if dbm.is_comped(row))
+    paying = states.count("paid") - comped
     grace = states.count("grace")
     soon = len(dbm.expiring_soon(conn, within_days=7))
     stars = conn.execute(
@@ -1373,7 +1377,8 @@ def _readers_line(conn: sqlite3.Connection) -> str:
     ).fetchone()[0]
     line = (
         f"👥 Читателей: {len(rows)} · платят {paying}"
-        f" · истекает за неделю {soon}"
+        + (f" · подарено {comped}" if comped else "")
+        + f" · истекает за неделю {soon}"
     )
     if grace:
         line += f" · в отсрочке {grace}"
