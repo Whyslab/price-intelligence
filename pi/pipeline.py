@@ -1352,8 +1352,15 @@ def health_report(conn: sqlite3.Connection) -> str:
     counts = dict(
         conn.execute("SELECT platform, COUNT(*) FROM stores GROUP BY platform").fetchall()
     )
+    # The last run that actually collected something. A `pi verify` run reads no
+    # catalogue at all, so reporting it here would announce "0 stores ok, 0
+    # products" — which is exactly what a total collapse looks like.
     last = conn.execute(
-        "SELECT * FROM runs WHERE finished_at IS NOT NULL ORDER BY id DESC LIMIT 1"
+        """
+        SELECT * FROM runs
+         WHERE finished_at IS NOT NULL AND scope IN ('sweep', 'stores')
+         ORDER BY id DESC LIMIT 1
+        """
     ).fetchone()
     # Compare against a cutoff built the way we store timestamps. SQLite's
     # datetime() yields "2026-08-27 08:25:00" while our rows read
