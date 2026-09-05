@@ -189,7 +189,26 @@ CREATE TABLE IF NOT EXISTS bot_users (
     -- spends a request and a second of its notification budget on somebody who
     -- left, and the log fills with a failure nobody can act on. Talking to the
     -- bot again sets it back.
-    active      INTEGER NOT NULL DEFAULT 1
+    active      INTEGER NOT NULL DEFAULT 1,
+    -- What this reader paid for. 'free' sees two finds a day and nothing else;
+    -- 'paid' sees the shelf, the search and their own feed.
+    --
+    -- The state is `paid_until`, not this column: a plan with a date in the
+    -- past is not a subscription, and asking "which plan?" without asking
+    -- "until when?" is how a lapsed reader keeps everything forever. Nothing
+    -- outside pi.db.is_subscribed is allowed to answer the question.
+    plan        TEXT    NOT NULL DEFAULT 'free',
+    paid_until  TEXT,
+    -- When they first paid, kept across lapses. A reader who leaves and comes
+    -- back is not a new reader, and the difference is worth knowing before
+    -- deciding what a subscriber is worth.
+    plan_since  TEXT,
+    -- Stars received from this reader, ever. Cumulative on purpose: refunding
+    -- the last month should not erase that the year before was paid for.
+    stars_paid  INTEGER NOT NULL DEFAULT 0,
+    -- Telegram's id for the most recent charge. Required to refund it, and a
+    -- refund is the one thing that cannot be done from any other record.
+    charge_id   TEXT
 );
 
 -- What one reader asked to be told about, whatever the thresholds say.

@@ -10,10 +10,13 @@ from dataclasses import replace
 from pathlib import Path
 from urllib.parse import urlparse
 
-from . import bot, pipeline, reference, taxonomy, tls, web
+import httpx
+
+from . import bot, digest, landed, personal, pipeline, reference, taxonomy, tls, web
 from . import db as dbm
 from .config import Config, load_config
 from .domains import same_host
+from .fx import load_rates
 from .notify import Telegram
 from .sources import detect, jsonld
 from .sources.base import normalize_size
@@ -456,6 +459,87 @@ def cmd_prune(args, config: Config) -> int:
     return 0
 
 
+def cmd_digest(args, config: Config) -> int:
+    """Send the free tier's two finds of the day.
+
+    Separate from `run` on purpose. The run is hourly and its budget belongs to
+    collection; the digest is daily, reads only the shelf, and must arrive even
+    on a day when every sweep was blocked.
+    """
+    from .bot import format_card
+
+    conn = dbm.connect(config.db_path)
+    picked = digest.pick(conn, count=args.count)
+    if not picked:
+        print("нечего показать: всё, что стоит на полке, уже было в бесплатной ленте")
+        return 0
+
+    now = dbm.utcnow()
+    shipping = landed.load_rules()
+    rates = load_rates(config.db_path.parent / "fx_cache.json")
+    eur = rates.to_usd(1.0, "EUR")
+    eur_usd = eur[0] if eur else None
+
+    cards = []
+    for row in picked:
+        delivered = landed.landed_all(
+            shipping, row["price_usd"], row["kind"], row["domain"],
+            row["country"], eur_usd,
+        )
+        sizes = dbm.sizes_in_stock(conn, row["product_id"])
+        cards.append((row, format_card(row, sizes, now, delivered)))
+
+    if args.dry_run:
+        for row, caption in cards:
+            print(caption.replace("<b>", "").replace("</b>", ""))
+            print(f"🔗 {row['url']}\n{'-' * 60}")
+        print(f"({len(cards)} шт, ничего не отправлено и не записано)")
+        return 0
+
+    if not config.telegram_ready:
+        print("TELEGRAM_BOT_TOKEN not set", file=sys.stderr)
+        return 1
+
+    audience = digest.readers(conn)
+    if not audience:
+        print("бесплатных читателей нет — нечего рассылать")
+        return 0
+
+    async def go() -> int:
+        sent = 0
+        async with httpx.AsyncClient(timeout=30) as client:
+            for row, caption in cards:
+                # Claimed once for the whole audience, not per reader: the digest
+                # is one publication that many people receive, and a find that
+                # reached half of them has been published.
+                if not digest.record(conn, row, dbm.utcnow()):
+                    continue
+                delivered_to = 0
+                for reader in audience:
+                    async with Telegram(config.bot_token, reader["chat_id"], client) as tg:
+                        if await tg.send_deal(caption, row["image_url"]):
+                            delivered_to += 1
+                        elif tg.chat_is_gone:
+                            personal.deactivate(conn, reader["chat_id"])
+                if delivered_to:
+                    sent += 1
+                else:
+                    digest.unrecord(conn, row)
+        return sent
+
+    published = asyncio.run(go())
+    print(f"опубликовано {published} из {len(cards)} для {len(audience)} читателей")
+    return 0
+
+
+def cmd_backup(args, config: Config) -> int:
+    conn = dbm.connect(config.db_path)
+    dest = Path(args.out) if args.out else config.db_path.with_name("pi-snapshot.db")
+    size = dbm.snapshot(conn, dest)
+    print(f"снимок базы: {dest} ({size / 1e6:,.0f} MB)")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="pi", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -528,6 +612,18 @@ def build_parser() -> argparse.ArgumentParser:
              "(default: delisted_grace_days in filters.toml)",
     )
     p.set_defaults(func=cmd_prune)
+
+    p = sub.add_parser(
+        "backup",
+        help="write a consistent copy of the database for the backup to pick up",
+    )
+    p.add_argument("--out", help="where to write it (default: data/pi-snapshot.db)")
+    p.set_defaults(func=cmd_backup)
+
+    p = sub.add_parser("digest", help="send the free tier's finds of the day")
+    p.add_argument("--count", type=int, default=2, help="how many finds (default 2)")
+    p.add_argument("--dry-run", action="store_true", help="print them instead of sending")
+    p.set_defaults(func=cmd_digest)
 
     p = sub.add_parser(
         "reindex",

@@ -14,7 +14,7 @@ from .domains import same_shop
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 SCHEMA_SQL = Path(__file__).with_name("schema.sql")
 
 
@@ -659,6 +659,37 @@ def price_history(conn: sqlite3.Connection, variant_id: int) -> list[sqlite3.Row
     ).fetchall()
 
 
+def snapshot(conn: sqlite3.Connection, dest: Path) -> int:
+    """Write a consistent copy of the database to `dest`, returning its size.
+
+    Copying the file is not the same thing, and the difference is not academic.
+    The collector writes every hour into a write-ahead log that reaches tens of
+    megabytes; a copy taken mid-sweep catches the database without the tail of
+    the log that completes it. The backup that runs on this machine copies files
+    and deliberately has no pre-run hooks, so the only place this can be made
+    right is here.
+
+    `sqlite3`'s online backup API reads through the same locking the collector
+    uses, so the copy is a transaction-consistent database and the sweep is not
+    interrupted to make it. The result has no `-wal` beside it — it is finished.
+
+    Written to a temporary name and renamed, because the point of the file is to
+    be a good copy: a backup that starts while this is half-written should find
+    yesterday's whole snapshot rather than today's partial one.
+    """
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    staging = dest.with_name(dest.name + ".part")
+    staging.unlink(missing_ok=True)
+    target = sqlite3.connect(staging)
+    try:
+        conn.backup(target)
+    finally:
+        target.close()
+    staging.replace(dest)
+    return dest.stat().st_size
+
+
 def prune_history(conn: sqlite3.Connection, keep_days: int = 180) -> int:
     """Delete price points older than keep_days, returning how many went.
 
@@ -842,6 +873,134 @@ def upsert_bot_user(
             f"UPDATE bot_users SET {assigns} WHERE id = :id", {**fields, "id": user_id}
         )
     return get_bot_user(conn, user_id)
+
+
+# --- subscription -----------------------------------------------------------
+
+# How long a lapsed subscription keeps its feed after the date it was paid to.
+#
+# A card that fails once is the usual reason a subscription ends, and it is
+# almost never the reason the person wanted it to. Cutting everything at
+# midnight of the paid-to date turns a bank's hiccup into a lost reader, so the
+# feed keeps running for three more days while the shelf does not — enough to
+# notice the reminder, not enough to be a free month.
+SUBSCRIPTION_GRACE_DAYS = 3
+
+
+def subscription_state(
+    conn: sqlite3.Connection, user_id: int, now: str | None = None
+) -> str:
+    """'paid', 'grace' or 'free' — the single answer to what this reader may see.
+
+    Three states, not a boolean, because the two things a subscription gates
+    stop at different moments: the shelf closes on the paid-to date, the feed
+    runs three days longer. One flag cannot say that, and every place that tried
+    would have to reinvent the same date arithmetic slightly differently.
+
+    The comparison is done here in Python rather than in SQL. Timestamps in this
+    database are `isoformat` — `2026-09-05T12:56:00+00:00` — and SQLite's own
+    `datetime('now')` produces a space instead of the T and no offset at all.
+    Comparing the two as strings is not an error; it silently matches nothing,
+    which would read as "nobody is subscribed" and never raise.
+    """
+    row = get_bot_user(conn, user_id)
+    if row is None or row["paid_until"] is None:
+        return "free"
+    moment = datetime.fromisoformat(now) if now else datetime.now(UTC)
+    until = datetime.fromisoformat(row["paid_until"])
+    if moment <= until:
+        return "paid"
+    if moment <= until + timedelta(days=SUBSCRIPTION_GRACE_DAYS):
+        return "grace"
+    return "free"
+
+
+def is_subscribed(conn: sqlite3.Connection, user_id: int, now: str | None = None) -> bool:
+    """Whether the shelf opens for this reader. Grace does not count.
+
+    Deliberately stricter than `subscription_state`: the grace period exists to
+    keep a feed running through a failed renewal, not to hand out the thing
+    being sold. Anything gating the shelf, the search or the article lookup asks
+    this; only the feed asks for the state itself.
+    """
+    return subscription_state(conn, user_id, now) == "paid"
+
+
+def grant(
+    conn: sqlite3.Connection,
+    user_id: int,
+    days: int = 30,
+    charge_id: str | None = None,
+    stars: int = 0,
+) -> sqlite3.Row:
+    """Extend a subscription, returning the reader.
+
+    Time is added to whichever is later, now or the date already paid to, so
+    that paying early adds a month instead of throwing away the rest of the one
+    already bought. Paying after a lapse starts from today, because the days in
+    between were not sold to anybody.
+
+    `stars_paid` accumulates and `plan_since` is set once and never moved: a
+    reader who leaves and comes back is not a new reader, and a refund of the
+    last month should not erase that the year before was paid for.
+    """
+    moment = datetime.now(UTC)
+    row = get_bot_user(conn, user_id)
+    start = moment
+    if row is not None and row["paid_until"]:
+        paid_until = datetime.fromisoformat(row["paid_until"])
+        start = max(moment, paid_until)
+    fields: dict[str, object] = {
+        "plan": "paid",
+        "paid_until": (start + timedelta(days=days)).isoformat(timespec="seconds"),
+        "plan_since": (row["plan_since"] if row and row["plan_since"] else moment.isoformat(timespec="seconds")),
+        "stars_paid": (row["stars_paid"] if row else 0) + stars,
+    }
+    if charge_id:
+        fields["charge_id"] = charge_id
+    assigns = ", ".join(f"{key} = :{key}" for key in fields)
+    conn.execute(f"UPDATE bot_users SET {assigns} WHERE id = :id", {**fields, "id": user_id})
+    return get_bot_user(conn, user_id)
+
+
+def expire_due(conn: sqlite3.Connection, now: str | None = None) -> int:
+    """Return readers whose grace has run out to the free plan, and count them.
+
+    Only `plan` moves. The profile, the starred things and `plan_since` all stay
+    exactly where they were: somebody coming back after six months should find
+    their list, not an empty bot, and that is the cheapest subscriber there is
+    to win back.
+    """
+    moment = datetime.fromisoformat(now) if now else datetime.now(UTC)
+    cutoff = (moment - timedelta(days=SUBSCRIPTION_GRACE_DAYS)).isoformat(timespec="seconds")
+    cursor = conn.execute(
+        "UPDATE bot_users SET plan = 'free' WHERE plan != 'free' AND paid_until < ?",
+        (cutoff,),
+    )
+    return cursor.rowcount
+
+
+def expiring_soon(
+    conn: sqlite3.Connection, within_days: int = 3, now: str | None = None
+) -> list[sqlite3.Row]:
+    """Paid readers whose subscription ends within the window.
+
+    What the reminder is sent from. Readers already past their date are not
+    here: they are in grace and have had the reminder already.
+    """
+    moment = datetime.fromisoformat(now) if now else datetime.now(UTC)
+    return conn.execute(
+        """
+        SELECT * FROM bot_users
+        WHERE plan != 'free' AND active = 1
+          AND paid_until >= ? AND paid_until < ?
+        ORDER BY paid_until
+        """,
+        (
+            moment.isoformat(timespec="seconds"),
+            (moment + timedelta(days=within_days)).isoformat(timespec="seconds"),
+        ),
+    ).fetchall()
 
 
 def offers_for(
