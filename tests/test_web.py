@@ -645,13 +645,44 @@ class TestStarringSomethingOverHttp:
 
         assert theirs["items"] == []
 
-    def test_reading_the_shelf_still_needs_nobody(self, conn):
-        """Favourites are the only thing that needs a name; browsing never did."""
+    def test_reading_the_shelf_needs_a_subscription(self, conn):
+        """The shelf is the thing being sold, so browsing it is what is gated."""
         a_shelf(conn, 2)
         with self._serving(conn) as base:
             code, body = self._call(f"{base}/api/offers")
 
+        # 402 rather than 403: the request is understood, and the only thing
+        # missing is payment.
+        assert code == 402
+        assert body["error"] == "subscription required"
+
+    def test_the_owner_is_not_a_customer_of_their_own_collector(self, conn):
+        a_shelf(conn, 2)
+        with self._serving(conn, owner_id=7) as base:
+            code, body = self._call(f"{base}/api/offers")
+
         assert (code, body["total"]) == (200, 2)
+
+    def test_a_subscriber_gets_the_shelf(self, conn):
+        a_shelf(conn, 2)
+        dbm.upsert_bot_user(conn, 9, "99")
+        dbm.grant(conn, 9, days=30)
+        with self._serving(conn, owner_id=9) as base:
+            code, body = self._call(f"{base}/api/offers")
+
+        assert (code, body["total"]) == (200, 2)
+
+    def test_a_lapsed_reader_loses_the_shelf(self, conn):
+        a_shelf(conn, 2)
+        dbm.upsert_bot_user(conn, 9, "99")
+        dbm.grant(conn, 9, days=30)
+        conn.execute("UPDATE bot_users SET paid_until = ? WHERE id = 9", (ts(1),))
+        with self._serving(conn, owner_id=None) as base:
+            code, _ = self._call(f"{base}/api/offers")
+
+        # Inside the grace period the feed still runs; the shelf does not, or
+        # grace would be a free month of the thing being sold.
+        assert code == 402
 
     @staticmethod
     def _page(url):
@@ -680,12 +711,25 @@ class TestStarringSomethingOverHttp:
         assert "Salomon XT-6" in page
         assert '"favorites_items": null' in ordinary, "an unopened list costs nothing"
 
-    def test_a_page_served_to_nobody_says_so(self, conn):
+    def test_a_page_served_to_nobody_offers_the_subscription(self, conn):
+        """Whoever lands here followed a button out of the bot.
+
+        They need to know what this is and how to open it, and an error code
+        tells them neither — it reads as a broken link.
+        """
         a_shelf(conn, 1)
         with self._serving(conn) as base:
             page = self._page(base + "/")
 
-        assert '"me": null' in page
+        assert "Полка открывается по подписке" in page
+        assert "150 звёзд в месяц" in page
+
+    def test_a_page_served_to_the_owner_says_who_they_are(self, conn):
+        a_shelf(conn, 1)
+        with self._serving(conn, owner_id=7) as base:
+            page = self._page(base + "/")
+
+        assert '"me": 7' in page
 
     def test_a_starred_row_carries_what_the_card_draws(self, conn):
         product, _ = self._a_product(conn)

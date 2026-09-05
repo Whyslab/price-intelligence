@@ -194,6 +194,10 @@ def cmd_web(args, config: Config) -> int:
         port=args.port,
         bot_token=config.bot_token,
         owner_id=args.owner,
+        # The person who runs the collector is not a customer of it. Their id
+        # comes from .env, which for a private chat is the same number, and it
+        # grants nothing on its own — Telegram still has to sign the request.
+        exempt_id=int(config.chat_id) if (config.chat_id or "").lstrip("-").isdigit() else None,
     )
     return 0
 

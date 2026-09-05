@@ -325,6 +325,75 @@ def shelf_page(conn: sqlite3.Connection, args: dict) -> dict:
     }
 
 
+# What a read answers when the reader is not paying. 402 rather than 403: the
+# request is understood and well formed, and the only thing missing is payment.
+SUBSCRIPTION_REQUIRED = {
+    "error": "subscription required",
+    "detail": "Витрина открывается по подписке. Оформить её можно в боте.",
+}
+
+
+def locked_page(conn: sqlite3.Connection) -> bytes:
+    """What somebody without a subscription gets instead of the shelf.
+
+    A page rather than a status code. Whoever lands here followed a button out
+    of the bot, and the two things they need are what this is and how to open
+    it; an error tells them neither and reads as a broken link.
+
+    It carries the same three arguments the bot's pitch does, with the numbers
+    counted here and now for the same reason: the size of the catalogue is the
+    one claim a reader can check in the next thirty seconds.
+    """
+    shelf = conn.execute("SELECT COUNT(*) FROM offers").fetchone()[0]
+    compared = conn.execute(
+        "SELECT COUNT(*) FROM offers WHERE reference_source = 'market'"
+    ).fetchone()[0]
+    body = f"""<!doctype html>
+<html lang="ru"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Полка — нужна подписка</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root {{ color-scheme: light dark; }}
+  body {{ margin: 0 auto; padding: 2rem 1.25rem; max-width: 34rem;
+         font: 16px/1.55 system-ui, sans-serif; }}
+  h1 {{ font-size: 1.4rem; margin: 0 0 .25rem; }}
+  p.lead {{ opacity: .75; margin-top: 0; }}
+  ol {{ padding-left: 1.2rem; }}
+  li {{ margin-bottom: .9rem; }}
+  .price {{ margin-top: 1.75rem; padding: 1rem; border-radius: .75rem;
+            background: rgba(128, 128, 128, .14); text-align: center; }}
+  button {{ margin-top: 1rem; width: 100%; padding: .8rem; font: inherit;
+            font-weight: 600; border: 0; border-radius: .6rem;
+            background: #2481cc; color: #fff; cursor: pointer; }}
+</style></head><body>
+<h1>💎 Полка открывается по подписке</h1>
+<p class="lead">Здесь {_spaced(shelf)} предложений со скидкой, с поиском по
+артикулу, размеру и марке.</p>
+<ol>
+  <li><b>Дешевле, чем у соседей.</b> {_spaced(compared)} предложений сравнены
+      с ценой на ту же вещь в других магазинах по артикулу производителя.
+      Канал со скидками пересылает ярлык — сравнить ему не с чем.</li>
+  <li><b>Цена подтверждена, а не найдена когда-то.</b> На каждой карточке
+      написано, когда магазин в последний раз показал эту цену.</li>
+  <li><b>Цена на руках</b> — с доставкой и пошлиной в вашу страну, а не только
+      та, что на ярлыке.</li>
+</ol>
+<div class="price">⭐ <b>150 звёзд в месяц</b><br>или 1500 за год — два месяца в подарок</div>
+<button onclick="if (window.Telegram?.WebApp) Telegram.WebApp.close(); else history.back();">
+  Вернуться в бота и оформить
+</button>
+</body></html>
+"""
+    return body.encode("utf-8")
+
+
+def _spaced(n: int) -> str:
+    """Thousands separated the way Russian writes them."""
+    return f"{n:,}".replace(",", "\u00a0")
+
+
 def render_page(
     conn: sqlite3.Connection, args: dict, user_id: int | None = None
 ) -> bytes:
@@ -379,6 +448,10 @@ class Handler(BaseHTTPRequestHandler):
     # the page then hides its hearts entirely rather than offering a button that
     # answers 401.
     owner_id: int | None = None
+    # Who never has to pay: the person who runs the collector. Unlike owner_id
+    # this grants no identity — the reader still proves who they are with
+    # Telegram's signature — so it is safe on an address other people reach.
+    exempt_id: int | None = None
     server_version = "price-intelligence"
 
     def log_message(self, fmt: str, *args) -> None:
@@ -436,6 +509,29 @@ class Handler(BaseHTTPRequestHandler):
         )
         return signed if signed is not None else self.owner_id
 
+    def _paying(self, conn: sqlite3.Connection) -> bool:
+        """Whether this request may see the shelf at all.
+
+        The shelf is the thing being sold, so unlike the hearts — which a
+        signed-out reader simply does not get — this is the gate. Two ways
+        through it: a live subscription, or being the person who runs the
+        collector. The second is not a courtesy; a shop owner locked out of
+        their own shop by their own paywall cannot debug it.
+
+        `is_subscribed` and not `subscription_state`, deliberately: the grace
+        period keeps a feed alive through a failed renewal, and handing back the
+        thing being sold as well would make grace a free month.
+        """
+        reader = self._reader()
+        if reader is None:
+            return False
+        # Both flavours of owner. `owner_id` only exists on localhost, where the
+        # machine is asserting who it belongs to; `exempt_id` works anywhere
+        # because Telegram still has to sign the request naming that person.
+        if reader in {self.owner_id, self.exempt_id} - {None}:
+            return True
+        return dbm.is_subscribed(conn, reader)
+
     def _body(self) -> dict:
         """The JSON a write sent, or {}."""
         try:
@@ -461,11 +557,22 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if parsed.path in ("/", "/index.html"):
                 with self._open() as conn:
+                    if not self._paying(conn):
+                        # A page, not a 402. Somebody who followed a link here
+                        # from the bot should find out what this is and how to
+                        # open it, and an error code tells them neither.
+                        self._send(
+                            200, locked_page(conn), "text/html; charset=utf-8"
+                        )
+                        return
                     body = render_page(conn, read_query(parsed.query), self._reader())
                 self._send(200, body, "text/html; charset=utf-8")
                 return
             if parsed.path == "/api/facets":
                 with self._open() as conn:
+                    if not self._paying(conn):
+                        self._json(SUBSCRIPTION_REQUIRED, 402)
+                        return
                     self._json(
                         dbm.shelf_facets(conn, kids=read_query(parsed.query)["kids"])
                     )
@@ -477,6 +584,9 @@ class Handler(BaseHTTPRequestHandler):
                     self._json({"error": "not a product id"}, 400)
                     return
                 with self._open() as conn:
+                    if not self._paying(conn):
+                        self._json(SUBSCRIPTION_REQUIRED, 402)
+                        return
                     found = product_page(
                         conn, product_id, read_variant(parsed.query)
                     )
@@ -485,10 +595,16 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path == "/api/lookup":
                 wanted = (parse_qs(parsed.query).get("q", [""])[0] or "").strip()
                 with self._open() as conn:
+                    if not self._paying(conn):
+                        self._json(SUBSCRIPTION_REQUIRED, 402)
+                        return
                     self._json(lookup_page(conn, wanted))
                 return
             if parsed.path == "/api/offers":
                 with self._open() as conn:
+                    if not self._paying(conn):
+                        self._json(SUBSCRIPTION_REQUIRED, 402)
+                        return
                     self._json(shelf_page(conn, read_query(parsed.query)))
                 return
             if parsed.path == "/api/favorites":
@@ -577,12 +693,22 @@ def serve(
     port: int = 8000,
     bot_token: str | None = None,
     owner_id: int | None = None,
+    exempt_id: int | None = None,
 ) -> None:
-    """Run until interrupted."""
+    """Run until interrupted.
+
+    `owner_id` says who an unsigned request is, and only makes sense on
+    localhost. `exempt_id` says who never has to pay, and is safe anywhere
+    because it grants nothing on its own — the reader still has to prove they
+    are that person with Telegram's signature.
+    """
     handler = type(
         "BoundHandler",
         (Handler,),
-        {"db_path": Path(db_path), "bot_token": bot_token, "owner_id": owner_id},
+        {
+            "db_path": Path(db_path), "bot_token": bot_token,
+            "owner_id": owner_id, "exempt_id": exempt_id,
+        },
     )
     server = ThreadingHTTPServer((host, port), handler)
     log.info("shelf on http://%s:%d — Ctrl-C to stop", host, port)
