@@ -10,7 +10,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from . import reference
-from .domains import same_shop
+from .domains import load_excluded, same_host, same_shop
 
 log = logging.getLogger(__name__)
 
@@ -392,9 +392,24 @@ def get_stores(
     # Least-recently-collected first, so a run that cannot finish still makes
     # progress: the next one picks up where this one stopped instead of starting
     # at the top of the alphabet and re-collecting the same shops forever.
-    return conn.execute(
+    rows = conn.execute(
         sql + " ORDER BY last_ok IS NOT NULL, last_ok, domain", params
     ).fetchall()
+
+    # A shop that asked not to be visited is dropped here rather than in the
+    # sweep, because this is the single door every path goes through: the sweep,
+    # `detect`, `verify`, and `--stores` naming one by hand. The last one on
+    # purpose — "we do not want you here" is not a preference a debug flag gets
+    # to override.
+    excluded = load_excluded()
+    if not excluded:
+        return rows
+    kept = [row for row in rows if same_host(row["domain"]) not in excluded]
+    if len(kept) != len(rows):
+        log.info(
+            "%d shop(s) skipped: they are in data/excluded.txt", len(rows) - len(kept)
+        )
+    return kept
 
 
 def productive_store_ids(conn: sqlite3.Connection, days: int) -> set[int]:

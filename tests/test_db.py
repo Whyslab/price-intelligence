@@ -616,3 +616,53 @@ class TestFollowingAProduct:
         dbm.record_favorite_price(conn, 7, product, 149.0)
 
         assert dbm.favorite_prices(conn, 7) == {product: 149.0}
+
+
+class TestAShopThatAskedNotToBeVisited:
+    """`data/excluded.txt` is the answer to being asked, and it is not advisory."""
+
+    @staticmethod
+    def _excluded(tmp_path, *domains) -> None:
+        (tmp_path / "excluded.txt").write_text(
+            "# comment\n" + "\n".join(domains) + "\n", encoding="utf-8"
+        )
+
+    def test_an_excluded_shop_is_not_returned(self, conn, tmp_path, monkeypatch):
+        dbm.upsert_store(conn, "keep.example", platform="shopify")
+        dbm.upsert_store(conn, "gone.example", platform="shopify")
+        self._excluded(tmp_path, "gone.example")
+        monkeypatch.setattr(dbm, "load_excluded", lambda: frozenset({"gone.example"}))
+
+        assert [s["domain"] for s in dbm.get_stores(conn)] == ["keep.example"]
+
+    def test_naming_it_by_hand_does_not_override_the_list(
+        self, conn, tmp_path, monkeypatch
+    ):
+        dbm.upsert_store(conn, "gone.example", platform="shopify")
+        monkeypatch.setattr(dbm, "load_excluded", lambda: frozenset({"gone.example"}))
+
+        # `--stores gone.example` goes through the same door. "We do not want you
+        # here" is not a preference a debug flag gets to override.
+        assert dbm.get_stores(conn, domains=("gone.example",)) == []
+
+    def test_www_is_the_same_shop(self, conn, monkeypatch):
+        dbm.upsert_store(conn, "www.gone.example", platform="shopify")
+        monkeypatch.setattr(dbm, "load_excluded", lambda: frozenset({"gone.example"}))
+
+        assert dbm.get_stores(conn) == []
+
+    def test_an_empty_list_changes_nothing(self, conn, monkeypatch):
+        dbm.upsert_store(conn, "keep.example", platform="shopify")
+        monkeypatch.setattr(dbm, "load_excluded", lambda: frozenset())
+
+        assert [s["domain"] for s in dbm.get_stores(conn)] == ["keep.example"]
+
+
+def test_the_shipped_exclusion_file_parses(tmp_path):
+    from pi.domains import load_excluded
+
+    path = tmp_path / "excluded.txt"
+    path.write_text(
+        "# a comment\n\nWWW.Gone.Example  # trailing\nother.example\n", encoding="utf-8"
+    )
+    assert load_excluded(path) == frozenset({"gone.example", "other.example"})

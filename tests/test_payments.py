@@ -223,3 +223,64 @@ class TestTheDailyCheck:
         row = dbm.get_bot_user(conn, 7)
         assert row["plan"] == "free"
         assert (row["sizes"], row["brands"]) == ("EU44", "Nike")
+
+
+class TestWhatIsPromisedAndWhatIsKept:
+    @pytest.mark.asyncio
+    async def test_start_says_the_price_before_anybody_can_pay(self, robot, calls):
+        await robot.handle(_message("/start"))
+        text = calls[0][1]["text"]
+        assert str(bot.MONTHLY_STARS) in text
+        assert "/terms" in text
+        assert "/delete_me" in text
+
+    @pytest.mark.asyncio
+    async def test_terms_name_the_refund_window_and_what_is_stored(self, robot, calls):
+        await robot.handle(_message("/terms"))
+        text = calls[0][1]["text"]
+        assert "48 часов" in text
+        assert "Что о вас хранится" in text
+
+    @pytest.mark.asyncio
+    async def test_delete_me_leaves_nothing_behind(self, robot, conn):
+        dbm.upsert_bot_user(conn, 7, "42", sizes="EU44")
+        product, variant = _a_product(conn, with_variant=True)
+        dbm.add_favorite(conn, 7, product, None)
+        conn.execute(
+            "INSERT INTO alerts (product_id, variant_id, ts, price_usd, price_bucket,"
+            " discount_pct, score, sent, user_id) VALUES (?, ?, ?, 10, 10, 50, 80, 1, 7)",
+            (product, variant, ts()),
+        )
+
+        await robot.handle(_message("/delete_me"))
+
+        assert dbm.get_bot_user(conn, 7) is None
+        assert conn.execute(
+            "SELECT COUNT(*) FROM favorites WHERE user_id = 7"
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM alerts WHERE user_id = 7"
+        ).fetchone()[0] == 0
+
+    @pytest.mark.asyncio
+    async def test_delete_me_does_not_touch_anybody_else(self, robot, conn):
+        dbm.upsert_bot_user(conn, 7, "42")
+        dbm.upsert_bot_user(conn, 8, "43", sizes="EU40")
+        dbm.add_favorite(conn, 8, _a_product(conn), None)
+
+        await robot.handle(_message("/delete_me"))
+
+        assert dbm.get_bot_user(conn, 8)["sizes"] == "EU40"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM favorites WHERE user_id = 8"
+        ).fetchone()[0] == 1
+
+
+def _a_product(conn, with_variant: bool = False):
+    store = dbm.upsert_store(conn, "shop.example", platform="shopify", currency="USD")
+    product = dbm.upsert_product(
+        conn, store, "p1", "Air Max", "https://shop.example/p1"
+    )
+    if not with_variant:
+        return product
+    return product, dbm.upsert_variant(conn, product, "v1", sku="SKU1", size="US10")

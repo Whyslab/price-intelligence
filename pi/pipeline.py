@@ -27,9 +27,17 @@ from .throttle import RateLimiter
 
 log = logging.getLogger(__name__)
 
+# A browser's string with a contact appended. The browser half is not a
+# disguise that works — measured: shops answering 403 keep answering 403 to any
+# headers at all, and the only thing that gets past them is a TLS fingerprint
+# (see pi/sources/impersonate.py). It stays because some servers are picky about
+# unfamiliar agents, and the contact is added because a shop that would rather
+# not be read needs somewhere to say so. `data/excluded.txt` is where the answer
+# goes.
 USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 "
+    "(+https://github.com/Whyslab/price-intelligence)"
 )
 HEADERS = {"User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.9"}
 

@@ -1,0 +1,8 @@
+# Shops never to visit, one bare domain per line. `#` starts a comment.
+#
+# Put a shop here when it asks not to be crawled. It is then dropped from every
+# path — the hourly sweep, `pi detect`, `pi verify`, and `--stores` naming it by
+# hand — and its products stop being collected. What was already collected stays
+# until `pi prune` clears it.
+#
+# The address in the collector's User-Agent is where such a request arrives.

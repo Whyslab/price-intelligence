@@ -264,6 +264,36 @@ def subscription_pitch(conn: sqlite3.Connection) -> str:
     ])
 
 
+# Shown before anybody can pay, because Telegram requires a digital-goods bot to
+# say what the service is and how a refund works, and because half the questions
+# a subscriber ever asks are answered by three paragraphs written once.
+TERMS = f"""📄 <b>Условия</b>
+
+<b>Что это за услуга.</b> Доступ к базе цен: витрина со всеми текущими скидками,
+поиск по артикулу и названию, лента уведомлений под ваш профиль и слежка за
+отмеченными товарами. Данные собираются с открытых каталогов магазинов; бот не
+продаёт товары и не является магазином.
+
+<b>Сколько стоит.</b> {MONTHLY_STARS} ⭐ за 30 дней с автопродлением, либо {YEARLY_STARS} ⭐ за
+год без продления. Отменить автопродление — /cancel; оплаченный срок при этом
+сохраняется.
+
+<b>Возврат.</b> В течение 48 часов после оплаты — без вопросов, напишите сюда же.
+Дальше — по обстоятельствам. Возврат снимает подписку.
+
+<b>Что о вас хранится.</b> Ваш Telegram id, имя пользователя, профиль (пол, тип
+вещей, размеры, марки), отмеченные товары и история отправленных вам
+уведомлений. Ничего из этого никуда не передаётся. Тексты сообщений не
+сохраняются.
+
+<b>Удалить всё.</b> /delete_me — сносит профиль, отмеченное и историю
+уведомлений без возможности восстановить.
+
+<b>Чего бот не обещает.</b> Цена в магазине может измениться или оказаться
+ошибкой магазина; доставка и пошлина считаются оценочно. Проверяйте на сайте
+магазина перед покупкой."""
+
+
 def subscription_keyboard() -> dict:
     return {
         "inline_keyboard": [
@@ -661,6 +691,34 @@ class Bot:
             {"inline_keyboard": [[{"text": f"Оплатить {stars} ⭐", "url": link}]]},
         )
 
+    async def forget(self, chat_id: str, user: sqlite3.Row) -> None:
+        """Delete everything kept about one reader, on their word alone.
+
+        No confirmation step. Somebody typing this has decided, and a bot that
+        asks "are you sure?" before letting go of data it was never asked to
+        keep is arguing for itself.
+
+        The alerts go too. They are the record of what this person was told,
+        which is as much about them as the profile is — and leaving them would
+        also mean a reader who came back never heard about anything they had
+        already been sent, from a list they can no longer see.
+
+        A live subscription is deliberately not refunded here: money is a
+        separate conversation, and /terms says where to have it.
+        """
+        user_id = int(user["id"])
+        with dbm.transaction(self.conn):
+            self.conn.execute("DELETE FROM favorites WHERE user_id = ?", (user_id,))
+            self.conn.execute("DELETE FROM alerts WHERE user_id = ?", (user_id,))
+            self.conn.execute("DELETE FROM bot_users WHERE id = ?", (user_id,))
+        await self.send(
+            chat_id,
+            "Готово. Профиль, отмеченное и история уведомлений удалены.\n\n"
+            "Если у вас была оплаченная подписка и вы хотите вернуть деньги — "
+            "напишите сюда, условия в /terms.\n\n"
+            "Чтобы начать заново — /start.",
+        )
+
     async def show_subscription(self, chat_id: str, user: sqlite3.Row) -> None:
         """What this reader has, in the plainest words available."""
         state = dbm.subscription_state(self.conn, user["id"])
@@ -825,16 +883,29 @@ class Bot:
         if text.startswith("/cancel"):
             await self.cancel_subscription(chat_id, user)
             return
+        if text.startswith("/terms"):
+            await self.send(chat_id, TERMS)
+            return
+        if text.startswith("/delete_me"):
+            await self.forget(chat_id, user)
+            return
         if text.startswith("/start"):
             await self.send(
                 chat_id,
                 "Привет. Я слежу за ценами в магазинах кроссовок и одежды и "
-                "показываю то, что действительно подешевело.\n\n"
+                "показываю то, что действительно подешевело — не то, что "
+                "магазин перечеркнул на ярлыке.\n\n"
+                f"<b>Бесплатно:</b> две лучшие находки в день.\n"
+                f"<b>По подписке ({MONTHLY_STARS} ⭐ в месяц):</b> вся полка, "
+                "поиск по артикулу, лента под ваши размеры и марки.\n\n"
                 "Можно настроить подборку под себя — четыре вопроса, — "
-                "или сразу посмотреть всё.",
+                "или сразу посмотреть, что есть.\n\n"
+                "<i>Условия и возврат — /terms. Удалить о себе всё — "
+                "/delete_me.</i>",
                 {"inline_keyboard": [
                     [{"text": "Настроить", "callback_data": "wizard"},
                      {"text": "Показать всё", "callback_data": "p:0"}],
+                    [{"text": "💎 Что даёт подписка", "callback_data": "pitch"}],
                     *([shelf] if (shelf := shelf_button(self.config.web_url)) else []),
                 ]},
             )
