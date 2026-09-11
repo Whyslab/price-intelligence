@@ -823,6 +823,37 @@ def confirm_offer(conn: sqlite3.Connection, product_id: int, ts: str) -> None:
     conn.execute("UPDATE offers SET checked_at = ? WHERE product_id = ?", (ts, product_id))
 
 
+def mark_offers_seen(
+    conn: sqlite3.Connection, variant_ids: Sequence[int], ts: str
+) -> int:
+    """Record that the shop showed us these variants just now.
+
+    `offers.checked_at` is what a card means by "проверено N назад", and until
+    this existed nothing wrote it except a re-score and a one-by-one verify. A
+    price that does not move is never re-scored — `record_price` writes a point
+    only when the shop changed something, deliberately, because otherwise a
+    daily exchange-rate tick becomes news — so a stable price aged on the card
+    while the sweep read it over and over.
+
+    Measured before this: 29,092 of 33,141 offers looked older than two days,
+    while 23,554 of them belong to a shop that had been read inside two days.
+    The shelf was not stale; the record of it was.
+
+    Written in one statement per chunk rather than per variant: a Shopify sweep
+    hands back tens of thousands at a time.
+    """
+    total = 0
+    for start in range(0, len(variant_ids), 900):
+        chunk = variant_ids[start : start + 900]
+        marks = ",".join("?" * len(chunk))
+        cursor = conn.execute(
+            f"UPDATE offers SET checked_at = ? WHERE variant_id IN ({marks})",
+            [ts, *chunk],
+        )
+        total += cursor.rowcount
+    return total
+
+
 def latest_price_usd(conn: sqlite3.Connection, variant_id: int) -> float | None:
     """The newest price recorded for one variant, or None if it has none."""
     row = conn.execute(

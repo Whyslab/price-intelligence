@@ -1625,3 +1625,73 @@ class TestAFindIsConfirmedWithTheShopBeforeItIsSent:
         make_due(conn)
 
         assert (await pipeline.run(config, conn)).alerts_sent > 0
+
+
+class TestSeenIsNotTheSameAsChanged:
+    """`offers.checked_at` is what a card means by "проверено N назад", and
+    until this nothing wrote it except a re-score or a one-by-one verify. A
+    price that does not move is never re-scored — `record_price` writes a point
+    only when the shop changed something, on purpose — so a stable price aged on
+    the card while the sweep read it over and over.
+
+    Measured before the fix: 29,092 of 33,141 offers looked older than two days,
+    while 23,554 of them belonged to a shop read inside two days."""
+
+    @respx.mock
+    async def test_a_sweep_that_changes_nothing_still_refreshes_the_card(
+        self, config, shopify_payload
+    ):
+        _mock_rates()
+        _mock_telegram()
+        respx.get("https://shop.example/products.json?limit=250").mock(
+            return_value=httpx.Response(200, json=shopify_payload)
+        )
+        _mock_product_pages(shopify_payload)
+        conn = dbm.connect(config.db_path)
+        known_store(conn)
+        await pipeline.run(config, conn)
+
+        # Age every card on the shelf, then sweep again with the same prices.
+        conn.execute("UPDATE offers SET checked_at = ?", (ts(9),))
+        conn.commit()
+        stale = conn.execute(
+            "SELECT COUNT(*) FROM offers WHERE checked_at < ?", (ts(1),)
+        ).fetchone()[0]
+        assert stale > 0, "the fixture has a shelf to age"
+
+        make_due(conn)
+        await pipeline.run(config, conn)
+
+        still_stale = conn.execute(
+            "SELECT COUNT(*) FROM offers WHERE checked_at < ?", (ts(1),)
+        ).fetchone()[0]
+        assert still_stale == 0, "the shop showed them again, so the card is current"
+
+    def test_only_the_variants_handed_in_are_stamped(self, conn):
+        """A card the shop did not show this time keeps its old date: the claim
+        is "we saw this", not "we read that shop"."""
+        store = dbm.upsert_store(conn, "s.example", platform="shopify", currency="USD")
+        ids = []
+        for n in range(3):
+            product = dbm.upsert_product(
+                conn, store, f"p{n}", f"Shoe {n}", f"https://s.example/{n}"
+            )
+            variant = dbm.upsert_variant(conn, product, f"v{n}", sku=f"SKU{n}")
+            conn.execute(
+                """
+                INSERT INTO offers (variant_id, product_id, found_at, checked_at,
+                                    price_usd, reference_usd, reference_source,
+                                    discount_pct, saving_usd, score, all_time_low)
+                VALUES (?, ?, ?, ?, 100.0, 200.0, 'market', 50.0, 100.0, 70, 0)
+                """,
+                (variant, product, ts(9), ts(9)),
+            )
+            ids.append(variant)
+        one = ids[0]
+
+        dbm.mark_offers_seen(conn, [one], ts(0))
+
+        fresh = conn.execute(
+            "SELECT variant_id FROM offers WHERE checked_at >= ?", (ts(1),)
+        ).fetchall()
+        assert [row[0] for row in fresh] == [one]

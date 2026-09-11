@@ -396,6 +396,7 @@ def store_result(
     # own is measured against the rest of the shop, which is the same bucket.
     ceilings = price_ceilings(result.products)
     impossible = 0
+    seen: list[int] = []
 
     for product in result.products:
         # A product that named its own currency is priced in that one. Only a
@@ -433,6 +434,8 @@ def store_result(
                 conn, product_id, variant.external_id, sku=variant.sku,
                 size=variant.size, size_norm=variant.size_norm, color=variant.color,
             )
+            # Seen is not the same as changed, and the card claims the first.
+            seen.append(variant_id)
             if dbm.record_price(
                 conn, variant_id, price_usd, compare_usd, variant.in_stock,
                 currency, variant.price, rate, ts=ts,
@@ -440,6 +443,8 @@ def store_result(
             ):
                 written += 1
                 changed.append(variant_id)
+    if seen:
+        dbm.mark_offers_seen(conn, seen, ts or dbm.utcnow())
     if impossible:
         log.warning(
             "%d price(s) discarded as impossible — more than %d times what this "
