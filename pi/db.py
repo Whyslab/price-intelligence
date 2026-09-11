@@ -1356,6 +1356,7 @@ def offers_for(
     min_discount: float | None = None,
     kids: bool = False,
     women: bool = False,
+    all_discounts: bool = False,
 ) -> tuple[list[sqlite3.Row], int]:
     """What is on offer for one person, best first. Returns (page, total).
 
@@ -1388,6 +1389,20 @@ def offers_for(
     # men's item is otherwise invisible and therefore unreportable.
     if not women:
         where.append("(p.gender IS NULL OR p.gender <> 'women')")
+    # A discount only somebody other than the seller vouches for. Measured on
+    # the shelf: 20,908 of 26,013 visible cards — 80% — rest on nothing but the
+    # shop's own struck-through price, which is the one number a shop writes
+    # about itself and the one every free discount channel repeats. A page of
+    # those reads as a jumble sale whatever it is dressed in, which is what
+    # "выглядит дёшево" turned out to mean.
+    #
+    # A switch and not a deletion, the way children's clothing is: the full view
+    # is one click away, and somebody hunting a particular thing wants the weak
+    # evidence too, labelled as weak.
+    if not all_discounts:
+        where.append(
+            "(o.all_time_low = 1 OR o.reference_source IN ('history', 'market'))"
+        )
     # What is left is "confirmed men" and "nobody said". Asking for men narrows
     # to the confirmed half; 57% of the shelf says nothing, so this is a
     # preference rather than the shop's own boundary. Asking for anything else
@@ -1532,7 +1547,7 @@ def _size_order(label: str) -> tuple:
 
 
 def shelf_facets(conn: sqlite3.Connection, kids: bool = False,
-                 women: bool = False) -> dict:
+                 women: bool = False, all_discounts: bool = False) -> dict:
     """What the shelf actually contains, for building filters out of.
 
     Offered rather than hardcoded because a filter listing a size nothing is on
@@ -1552,6 +1567,8 @@ def shelf_facets(conn: sqlite3.Connection, kids: bool = False,
     hide = "" if kids else " AND (p.audience IS NULL OR p.audience <> 'kids')"
     if not women:
         hide += " AND (p.gender IS NULL OR p.gender <> 'women')"
+    if not all_discounts:
+        hide += " AND (o.all_time_low = 1 OR o.reference_source IN ('history', 'market'))"
 
     def tally(sql: str) -> list[dict]:
         return [

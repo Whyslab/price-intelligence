@@ -435,11 +435,14 @@ def _offer(conn, store_id, key, price, discount, score=None):
         INSERT INTO offers (variant_id, product_id, found_at, checked_at,
                             price_usd, reference_usd, reference_source,
                             discount_pct, saving_usd, score, all_time_low)
-        VALUES (?, ?, ?, ?, ?, ?, 'tag', ?, ?, ?, 0)
+        VALUES (?, ?, ?, ?, ?, ?, 'market', ?, ?, ?, 0)
         """,
         (variant, product, ts(1), ts(0), price, price * 2, discount, price,
          score if score is not None else discount),
     )
+    # 'market' and not 'tag': the shelf shows only discounts somebody other than
+    # the seller vouches for, and these tests are about the order of what it
+    # shows, not about which evidence gets in.
 
 
 class TestWhoseFindGoesFirst:
@@ -1103,3 +1106,60 @@ class TestWithNothingBeingSold:
                 raise AssertionError("the shelf was handed over without a subscription")
             except HTTPError as refused:
                 assert refused.code == 402
+
+
+class TestOnlyDiscountsSomebodyElseVouchesFor:
+    """20,908 of the 26,013 cards the shelf could draw rest on nothing but the
+    shop's own struck-through price — the one number a shop writes about itself,
+    and the one every free discount channel repeats. A page of those reads as a
+    jumble sale whatever it is dressed in."""
+
+    @staticmethod
+    def _offer(conn, domain, source, all_time_low=0):
+        store = dbm.upsert_store(conn, domain, platform="shopify", currency="USD")
+        product = dbm.upsert_product(
+            conn, store, domain, f"Shoe {domain}", f"https://{domain}/p", brand="Nike"
+        )
+        conn.execute(
+            "UPDATE products SET kind='shoes', brand_family='Nike' WHERE id = ?",
+            (product,),
+        )
+        variant = dbm.upsert_variant(conn, product, f"v-{domain}", size_norm="US10")
+        conn.execute(
+            """
+            INSERT INTO offers (variant_id, product_id, found_at, checked_at,
+                                price_usd, reference_usd, reference_source,
+                                discount_pct, saving_usd, score, all_time_low)
+            VALUES (?, ?, ?, ?, 100.0, 200.0, ?, 50.0, 100.0, 80, ?)
+            """,
+            (variant, product, ts(1), ts(0), source, all_time_low),
+        )
+
+    def test_the_shops_own_tag_is_not_shown(self, conn):
+        self._offer(conn, "tag.example", "tag")
+        self._offer(conn, "market.example", "market")
+        rows, total = dbm.offers_for(conn)
+        assert total == 1
+        assert rows[0]["reference_source"] == "market"
+
+    def test_an_all_time_low_counts_even_on_a_tag(self, conn):
+        """Our own record of the price is evidence the shop did not write."""
+        self._offer(conn, "low.example", "tag", all_time_low=1)
+        assert dbm.offers_for(conn)[1] == 1
+
+    def test_the_full_view_is_one_click_away(self, conn):
+        """Somebody hunting one particular thing wants the weak evidence too."""
+        self._offer(conn, "tag.example", "tag")
+        self._offer(conn, "market.example", "market")
+        assert dbm.offers_for(conn, all_discounts=True)[1] == 2
+
+    def test_the_counts_follow_what_the_page_will_show(self, conn):
+        self._offer(conn, "tag.example", "tag")
+        self._offer(conn, "market.example", "market")
+        assert dbm.shelf_facets(conn)["total"] == 1
+        assert dbm.shelf_facets(conn, all_discounts=True)["total"] == 2
+
+    def test_the_query_reads_the_switch(self):
+        assert web.read_query("")["all_discounts"] is False
+        assert web.read_query("all_discounts=1")["all_discounts"] is True
+        assert web.read_query("all_discounts=nonsense")["all_discounts"] is False

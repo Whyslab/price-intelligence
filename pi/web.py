@@ -145,6 +145,13 @@ def read_query(raw: str) -> dict:
         # this shelf is for — but it stays reachable, because a hidden
         # misclassification is one nobody can report.
         "kids": (query.get("kids", ["0"])[0] or "0").lower() in ("1", "true", "yes"),
+        # The shelf shows only discounts somebody other than the seller vouches
+        # for. 20,908 of the 26,013 cards it could draw rest on nothing but the
+        # shop's own struck-through price, and a page of those is a jumble sale
+        # whatever it is dressed in. Reachable, though: somebody hunting one
+        # particular thing wants the weak evidence too, labelled as weak.
+        "all_discounts": (query.get("all_discounts", ["0"])[0] or "0").lower()
+        in ("1", "true", "yes"),
         # Not a filter on the shelf but a different list entirely — see
         # db.favorites_for. Read here so a link to it can be sent to somebody.
         "favorites": (query.get("favorites", ["0"])[0] or "0").lower() in ("1", "true", "yes"),
@@ -337,6 +344,7 @@ def shelf_page(conn: sqlite3.Connection, args: dict) -> dict:
         max_price=args["max_price"],
         min_discount=args["min_discount"],
         kids=args["kids"],
+        all_discounts=args["all_discounts"],
     )
     return {
         "total": total,
@@ -441,7 +449,9 @@ def render_page(
 
     seed = json.dumps(
         {"seed": {
-            "facets": dbm.shelf_facets(conn, kids=args["kids"]),
+            "facets": dbm.shelf_facets(
+                conn, kids=args["kids"], all_discounts=args["all_discounts"]
+            ),
             "offers": shelf_page(conn, args),
             "me": user_id,
             "favorites": sorted(dbm.favorite_ids(conn, user_id)) if user_id else [],
@@ -659,7 +669,11 @@ class Handler(BaseHTTPRequestHandler):
                         self._json(SUBSCRIPTION_REQUIRED, 402)
                         return
                     self._json(
-                        dbm.shelf_facets(conn, kids=read_query(parsed.query)["kids"])
+                        dbm.shelf_facets(
+                            conn,
+                            kids=read_query(parsed.query)["kids"],
+                            all_discounts=read_query(parsed.query)["all_discounts"],
+                        )
                     )
                 return
             if parsed.path.startswith("/api/product/"):

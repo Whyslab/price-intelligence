@@ -223,7 +223,8 @@ tr.cheap td.p{color:var(--accent);font-weight:600}
         <span id="prange"></span>
       </div>
     </div>
-    <div class="group"><h3>Скидка не меньше</h3><div class="chips" id="f-disc"></div></div>
+    <div class="group"><h3>Скидка не меньше</h3><div class="chips" id="f-disc"></div>
+      <div class="chips" id="f-evidence"></div></div>
     <div class="group"><h3>Что</h3><div class="chips" id="f-kind"></div></div>
     <div class="group"><h3>Кому</h3><div class="chips" id="f-gender"></div>
       <div class="chips" id="f-kids"></div></div>
@@ -396,6 +397,7 @@ async function toggle_star(id, variant, button){
 
 const state = {kind:new Set(), gender:new Set(), size:new Set(), brand:new Set(),
                q:"", min_price:"", max_price:"", min_discount:"", kids:false,
+               all_discounts:false,
                sort:"score", page:0, view:"shelf"};
 let facets = null, expanded = {size:false, brand:false};
 // Кто смотрит. null — никто: страница открыта не из Telegram и без --owner,
@@ -418,6 +420,7 @@ function save(){
       kind:[...state.kind], gender:[...state.gender], size:[...state.size],
       brand:[...state.brand], min_price:state.min_price, max_price:state.max_price,
       min_discount:state.min_discount, kids:state.kids, sort:state.sort,
+      all_discounts:state.all_discounts,
     }));
   } catch {}
 }
@@ -430,6 +433,7 @@ function restore(){
     for (const k of ["min_price","max_price","min_discount","sort"])
       if (s[k] != null) state[k] = s[k];
     state.kids = Boolean(s.kids);
+    state.all_discounts = Boolean(s.all_discounts);
     return true;
   } catch { return false; }
 }
@@ -437,7 +441,8 @@ function restore(){
 function count_active(){
   return state.kind.size + state.gender.size + state.size.size + state.brand.size
        + (state.min_price ? 1 : 0) + (state.max_price ? 1 : 0)
-       + (state.min_discount ? 1 : 0) + (state.kids ? 1 : 0);
+       + (state.min_discount ? 1 : 0) + (state.kids ? 1 : 0)
+       + (state.all_discounts ? 1 : 0);
 }
 
 function toggle(name, value){
@@ -480,6 +485,25 @@ function discount_chips(){
 
 /* Детское скрыто по умолчанию: на полке его 447 из 33 738, и это не то, за чем
    сюда приходят. Но кнопка есть — иначе ошибку классификатора никто не увидит. */
+/* Полка показывает только те скидки, за которые ручается кто-то кроме продавца:
+   минимум за всё время наблюдения или цена в других магазинах на тот же артикул.
+   Из 26 013 карточек, которые она могла бы нарисовать, 20 908 держатся на одной
+   лишь зачёркнутой цене магазина — а это единственное число, которое магазин
+   пишет о себе сам, и ровно то, что пересказывает любой канал скидок.
+
+   Переключатель, а не запрет: тому, кто ищет конкретную вещь, слабое
+   свидетельство тоже нужно — помеченное как слабое. */
+function evidence_chip(){
+  const box = el("f-evidence");
+  box.innerHTML = "";
+  const b = document.createElement("button");
+  b.className = "chip"; b.type = "button";
+  b.setAttribute("aria-pressed", String(state.all_discounts));
+  b.textContent = "Все скидки, включая ценник магазина";
+  b.onclick = () => { state.all_discounts = !state.all_discounts; reload(); };
+  box.append(b);
+}
+
 function kids_chip(){
   const box = el("f-kids");
   box.innerHTML = "";
@@ -714,6 +738,7 @@ function reload(){
     chips("f-gender", "gender", facets.genders, v => GENDER_RU[v] || v, facets.mine?.genders);
     discount_chips();
     kids_chip();
+    evidence_chip();
   }
   draw_whole();
   save();
@@ -932,6 +957,7 @@ for (const [id, key] of [["pmin","min_price"], ["pmax","max_price"]]){
     chips("f-gender", "gender", facets.genders, v => GENDER_RU[v] || v, facets.mine?.genders);
     discount_chips();
     kids_chip();
+    evidence_chip();
     draw_whole();
     render(seed.offers, false);
     if (state.view === "fav") reload();
