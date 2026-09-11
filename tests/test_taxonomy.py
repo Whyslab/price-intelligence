@@ -311,3 +311,39 @@ class TestTheBrandTheShopWroteInTheTitle:
     def test_nothing_is_a_real_answer(self):
         assert taxonomy.brand_from_title("Some Unknown Thing", self.INDEX) == (None, None)
         assert taxonomy.brand_from_title(None, self.INDEX) == (None, None)
+
+
+class TestTheWaysAShopSaysWomensWithoutTheWord:
+    """Measured against the 18,083 shelf products the word-based rules leave
+    unlabelled: a trailing W reaches 90 of them and a named garment 318. Small —
+    about 2% — and clean, which is the only reason they are worth having."""
+
+    def test_the_trailing_w_is_the_womens_cut_of_a_model(self):
+        """adidas, Asics, On and Nike all write it this way."""
+        assert taxonomy.gender("Superstar II W") == "women"
+        assert taxonomy.gender("Gazelle Bold W") == "women"
+        assert taxonomy.gender("Gel-1090 W") == "women"
+
+    def test_a_lone_w_in_the_middle_is_not_read(self):
+        """There it is an initial or a size, not a cut."""
+        assert taxonomy.gender("W. Simmons Tee") is None
+        assert taxonomy.gender("Samba OG") is None
+
+    def test_a_named_garment_counts(self):
+        assert taxonomy.gender("Monogram Spaghetti Mini Dress") == "women"
+        assert taxonomy.gender("SANDALI ELEVATED ELEFTHERIA") == "women"
+        assert taxonomy.gender("BORSA FLECA NOBUCK") == "women"
+
+    def test_dress_as_a_colour_is_not_a_dress(self):
+        """The false class here was not "dress shirt", which does not occur in
+        these titles at all, but "Dress Blues" — a colour, on a DC sweatshirt."""
+        assert taxonomy.gender("DC Cooper 1/4 Zip Sweat - Dress Blues") is None
+        assert taxonomy.gender("Vans DNA Branding Sweatshirt - Dress Blues") is None
+
+    def test_dress_as_an_adjective_is_not_one_either(self):
+        assert taxonomy.gender("Brooks Brothers Dress Shirt") is None
+        assert taxonomy.gender("Leather Dress Shoes") is None
+
+    def test_the_word_still_wins_when_it_is_there(self):
+        assert taxonomy.gender("Nike Women's Air Footscape") == "women"
+        assert taxonomy.gender("Herren Jacke") == "men"

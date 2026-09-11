@@ -244,10 +244,37 @@ _MEN = re.compile(
     re.I,
 )
 
+# Two more ways a shop says "women's" without using the word. Measured against
+# the 18,083 shelf products the rules above leave unlabelled, so neither is a
+# guess about what shops might write:
+#
+#   trailing W          90   Superstar II W, Gazelle W, Samba OG W, Gel-1090 W
+#   garment named       318   Mini Dress, Sandali, Borsa, Stivali, Maxi Dress
+#
+# Together about 2% of what is unlabelled, which is small — the plan claimed
+# more — and clean, which is why they are here anyway.
+#
+# The trailing W is adidas, Asics, On and Nike writing the women's cut of a
+# model at the end of its name. It is only read at the end of the title or
+# before a bracket or a dash, never loose in the middle, where a lone W is an
+# initial or a size.
+_WOMEN_MODEL = re.compile(r"\bW\s*$|\bW\s*[-–—(\[]")
+# `dress` had one false class worth guarding and it was not the obvious one:
+# "dress shirt" and "dress shoes" do not occur among these titles at all, while
+# "Dress Blues" — a colour, on a DC sweatshirt and a Vans kids' one — does.
+_WOMEN_GARMENT = re.compile(
+    r"\bdress\b(?!\s+(?:blue|blues|shirt|shoes?|pants?|boots?|socks?|code))"
+    r"|\b(skirt|gown|vestido|kleid|robe|jupe|blouse|bodysuit|camisole|bralette"
+    r"|sandali|stivali|borsa|borse|decollete|d\u00e9collet\u00e9|bolso)\b",
+    re.I,
+)
+
 
 def gender(title: str | None, category: str | None = None) -> str | None:
     """'women', 'men', or None. None means the catalogue did not say."""
     haystack = f"{title or ''} {category or ''}"
+    if _WOMEN_MODEL.search(title or "") or _WOMEN_GARMENT.search(haystack):
+        return "women"
     if _WOMEN.search(haystack):
         return "women"
     if _MEN.search(haystack):
