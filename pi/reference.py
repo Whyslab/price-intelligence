@@ -70,6 +70,24 @@ _STYLE_CODE = re.compile(
     r"|[A-Z]?\d{5}[A-Z]"             # five-digit codes with a colour letter
     r")\b"
 )
+# Carhartt WIP writes the garment and its colour as two fields, and the shops
+# join them with whatever they please: `I036262 3AN0J`, `I031454.1ONXX`. Neither
+# half alone is the article — the code without the colour is a cut, and several
+# colours of the Mitch jacket are not one thing to compare prices between, which
+# is the invariant every pattern above keeps (`CW2288-111` carries its colourway
+# in the `-111`). So both halves are taken and the separator is dropped.
+#
+# Measured the way the list above was, by shared keys rather than by products:
+# style alone reaches 1,177 keys in two shops or more but merges colourways;
+# style with colour reaches 624, which is the same order as New Balance's 597
+# and keeps the invariant. Zero of them carry two different brands.
+#
+# The North Face was measured beside it and left out: `NF0A8CKG` in two shops or
+# more is 310 keys and merges colourways, while the full `NF0A8CKG0UZ1` keeps
+# them apart and reaches 132 — between the adidas shape that was rejected at 30
+# and the Asics one that was taken at 295, and not clearly worth the risk.
+_CARHARTT_CODE = re.compile(r"\bI0\d{5}[ .\-][A-Z0-9]{4,5}\b")
+_CODE_SEPARATOR = re.compile(r"[ .\-]")
 _NOT_ALNUM = re.compile(r"[^a-z0-9]+")
 # Colour and packaging notes that shops append to an otherwise identical title.
 _TITLE_NOISE = re.compile(
@@ -85,7 +103,15 @@ def style_codes(text: str | None) -> set[str]:
     """Every manufacturer article number visible in a SKU or a product title."""
     if not text:
         return set()
-    return {match.group(1) for match in _STYLE_CODE.finditer(text.upper())}
+    upper = text.upper()
+    codes = {match.group(1) for match in _STYLE_CODE.finditer(upper)}
+    # Normalised rather than taken as written, because the shops disagree only
+    # about the separator. See _CARHARTT_CODE.
+    codes |= {
+        _CODE_SEPARATOR.sub("", match.group(0))
+        for match in _CARHARTT_CODE.finditer(upper)
+    }
+    return codes
 
 
 def title_key(brand: str | None, title: str | None) -> str | None:

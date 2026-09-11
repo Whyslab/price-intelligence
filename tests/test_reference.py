@@ -394,3 +394,29 @@ class TestStoreTrust:
         almost entirely on sale."""
         store = self._catalogue(conn, "noise.example", 200, [0.4])
         assert reference.store_trust(conn)[store].tagged == 0
+
+
+class TestCarharttWritesItsArticleInTwoFields:
+    """`I036262 3AN0J` — the garment, then the colour, joined however the shop
+    pleases. Neither half alone is the article: the code without a colour would
+    merge every colourway of the same jacket, and comparing prices between those
+    is comparing different things."""
+
+    def test_both_halves_make_one_code(self):
+        assert reference.style_codes("I036262 3AN0J PALISANDER") == {"I0362623AN0J"}
+
+    def test_the_separator_does_not_matter(self):
+        """Shops write a space, a dot or a dash for the same article."""
+        assert (
+            reference.style_codes("I031454.1ONXX")
+            == reference.style_codes("I031454 1ONXX")
+            == reference.style_codes("I031454-1ONXX")
+        )
+
+    def test_a_bare_style_without_a_colour_is_not_a_code(self):
+        assert reference.style_codes("I036262") == set()
+
+    def test_the_shapes_already_recognised_are_untouched(self):
+        assert reference.style_codes("CW2288-111") == {"CW2288-111"}
+        assert reference.style_codes("IF4396") == {"IF4396"}
+        assert reference.style_codes("M990GL6") == {"M990GL6"}
