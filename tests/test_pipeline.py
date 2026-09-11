@@ -76,14 +76,30 @@ def _mock_rates():
 def _mock_product_pages(payload, domain="shop.example"):
     """Answer /products/<handle>.json the way a real Shopify shop does.
 
-    A run verifies the oldest cards on its own shelf by opening one product at
-    a time, so a fake shop that only serves its catalogue is no longer a
-    complete fake shop.
+    A run opens one product at a time twice over: to verify the oldest cards on
+    its own shelf, and to confirm a find with the shop before announcing it. A
+    fake shop that only serves its catalogue is not a complete fake shop.
+
+    Served from a box the caller may refill rather than a route per handle,
+    because respx keeps the first route registered for a url — so a test that
+    moves its prices has to move this too, and re-registering would silently
+    keep serving the old ones.
     """
+    box = {"payload": payload}
+
+    def answer_for(handle):
+        def answer(request):
+            for raw in box["payload"]["products"]:
+                if raw["handle"] == handle:
+                    return httpx.Response(200, json={"product": raw})
+            return httpx.Response(404)
+        return answer
+
     for raw in payload["products"]:
         respx.get(f"https://{domain}/products/{raw['handle']}.json").mock(
-            return_value=httpx.Response(200, json={"product": raw})
+            side_effect=answer_for(raw["handle"])
         )
+    return box
 
 
 def _mock_telegram():
@@ -112,6 +128,9 @@ async def test_a_discounted_shopify_catalogue_produces_a_photo_alert(config, sho
     respx.get("https://shop.example/products.json?limit=250").mock(
         return_value=httpx.Response(200, json=shopify_payload)
     )
+    # A find is confirmed with the shop before it is announced, so the run asks
+    # for each product's own page as well as the catalogue.
+    _mock_product_pages(shopify_payload)
 
     conn = dbm.connect(config.db_path)
     known_store(conn)
@@ -139,6 +158,9 @@ async def test_a_run_classifies_what_it_collected(config, shopify_payload):
     respx.get("https://shop.example/products.json?limit=250").mock(
         return_value=httpx.Response(200, json=shopify_payload)
     )
+    # A find is confirmed with the shop before it is announced, so the run asks
+    # for each product's own page as well as the catalogue.
+    _mock_product_pages(shopify_payload)
 
     conn = dbm.connect(config.db_path)
     known_store(conn)
@@ -160,6 +182,9 @@ async def test_a_sold_out_discount_is_never_announced(config, shopify_payload):
     respx.get("https://shop.example/products.json?limit=250").mock(
         return_value=httpx.Response(200, json=shopify_payload)
     )
+    # A find is confirmed with the shop before it is announced, so the run asks
+    # for each product's own page as well as the catalogue.
+    _mock_product_pages(shopify_payload)
 
     conn = dbm.connect(config.db_path)
     known_store(conn)
@@ -184,6 +209,9 @@ async def test_the_first_pass_over_a_new_store_is_a_baseline_not_news(config, sh
     respx.get("https://shop.example/products.json?limit=250").mock(
         return_value=httpx.Response(200, json=shopify_payload)
     )
+    # A find is confirmed with the shop before it is announced, so the run asks
+    # for each product's own page as well as the catalogue.
+    pages = _mock_product_pages(shopify_payload)
 
     conn = dbm.connect(config.db_path)
     dbm.upsert_store(conn, "shop.example", platform="shopify", currency="GBP")  # never collected
@@ -202,6 +230,9 @@ async def test_the_first_pass_over_a_new_store_is_a_baseline_not_news(config, sh
     respx.get("https://shop.example/products.json?limit=250").mock(
         return_value=httpx.Response(200, json=cheaper)
     )
+    # The per-product page has to move with the catalogue, or the confirmation
+    # before sending sees the old, higher price and rightly drops the find.
+    pages["payload"] = cheaper
 
     make_due(conn)
     second = await pipeline.run(config, conn)
@@ -216,6 +247,9 @@ async def test_prices_are_converted_from_the_shops_currency(config, shopify_payl
     respx.get("https://shop.example/products.json?limit=250").mock(
         return_value=httpx.Response(200, json=shopify_payload)
     )
+    # A find is confirmed with the shop before it is announced, so the run asks
+    # for each product's own page as well as the catalogue.
+    _mock_product_pages(shopify_payload)
 
     conn = dbm.connect(config.db_path)
     known_store(conn)
@@ -237,6 +271,9 @@ async def test_the_same_deal_is_not_sent_twice(config, shopify_payload):
     respx.get("https://shop.example/products.json?limit=250").mock(
         return_value=httpx.Response(200, json=shopify_payload)
     )
+    # A find is confirmed with the shop before it is announced, so the run asks
+    # for each product's own page as well as the catalogue.
+    _mock_product_pages(shopify_payload)
 
     conn = dbm.connect(config.db_path)
     known_store(conn)
@@ -265,6 +302,7 @@ async def test_one_product_discounted_in_many_sizes_is_announced_once(config, sh
     respx.get("https://shop.example/products.json?limit=250").mock(
         return_value=httpx.Response(200, json={"products": [product]})
     )
+    _mock_product_pages({"products": [product]})
 
     conn = dbm.connect(config.db_path)
     known_store(conn)
@@ -288,6 +326,9 @@ async def test_a_failed_send_is_not_recorded_as_sent(config, shopify_payload):
     respx.get("https://shop.example/products.json?limit=250").mock(
         return_value=httpx.Response(200, json=shopify_payload)
     )
+    # A find is confirmed with the shop before it is announced, so the run asks
+    # for each product's own page as well as the catalogue.
+    _mock_product_pages(shopify_payload)
 
     conn = dbm.connect(config.db_path)
     known_store(conn)
@@ -322,6 +363,9 @@ async def test_dry_run_sends_nothing(config, shopify_payload, capsys):
     respx.get("https://shop.example/products.json?limit=250").mock(
         return_value=httpx.Response(200, json=shopify_payload)
     )
+    # A find is confirmed with the shop before it is announced, so the run asks
+    # for each product's own page as well as the catalogue.
+    _mock_product_pages(shopify_payload)
 
     conn = dbm.connect(config.db_path)
     known_store(conn)
@@ -346,6 +390,9 @@ async def test_a_brand_you_did_not_name_still_reaches_you(config, shopify_payloa
     respx.get("https://shop.example/products.json?limit=250").mock(
         return_value=httpx.Response(200, json=shopify_payload)
     )
+    # A find is confirmed with the shop before it is announced, so the run asks
+    # for each product's own page as well as the catalogue.
+    _mock_product_pages(shopify_payload)
 
     config = Config(**{**config.__dict__, "filters": Filters(
         brands_allow=("no-such-brand",),
@@ -412,6 +459,9 @@ async def test_a_store_that_has_worked_before_is_always_retried(config, shopify_
     respx.get("https://shop.example/products.json?limit=250").mock(
         return_value=httpx.Response(200, json=shopify_payload)
     )
+    # A find is confirmed with the shop before it is announced, so the run asks
+    # for each product's own page as well as the catalogue.
+    _mock_product_pages(shopify_payload)
     conn = dbm.connect(config.db_path)
     known_store(conn, status="error", last_error="no product URLs in sitemap")
 
@@ -426,6 +476,9 @@ async def test_naming_a_store_explicitly_overrides_the_skip(config, shopify_payl
     respx.get("https://shop.example/products.json?limit=250").mock(
         return_value=httpx.Response(200, json=shopify_payload)
     )
+    # A find is confirmed with the shop before it is announced, so the run asks
+    # for each product's own page as well as the catalogue.
+    _mock_product_pages(shopify_payload)
     conn = dbm.connect(config.db_path)
     dbm.upsert_store(
         conn, "shop.example", platform="shopify", currency="GBP", status="error",
@@ -499,6 +552,9 @@ async def test_seeding_silences_the_backlog_of_standing_sales(config, shopify_pa
     respx.get("https://shop.example/products.json?limit=250").mock(
         return_value=httpx.Response(200, json=shopify_payload)
     )
+    # A find is confirmed with the shop before it is announced, so the run asks
+    # for each product's own page as well as the catalogue.
+    _mock_product_pages(shopify_payload)
 
     conn = dbm.connect(config.db_path)
     known_store(conn)
@@ -526,6 +582,7 @@ async def test_a_price_drop_after_seeding_is_still_announced(config, shopify_pay
     respx.get("https://shop.example/products.json?limit=250").mock(
         return_value=httpx.Response(200, json=shopify_payload)
     )
+    pages = _mock_product_pages(shopify_payload)
     conn = dbm.connect(config.db_path)
     known_store(conn)
     await pipeline.run(config, conn, collect_only=True)
@@ -539,6 +596,10 @@ async def test_a_price_drop_after_seeding_is_still_announced(config, shopify_pay
     respx.get("https://shop.example/products.json?limit=250").mock(
         return_value=httpx.Response(200, json=cheaper)
     )
+    # The product page has to move with the catalogue: a find is confirmed with
+    # the shop before it is announced, and a page still quoting the old, higher
+    # price is the sale being over as far as that check can tell.
+    pages["payload"] = cheaper
 
     make_due(conn)
     stats = await pipeline.run(config, conn)
@@ -1044,6 +1105,9 @@ async def test_a_run_leaves_what_is_on_offer_on_the_shelf(config, shopify_payloa
     respx.get("https://shop.example/products.json?limit=250").mock(
         return_value=httpx.Response(200, json=shopify_payload)
     )
+    # A find is confirmed with the shop before it is announced, so the run asks
+    # for each product's own page as well as the catalogue.
+    _mock_product_pages(shopify_payload)
     conn = dbm.connect(config.db_path)
     known_store(conn)
     await pipeline.run(config, conn)
@@ -1062,6 +1126,9 @@ async def test_an_offer_is_withdrawn_when_the_sale_ends(config, shopify_payload)
     respx.get("https://shop.example/products.json?limit=250").mock(
         return_value=httpx.Response(200, json=shopify_payload)
     )
+    # A find is confirmed with the shop before it is announced, so the run asks
+    # for each product's own page as well as the catalogue.
+    _mock_product_pages(shopify_payload)
     conn = dbm.connect(config.db_path)
     known_store(conn)
     await pipeline.run(config, conn)
@@ -1114,6 +1181,7 @@ class TestRecordingABlock:
         respx.get("https://shop.example/products.json?limit=250").mock(
             return_value=httpx.Response(200, json=shopify_payload)
         )
+        _mock_product_pages(shopify_payload)
         self._shut_out(monkeypatch)
 
         conn = dbm.connect(config.db_path)
@@ -1129,6 +1197,7 @@ class TestRecordingABlock:
         respx.get("https://shop.example/products.json?limit=250").mock(
             return_value=httpx.Response(200, json=shopify_payload)
         )
+        _mock_product_pages(shopify_payload)
         self._shut_out(monkeypatch)
 
         conn = dbm.connect(config.db_path)
@@ -1492,3 +1561,67 @@ class TestOpeningACardToSeeIfItIsStillThere:
         assert stats.verified > 0
         assert stats.alerts_sent > 0, "a drop found one card at a time still goes out"
         assert photo.called
+
+
+class TestAFindIsConfirmedWithTheShopBeforeItIsSent:
+    """The price in a find was read from a catalogue page, and between that read
+    and the message arriving the shop may have put it back up. Everything else
+    here is careful about whether a discount is real; this is about whether it
+    is still real, which is the part a reader checks first by clicking."""
+
+    @respx.mock
+    async def test_a_price_that_went_back_up_is_not_announced(
+        self, config, shopify_payload
+    ):
+        _mock_rates()
+        photo, text = _mock_telegram()
+        respx.get("https://shop.example/products.json?limit=250").mock(
+            return_value=httpx.Response(200, json=shopify_payload)
+        )
+        _mock_product_pages(shopify_payload)
+        conn = dbm.connect(config.db_path)
+        known_store(conn)
+        await pipeline.run(config, conn, collect_only=True)
+
+        cheaper = json.loads(json.dumps(shopify_payload))
+        for product in cheaper["products"]:
+            for variant in product["variants"]:
+                variant["available"] = True
+                variant["price"] = f"{float(variant['price']) / 3:.2f}"
+        respx.get("https://shop.example/products.json?limit=250").mock(
+            return_value=httpx.Response(200, json=cheaper)
+        )
+        # The catalogue says the sale is on; the product page says it is over.
+        # The page is the later word, and it is the one a reader would click to.
+        make_due(conn)
+        stats = await pipeline.run(config, conn)
+
+        assert stats.alerts_sent == 0
+        assert not photo.called and not text.called
+
+    @respx.mock
+    async def test_a_price_that_fell_further_still_goes(self, config, shopify_payload):
+        """Re-scoring it here would mean re-deciding, in the send path, what the
+        run already decided."""
+        _mock_rates()
+        _mock_telegram()
+        respx.get("https://shop.example/products.json?limit=250").mock(
+            return_value=httpx.Response(200, json=shopify_payload)
+        )
+        pages = _mock_product_pages(shopify_payload)
+        conn = dbm.connect(config.db_path)
+        known_store(conn)
+        await pipeline.run(config, conn, collect_only=True)
+
+        cheaper = json.loads(json.dumps(shopify_payload))
+        for product in cheaper["products"]:
+            for variant in product["variants"]:
+                variant["available"] = True
+                variant["price"] = f"{float(variant['price']) / 3:.2f}"
+        respx.get("https://shop.example/products.json?limit=250").mock(
+            return_value=httpx.Response(200, json=cheaper)
+        )
+        pages["payload"] = cheaper
+        make_due(conn)
+
+        assert (await pipeline.run(config, conn)).alerts_sent > 0

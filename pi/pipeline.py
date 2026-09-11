@@ -277,6 +277,20 @@ VERIFY_BUDGET = 60
 VERIFIABLE = ("shopify", "jsonld")
 
 
+async def _fetch_one(client, row, limiter):
+    """Ask one shop about one product, the way its platform allows.
+
+    Split out because two callers need it: `verify_offers`, which walks the
+    oldest cards, and the check that runs on a find before it is announced.
+    """
+    if row["platform"] == "shopify":
+        handle = (row["url"] or "").rstrip("/").rsplit("/", 1)[-1]
+        if not handle:
+            return "skipped", None
+        return await shopify.fetch_product(client, row["domain"], handle, limiter)
+    return await jsonld.fetch_product(client, row["url"])
+
+
 async def verify_offers(
     conn: sqlite3.Connection,
     client: httpx.AsyncClient,
@@ -301,15 +315,9 @@ async def verify_offers(
     rows = dbm.stale_offers(conn, limit, VERIFIABLE)
     report = {"checked": 0, "gone": 0, "unreachable": 0, "changed": []}
     for row in rows:
-        if row["platform"] == "shopify":
-            handle = (row["url"] or "").rstrip("/").rsplit("/", 1)[-1]
-            if not handle:
-                continue
-            status, product = await shopify.fetch_product(
-                client, row["domain"], handle, limiter
-            )
-        else:
-            status, product = await jsonld.fetch_product(client, row["url"])
+        status, product = await _fetch_one(client, row, limiter)
+        if status == "skipped":
+            continue
 
         if status == "unreachable":
             report["unreachable"] += 1
@@ -1205,6 +1213,17 @@ async def run(
             _finish_run(conn, run_id, stats)
             return stats
 
+        # Last gate before a message leaves: is this still true?
+        queues, confirmed = await confirm_before_announcing(
+            conn, client, rates, limiter, queues
+        )
+        if confirmed["checked"]:
+            log.info(
+                "confirmed %d find(s) with the shop · %d dropped (%d gone, %d unreachable)",
+                confirmed["checked"], confirmed["dropped"],
+                confirmed["gone"], confirmed["unreachable"],
+            )
+
         for reader, selected in queues:
             stats.alerts_sent += await _send_to(
                 conn, config, client, reader, selected, shipping, eur_usd,
@@ -1217,6 +1236,99 @@ async def run(
     # whether it was blocked, which is only known a few lines above this.
     await _warn_if_degraded(conn, config, dry_run=dry_run)
     return stats
+
+
+# How much higher than announced a price may come back and still be sent. A
+# shop rounding its own conversion moves a figure by a fraction of a percent;
+# anything past this is the sale being over.
+PRICE_TOLERANCE = 0.01
+
+
+async def confirm_before_announcing(
+    conn: sqlite3.Connection,
+    client: httpx.AsyncClient,
+    rates: dict,
+    limiter: RateLimiter | None,
+    queues: list[tuple[personal.Subscriber, list]],
+) -> tuple[list[tuple[personal.Subscriber, list]], dict]:
+    """Ask each shop about the finds about to be announced, and drop what moved.
+
+    The price in a find was read from a catalogue page, and between that read
+    and the message arriving the shop may have put it back up. Everything else
+    here is careful about whether a discount is real; this is about whether it
+    is still real, which is the part a reader checks first by clicking.
+
+    Affordable only because the curation upstream is strict: the bot has 1,373
+    offers it may ever interrupt somebody with and sends a handful a day, so
+    this is single-figure requests per run rather than thousands.
+
+    Asymmetric on purpose. A price that came back higher is the sale being over
+    and the find is dropped. A price that came back lower is the find being
+    truer than when it was scored, and it goes out unchanged — re-scoring it
+    here would mean re-deciding, in the send path, what the run already decided.
+
+    A shop that cannot be reached says nothing either way, and nothing either
+    way is not a confirmation. The find is held rather than sent; no alert is
+    recorded for it, so the next run considers it again.
+    """
+    wanted = sorted({deal.product_id for _, picked in queues for deal, _ in picked})
+    report = {"checked": 0, "dropped": 0, "gone": 0, "unreachable": 0}
+    if not wanted:
+        return queues, report
+
+    rows = {row["product_id"]: row for row in dbm.offers_to_confirm(conn, wanted, VERIFIABLE)}
+    verdict: dict[int, bool] = {}
+    for product_id in wanted:
+        row = rows.get(product_id)
+        if row is None:
+            # Not a platform that can be asked about one product — ASOS reads
+            # sale sections and has no per-product page. Nothing to confirm
+            # with, so nothing is claimed: the find goes as it stands.
+            verdict[product_id] = True
+            continue
+        status, product = await _fetch_one(client, row, limiter)
+        report["checked"] += 1
+        if status == "gone":
+            with dbm.transaction(conn):
+                dbm.mark_product_missing(conn, product_id, dbm.utcnow())
+            report["gone"] += 1
+            verdict[product_id] = False
+            continue
+        if status != "ok" or product is None:
+            report["unreachable"] += 1
+            verdict[product_id] = False
+            continue
+        with dbm.transaction(conn):
+            store_result(
+                conn,
+                row["store_id"],
+                FetchResult(
+                    domain=row["domain"], products=[product], currency=row["currency"]
+                ),
+                rates,
+            )
+            dbm.confirm_offer(conn, product_id, dbm.utcnow())
+        verdict[product_id] = True
+
+    kept: list[tuple[personal.Subscriber, list]] = []
+    for reader, picked in queues:
+        survivors = []
+        for deal, deal_row in picked:
+            if not verdict.get(deal.product_id, True):
+                report["dropped"] += 1
+                continue
+            now = dbm.latest_price_usd(conn, deal.variant_id)
+            if now is not None and now > deal.price_usd * (1 + PRICE_TOLERANCE):
+                log.info(
+                    "%s went from %.2f to %.2f before it could be sent",
+                    deal_row["title"][:48], deal.price_usd, now,
+                )
+                report["dropped"] += 1
+                continue
+            survivors.append((deal, deal_row))
+        if survivors:
+            kept.append((reader, survivors))
+    return kept, report
 
 
 async def _send_to(

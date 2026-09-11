@@ -823,6 +823,53 @@ def confirm_offer(conn: sqlite3.Connection, product_id: int, ts: str) -> None:
     conn.execute("UPDATE offers SET checked_at = ? WHERE product_id = ?", (ts, product_id))
 
 
+def latest_price_usd(conn: sqlite3.Connection, variant_id: int) -> float | None:
+    """The newest price recorded for one variant, or None if it has none."""
+    row = conn.execute(
+        """
+        SELECT price_usd FROM price_points
+         WHERE variant_id = ?
+         -- `rowid` breaks the tie, and there is one to break: a run that
+         -- collects a price and then confirms it before announcing writes both
+         -- points in the same second, and `ts DESC` alone may then answer with
+         -- the older of the two.
+         ORDER BY ts DESC, rowid DESC LIMIT 1
+        """,
+        (variant_id,),
+    ).fetchone()
+    return None if row is None else row[0]
+
+
+def offers_to_confirm(
+    conn: sqlite3.Connection, product_ids: Sequence[int], platforms: Sequence[str]
+) -> list[sqlite3.Row]:
+    """The same shape `stale_offers` returns, for named products.
+
+    What a notification is about has to be asked after the run has decided to
+    send it and before it arrives: the price it quotes was read from a catalogue
+    page that may be an hour old, and an hour is long enough for the shop to
+    have put it back up. Same columns as `stale_offers` so the one fetch path
+    serves both.
+    """
+    if not product_ids or not platforms:
+        return []
+    pids = ",".join("?" * len(product_ids))
+    marks = ",".join("?" * len(platforms))
+    return conn.execute(
+        f"""
+        SELECT p.id AS product_id, p.url, p.external_id, p.store_id,
+               s.domain, s.platform, s.currency,
+               MIN(o.checked_at) AS checked_at, MAX(o.score) AS score
+          FROM offers o
+          JOIN products p ON p.id = o.product_id
+          JOIN stores   s ON s.id = p.store_id
+         WHERE p.id IN ({pids}) AND s.platform IN ({marks})
+         GROUP BY p.id
+        """,
+        [*product_ids, *platforms],
+    ).fetchall()
+
+
 def stale_offers(conn: sqlite3.Connection, limit: int, platforms: Sequence[str]) -> list[sqlite3.Row]:
     """What is on the shelf and has gone longest without being looked at.
 
