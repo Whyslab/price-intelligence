@@ -319,6 +319,12 @@ async def fetch_product(
     return ("ok", parsed[0]) if parsed else ("gone", None)
 
 
+# The furthest `?page=` Shopify will answer, given the page size above: it caps
+# `page * limit` at 25,000 and returns HTTP 400 past it.
+SHOPIFY_PAGE_WINDOW = 25_000
+LAST_PAGE = SHOPIFY_PAGE_WINDOW // PAGE_SIZE
+
+
 async def fetch(
     client: httpx.AsyncClient,
     domain: str,
@@ -352,6 +358,14 @@ async def fetch(
     products: list[ScrapedProduct] = []
     seen_ids: set[str] = set()
     page_number = max(1, cursor)
+    # Shopify refuses `page * limit` beyond 25,000 — the 101st page of 250
+    # answers HTTP 400 "Page * Limit exceeds the 25000 limit" — and a cursor
+    # that walked into that wall used to stay there. Five shops stopped being
+    # read on 1-2 September and 9,535 of their cards aged on the shelf until
+    # somebody asked why a fifth of it was three weeks old. The catalogue is
+    # read in slices across runs; after the last slice it starts again.
+    if page_number > LAST_PAGE:
+        page_number = 1
     url = f"{base}/products.json?limit={PAGE_SIZE}"
     if page_number > 1:
         url += f"&page={page_number}"

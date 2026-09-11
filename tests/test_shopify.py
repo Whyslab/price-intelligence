@@ -519,3 +519,39 @@ class TestWhichOptionIsTheSize:
         variant = self._parse(None, "EU 42", "NERO")
         assert variant.size == "EU 42"
         assert variant.color == "NERO"
+
+
+class TestTheWallAtPageOneHundred:
+    """Shopify caps `page * limit` at 25,000, so the 101st page of 250 answers
+    HTTP 400 "Page * Limit exceeds the 25000 limit". A cursor that walked into
+    that wall used to stay there: five shops stopped being read on 1-2 September
+    and 9,535 of their cards aged on the shelf until somebody asked why a fifth
+    of it was three weeks old."""
+
+    def test_the_last_page_is_derived_from_the_page_size(self):
+        assert shopify.LAST_PAGE == 25_000 // shopify.PAGE_SIZE == 100
+
+    @respx.mock
+    async def test_a_cursor_past_the_wall_starts_the_catalogue_again(self):
+        """Not an error to report — the catalogue is read in slices across runs,
+        and after the last slice it begins again."""
+        first = respx.get(
+            f"https://shop.example/products.json?limit={shopify.PAGE_SIZE}"
+        ).mock(return_value=httpx.Response(200, json={"products": []}))
+
+        async with httpx.AsyncClient() as client:
+            result = await shopify.fetch(client, "shop.example", "USD", cursor=101)
+
+        assert first.called, "it asked for the first page, not the 101st"
+        assert result.error is None
+
+    @respx.mock
+    async def test_a_cursor_inside_the_window_is_honoured(self):
+        asked = respx.get(
+            f"https://shop.example/products.json?limit={shopify.PAGE_SIZE}&page=7"
+        ).mock(return_value=httpx.Response(200, json={"products": []}))
+
+        async with httpx.AsyncClient() as client:
+            await shopify.fetch(client, "shop.example", "USD", cursor=7)
+
+        assert asked.called
