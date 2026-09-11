@@ -59,6 +59,50 @@ class Filters:
     brands_deny: tuple[str, ...] = ()
     sizes: tuple[str, ...] = ()
 
+    # --- what is worth interrupting somebody for -------------------------
+    # These three are about the find, not about the reader, and they are the
+    # difference between a feed and a firehose. Measured on the live shelf:
+    # 28,307 of 33,277 standing offers — 85% — rest on nothing but the shop's
+    # own struck-through price, and a quarter of what the bot sent in a week
+    # carried no brand it could name.
+    #
+    # A discount is only announced when somebody other than the seller says the
+    # price used to be higher: an all-time low on this shop's own history, or a
+    # market price agreed by other shops stocking the same article. `tag` alone
+    # is the shop's word for it.
+    require_real_reference: bool = True
+    # Nothing with no recognisable brand and nothing whose type could not be
+    # read. Both are "we do not know what this is", and that is not a find.
+    require_brand: bool = True
+    require_kind: bool = True
+    # Which types count as clothing at all, when require_kind is on.
+    kinds_allowed: tuple[str, ...] = ("shoes", "clothing", "accessories")
+    # Whose clothes a notification may be about. Stricter than the shelf on
+    # purpose: the shelf is opened by somebody who chose to look and can glance
+    # past a miss, while a notification arrives uninvited and a wrong one costs
+    # more than a missed right one. The shelf therefore shows the 2,977 offers
+    # nobody labelled; the bot does not. Empty means no opinion.
+    notify_genders: tuple[str, ...] = ("men",)
+
+    def worth_interrupting(self, reference_source: str, all_time_low: bool,
+                           brand_family: str | None, kind: str | None,
+                           gender: str | None = None) -> bool:
+        """Whether this find may become a notification.
+
+        Asked of the find, never of the reader — the reader's own size and
+        brands are `wants_size` and `wants_brand`, and the shelf deliberately
+        drops those (see pipeline.shelf_config) while keeping these.
+        """
+        if self.require_real_reference and not (
+            all_time_low or reference_source in ("history", "market")
+        ):
+            return False
+        if self.require_brand and not (brand_family or "").strip():
+            return False
+        if self.require_kind and (kind or "") not in self.kinds_allowed:
+            return False
+        return not (self.notify_genders and gender not in self.notify_genders)
+
     def wants_brand(self, brand: str | None) -> bool:
         b = (brand or "").strip().lower()
         if self.brands_deny and any(d in b for d in self.brands_deny):
@@ -92,6 +136,19 @@ class Config:
     # Article numbers to be told about whatever the thresholds say. A missing
     # file simply means nothing is being watched, which is the usual case.
     watchlist_file: Path = ROOT / "data" / "watchlist.txt"
+    # Whether the product is being sold at all.
+    #
+    # Off for now, and deliberately a switch rather than a deletion: the whole
+    # subscription — Stars, renewal, grace, refunds, the paywall, the owner's
+    # panel — is built, tested and left in place. Selling it needs a real
+    # payment to prove the path end to end, and that is a decision about money,
+    # not about code, so until it is taken the shelf is simply open.
+    #
+    # With it off: no pitch, no buy buttons, no paywall, and every reader gets
+    # the full feed. Nothing about payment state is erased — `pi grant` and the
+    # owner's panel still report the truth, so turning it back on resumes
+    # rather than restarts. See docs/subscription.md.
+    subscription: bool = False
     # Where `pi web` can be reached from a phone, if anywhere. Unset by default
     # and the bot then simply has no button for it: the server binds to
     # localhost, and offering a link to a machine the reader is not sitting at
@@ -125,6 +182,9 @@ def load_filters(path: Path) -> Filters:
             data[key] = tuple(str(v).strip().lower() for v in data[key])
     if "sizes" in data:
         data["sizes"] = tuple(str(v).strip().upper() for v in data["sizes"])
+    for key in ("kinds_allowed", "notify_genders"):
+        if key in data:
+            data[key] = tuple(str(v).strip().lower() for v in data[key])
     return Filters(**data)
 
 
@@ -138,6 +198,9 @@ def load_config(env_file: Path | None = None) -> Config:
         bot_token=os.getenv("TELEGRAM_BOT_TOKEN") or None,
         chat_id=os.getenv("TELEGRAM_CHAT_ID") or None,
         web_url=(os.getenv("PI_WEB_URL") or "").strip().rstrip("/") or None,
+        # PI_SUBSCRIPTION=on turns selling back on. Anything else, including
+        # absent, leaves it off.
+        subscription=(os.getenv("PI_SUBSCRIPTION") or "").strip().lower() == "on",
         concurrency=int(os.getenv("PI_CONCURRENCY", "8")),
         shopify_rate=float(os.getenv("PI_SHOPIFY_RATE", "2.0")),
         shopify_host_rate=float(os.getenv("PI_SHOPIFY_HOST_RATE", "0.5")),

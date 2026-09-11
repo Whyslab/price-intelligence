@@ -237,6 +237,11 @@ _KIDS_CATEGORY = re.compile(
     re.I,
 )
 
+# "Big Boy" is deliberately not read as a size class either, though "Big Kids"
+# is. It was tried: on this catalogue every one of the 22 matches is Polar Skate
+# Co's adult jeans, whose model is called Big Boy. The rule would have hidden 22
+# adult products to catch none.
+#
 # Bare "GS" is deliberately not read as grade school. It would add 1,886
 # products, and it is a model code as often as a size class: "Nike Dunk Low GS"
 # is a child's shoe and "GS Air Paris Pocket T-Shirt" is not. Every shop that

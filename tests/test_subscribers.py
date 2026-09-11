@@ -30,6 +30,9 @@ def config(tmp_path) -> Config:
         shopify_host_rate=10_000.0,
         max_shopify_stores=0,
         log_level="WARNING",
+        # Selling is off by default (Config.subscription); these tests are
+        # about what happens when it is on, so they turn it on.
+        subscription=True,
         filters=Filters(min_discount_pct=30.0, min_saving_usd=40.0, min_score=50),
     )
 
@@ -311,12 +314,18 @@ class TestFollowingAProduct:
     """
 
     @staticmethod
-    def _scored(conn, score: int = 20, price: float = 97.0) -> list:
-        """One deal nobody would be interrupted with: 20 points, well under the bar."""
+    def _scored(conn, score: int = 20, price: float = 97.0, gender: str = "men") -> list:
+        """One deal nobody would be interrupted with: 20 points, well under the bar.
+
+        `gender` defaults to what this shop stocks. Only the starred-thing test
+        wants women's, and it says so — a women's product is not carried at all
+        (pi.db.offers_for, pipeline.arrange_for), so leaving it as the fixture
+        default made every other test here depend on a rule none of them is about.
+        """
         product = a_product(conn)
         conn.execute(
-            "UPDATE products SET gender = 'women', kind = 'shoes', brand_family = 'Salomon'"
-            " WHERE id = ?", (product,),
+            "UPDATE products SET gender = ?, kind = 'shoes', brand_family = 'Salomon'"
+            " WHERE id = ?", (gender, product),
         )
         row = conn.execute(
             """
@@ -341,8 +350,8 @@ class TestFollowingAProduct:
         )
 
     def test_a_starred_thing_arrives_below_every_bar(self, config, conn):
-        """20 points against a bar of 50, and a gender the reader did not ask for."""
-        scored = self._scored(conn, score=20)
+        """20 points against a bar of 50, and a gender this shop does not stock."""
+        scored = self._scored(conn, score=20, gender="women")
         product = scored[0][0].product_id
 
         arrived = pipeline.arrange_for(
@@ -354,7 +363,7 @@ class TestFollowingAProduct:
         assert len(arrived) == 1
 
     def test_the_same_thing_does_not_reach_somebody_who_did_not_star_it(self, config, conn):
-        scored = self._scored(conn, score=20)
+        scored = self._scored(conn, score=20, gender="women")
 
         assert pipeline.arrange_for(
             conn, scored, config, market=None, user_id=9,
@@ -418,12 +427,16 @@ class TestFollowingAProduct:
 
 
 class TestTheFeedIsWhatIsSold:
-    """A reader who has not paid hears from the digest, not from the run."""
+    """A reader who has not paid hears from the digest, not from the run.
+
+    Every call here passes `subscription=True`: selling is off by default
+    (Config.subscription), and with it off there is no paid/free line to test.
+    """
 
     def test_a_free_reader_with_a_full_profile_is_not_written_to(self, conn):
         dbm.upsert_bot_user(conn, 9, "99", "browsing", sizes="EU40", brands="Nike")
 
-        readers = personal.subscribers(conn, OWNER_CHAT, Filters())
+        readers = personal.subscribers(conn, OWNER_CHAT, Filters(), subscription=True)
 
         assert "99" not in [r.chat_id for r in readers], (
             "the feed is the thing being sold; a filled-in profile does not buy it"
@@ -433,20 +446,20 @@ class TestTheFeedIsWhatIsSold:
         dbm.upsert_bot_user(conn, 9, "99", "paying", sizes="EU40")
         dbm.grant(conn, 9, days=30)
 
-        assert "99" in [r.chat_id for r in personal.subscribers(conn, OWNER_CHAT, Filters())]
+        assert "99" in [r.chat_id for r in personal.subscribers(conn, OWNER_CHAT, Filters(), subscription=True)]
 
     def test_grace_keeps_the_feed_running(self, conn):
         dbm.upsert_bot_user(conn, 9, "99", "lapsing", sizes="EU40")
         dbm.grant(conn, 9, days=30)
         conn.execute("UPDATE bot_users SET paid_until = ? WHERE id = 9", (ts(1),))
 
-        assert "99" in [r.chat_id for r in personal.subscribers(conn, OWNER_CHAT, Filters())], (
+        assert "99" in [r.chat_id for r in personal.subscribers(conn, OWNER_CHAT, Filters(), subscription=True)], (
             "a failed renewal should cost a reminder, not the product"
         )
 
     def test_the_owner_never_has_to_pay(self, conn):
         dbm.upsert_bot_user(conn, 7, OWNER_CHAT, "owner", sizes="EU44")
 
-        readers = personal.subscribers(conn, OWNER_CHAT, Filters())
+        readers = personal.subscribers(conn, OWNER_CHAT, Filters(), subscription=True)
 
         assert [r.chat_id for r in readers] == [OWNER_CHAT]

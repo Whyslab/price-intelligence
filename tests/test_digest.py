@@ -147,6 +147,8 @@ def test_readers_are_the_ones_not_paying(conn):
     conn.execute("UPDATE bot_users SET paid_until = ? WHERE id = 3", (ts(1),))  # grace
     conn.execute("UPDATE bot_users SET active = 0 WHERE id = 4")
 
-    audience = [row["id"] for row in digest.readers(conn)]
+    # Selling is off by default; the digest only has an audience when there
+    # is something the audience has not bought.
+    audience = [row["id"] for row in digest.readers(conn, subscription=True)]
     # 2 pays and gets the real feed; 3 is in grace and still gets it; 4 left.
     assert audience == [1]

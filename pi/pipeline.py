@@ -685,6 +685,19 @@ def score_variants(
     return scored
 
 
+def _col(row, name: str):
+    """One column, or None when this row simply does not carry it.
+
+    Rows reach `arrange_for` from two queries and from tests that build their
+    own, and not all of them select every column. A missing one means "nothing
+    is claimed", which is the same answer as NULL and must not be a crash.
+    """
+    try:
+        return row[name]
+    except (IndexError, KeyError):
+        return None
+
+
 def arrange_for(
     conn: sqlite3.Connection,
     scored: list[tuple[dealm.Deal, sqlite3.Row]],
@@ -732,6 +745,7 @@ def arrange_for(
         # statement of intent than any classifier's reading of a title.
         if not kids and row["audience"] == "kids" and not follows:
             continue
+
         if deal.watched != follows:
             deal = replace(deal, watched=follows)
         # One notification per product: the same hoodie discounted in six sizes
@@ -1116,7 +1130,9 @@ async def run(
         # rather than cutting it: a shoe in somebody else's size still arrives
         # when it is properly cheap, and a brand nobody named still arrives at
         # all — a hard list fails exactly on what is not in it.
-        readers = personal.subscribers(conn, config.chat_id, config.filters)
+        readers = personal.subscribers(
+            conn, config.chat_id, config.filters, config.subscription
+        )
         shipping = landed.load_rules()
         eur = rates.to_usd(1.0, "EUR")
         eur_usd = eur[0] if eur else None
@@ -1137,6 +1153,10 @@ async def run(
                 rank=personal.ranker(
                     reader.reader, config.filters.min_score, shipping, eur_usd,
                     following=followed.get(reader.user_id, set()),
+                    # The real filters, not shelf_config's: what reaches a
+                    # notification is judged harder than what sits on a page
+                    # somebody chose to open.
+                    filters=config.filters,
                 ),
                 watched=mine,
             )

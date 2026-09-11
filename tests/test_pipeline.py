@@ -35,7 +35,16 @@ def config(tmp_path) -> Config:
         shopify_host_rate=10_000.0,
         max_shopify_stores=0,      # no slicing unless a test asks for it
         log_level="WARNING",
-        filters=Filters(min_discount_pct=30.0, min_saving_usd=40.0, min_score=50),
+        # These tests are about the run — collecting, scoring, capping, seeding,
+        # writing the shelf — and their fixtures quote prices nobody has seen
+        # move, so every find in them rests on the shop's own tag. Curation is
+        # switched off here and tested on its own in test_personal.py, rather
+        # than silently suppressing every alert these assertions are about.
+        filters=Filters(
+            min_discount_pct=30.0, min_saving_usd=40.0, min_score=50,
+            require_real_reference=False, require_brand=False, require_kind=False,
+            notify_genders=(),
+        ),
     )
 
 
@@ -338,7 +347,13 @@ async def test_a_brand_you_did_not_name_still_reaches_you(config, shopify_payloa
         return_value=httpx.Response(200, json=shopify_payload)
     )
 
-    config = Config(**{**config.__dict__, "filters": Filters(brands_allow=("no-such-brand",))})
+    config = Config(**{**config.__dict__, "filters": Filters(
+        brands_allow=("no-such-brand",),
+        # As in the fixture: this is about the allow-list, and the payload's
+        # prices are ones nobody has watched move.
+        require_real_reference=False, require_brand=False, require_kind=False,
+            notify_genders=(),
+    )})
     conn = dbm.connect(config.db_path)
     known_store(conn)
     stats = await pipeline.run(config, conn)
