@@ -374,7 +374,8 @@ def build_market_index(conn: sqlite3.Connection) -> MarketIndex:
                p.store_id   AS store_id,
                v.product_id AS product_id,
                MIN(latest.price_usd)      AS price_usd,
-               MAX(latest.compare_at_usd) AS compare_at_usd
+               MAX(latest.compare_at_usd) AS compare_at_usd,
+               MIN(LOWER(TRIM(COALESCE(p.brand_family, p.brand_norm, '')))) AS brand
         FROM (
             SELECT variant_id, price_usd, compare_at_usd
             FROM (
@@ -394,6 +395,31 @@ def build_market_index(conn: sqlite3.Connection) -> MarketIndex:
 
     by_key: dict[tuple[str, str], dict[str, tuple[float, float | None]]] = defaultdict(dict)
     keys_by_product: dict[int, set[tuple[str, str]]] = defaultdict(set)
+    # A key that two shops attach to two different brands is not an article
+    # number, whatever it looks like. `\d{6}-\d{2}` was taken for Puma and also
+    # matches a shop's own id with a European size on the end, so `103134-40`
+    # put a Hey Dude and a Nike in one group. Measured, 733 of the 18,617 style
+    # keys linking two shops do this.
+    #
+    # The whole key goes rather than the odd row: what the market charges is a
+    # median, and a $30 cap among $200 sneakers does not merely add a wrong
+    # price — it moves the number every other offer in the group is judged
+    # against, and invents a discount below a market price that never existed.
+    # `MAX_SPREAD` catches the extreme version of this and nothing milder.
+    #
+    # Silence is not disagreement: 78% of the catalogue names no brand, and a
+    # key is only dropped when two rows both name one and the names differ.
+    conflicted = {
+        (key_type, key)
+        for key_type, key in conn.execute(
+            """
+            SELECT key_type, key FROM pi_market
+             WHERE brand <> ''
+             GROUP BY key_type, key
+            HAVING COUNT(DISTINCT brand) > 1
+            """
+        )
+    }
     rows = conn.execute(
         """
         SELECT m.key_type, m.key, m.product_id, m.price_usd, m.compare_at_usd, s.domain
@@ -406,6 +432,8 @@ def build_market_index(conn: sqlite3.Connection) -> MarketIndex:
     )
     for key_type, key, product_id, price_usd, compare_at_usd, domain in rows:
         key = (key_type, key)
+        if key in conflicted:
+            continue
         shop = same_shop(domain)
         known = by_key[key].get(shop)
         if known is None or price_usd < known[0]:

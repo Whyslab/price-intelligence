@@ -149,10 +149,75 @@ def canonical_brand(
     brand column is how the field got useless in the first place.
     """
     key = _ALIAS.get(fold(vendor), fold(vendor))
-    if not key or key not in index:
+    if not key or key in _NOT_A_BRAND or key not in index:
         return None, None
     canonical = index[key]
     return canonical, _FAMILY.get(key, canonical)
+
+
+# Vendor strings that are a condition, not a maker. Only one has ever earned a
+# place here: 238 products are sold with the vendor field set to "Vintage", and
+# enough shops do it that the index promotes it to a brand — which then reads
+# "Vintage Balmain Paris Wool Blazer" as a Vintage rather than a Balmain.
+_NOT_A_BRAND = {"vintage"}
+
+# Words a shop puts before the brand. Tried only when nothing matched at the
+# front at all, so "New Balance" is found before "new" is ever treated as noise.
+_LEADING_NOISE = {
+    "vintage", "pre", "owned", "preowned", "used", "deadstock", "ds", "vnds",
+    "nwt", "nwot", "rare", "authentic", "original", "sale", "restock",
+}
+
+# How many leading words of a title may be a brand name. Four covers "Stepney
+# Workers Club" and "A Bathing Ape" and stops well short of swallowing the
+# product.
+_BRAND_WORDS = 4
+
+
+def brand_from_title(
+    title: str | None, index: dict[str, str]
+) -> tuple[str | None, str | None]:
+    """The brand a shop put at the front of the title, when it named none.
+
+    `canonical_brand` reads the vendor field and nothing else, which is right
+    when the shop fills it in. 166,948 products in this catalogue have no brand
+    at all, and 10,151 of them are standing on the shelf right now — dropped by
+    `require_brand` before they can become a find, and invisible to the check
+    that refuses to call two products the same article when their brands differ.
+
+    Measured: 50,950 of those titles name a brand somewhere, but 7,260 name two
+    — a collaboration, where the second name is not the maker — so "anywhere in
+    the title" reads a Nike x Sacai as either. At the **front** it is 38,464,
+    and the front is where every shop that bothers puts it.
+
+    Matched a word at a time rather than on the folded string, because folding
+    drops spaces and `nikelodeon` would then start with `nike`. The longest
+    match wins: "The North" is not a brand and "The North Face" is.
+    """
+    if not title:
+        return None, None
+
+    def longest(words: list[str]) -> tuple[str | None, str | None]:
+        for take in range(min(_BRAND_WORDS, len(words)), 0, -1):
+            brand, family = canonical_brand(" ".join(words[:take]), index)
+            if brand and fold(brand) not in _NOT_A_BRAND:
+                return brand, family
+        return None, None
+
+    words = title.split()
+    brand, family = longest(words)
+    if brand:
+        return brand, family
+    # Nothing at the very front. Step over the words shops put before a brand —
+    # "PRE OWNED adidas Yeezy", "Vintage Balmain Paris" — and no further.
+    dropped = 0
+    while words and dropped < 3 and fold(words[0]) in _LEADING_NOISE:
+        words = words[1:]
+        dropped += 1
+        brand, family = longest(words)
+        if brand:
+            return brand, family
+    return None, None
 
 
 # --- gender -----------------------------------------------------------------
@@ -488,9 +553,14 @@ def classify(
     stated: dict[int, str] = {}
     updates: list[tuple] = []
     stats = {"products": len(rows), "brands": len(index), "brand": 0, "kind": 0,
-             "kids": 0}
+             "kids": 0, "brand_from_title": 0}
     for row in rows:
         brand, family = canonical_brand(row["brand"], index)
+        if not brand:
+            # The vendor field said nothing; the title often does.
+            brand, family = brand_from_title(row["title"], index)
+            if brand:
+                stats["brand_from_title"] += 1
         who = gender(row["title"], row["category"])
         what = kind(row["title"], row["category"], (row["sizes"] or "").split("|"))
         for_whom = audience(row["title"], row["category"])

@@ -1651,17 +1651,42 @@ def _one_row_per_merchant(
     return sorted(best.values(), key=lambda row: row["price_usd"])
 
 
+# Two rows may share a key and still be different things, and the shapes that
+# invite it are the loose ones: `\d{6}-\d{2}` was taken for Puma and also
+# matches a shop's own id with a European size stuck on the end, so `103134-40`
+# claimed a Hey Dude and a Nike are the same article. Measured across the
+# catalogue, 733 of the 18,617 style keys that link two shops — 3.9% — join
+# products whose brands are both known and different. One of them offered a
+# $30 Jordan cap as the cheaper version of a $200 adidas Yeezy.
+#
+# Dropping the pattern is the wrong cure: 998 of its 1,185 cross-shop keys are
+# right. The brands are the cure. A disagreement is only believed when both
+# sides actually name a brand — 78% of the catalogue names none, and silence is
+# not a contradiction.
+#
+# This matters beyond the product card. `build_market_index` groups by the same
+# keys to decide what the market charges, so a cap in a group of sneakers drags
+# the median down and invents a discount below a market price that never
+# existed — under `require_real_reference` that invention is now trusted.
+_BRANDS_AGREE = """
+    (   me.brand_family IS NULL OR TRIM(me.brand_family) = ''
+     OR other.brand_family IS NULL OR TRIM(other.brand_family) = ''
+     OR LOWER(me.brand_family) = LOWER(other.brand_family))
+"""
+
+
 def _sibling_product_ids(conn: sqlite3.Connection, product_id: int) -> list[int]:
     """Products other rows describe as the same article as this one.
 
     Keys carried by an implausible number of products are dropped rather than
     followed: a shop that writes its brand into the SKU field turns `DIME` into
-    a claim about 413 unrelated products.
+    a claim about 413 unrelated products. And a key is not followed across two
+    products that name different brands — see `_BRANDS_AGREE`.
     """
     return [
         row[0]
         for row in conn.execute(
-            """
+            f"""
             WITH mine AS (
                 SELECT key_type, key FROM product_keys WHERE product_id = :pid
             ),
@@ -1675,7 +1700,10 @@ def _sibling_product_ids(conn: sqlite3.Connection, product_id: int) -> list[int]
             SELECT DISTINCT pk.product_id
               FROM product_keys pk
               JOIN usable u ON u.key_type = pk.key_type AND u.key = pk.key
+              JOIN products other ON other.id = pk.product_id
+              JOIN products me    ON me.id = :pid
              WHERE pk.product_id <> :pid
+               AND {_BRANDS_AGREE}
             """,
             {"pid": product_id, "fanout": MAX_KEY_FANOUT},
         ).fetchall()
