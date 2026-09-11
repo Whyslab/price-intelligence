@@ -136,17 +136,22 @@ def unrecord(conn: sqlite3.Connection, row: sqlite3.Row) -> None:
     )
 
 
-def readers(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+def readers(conn: sqlite3.Connection, subscription: bool = False) -> list[sqlite3.Row]:
     """Everyone the digest is for: reachable, and not paying for the real feed.
 
     A reader inside the grace period is deliberately excluded. Their feed is
     still running — that is what grace is — and adding the advertisement for
     the thing they already have would read as a demotion rather than an offer.
+
+    With `subscription` off the list is empty on purpose. The digest is the
+    product advertising itself to people who do not have it; when nothing is
+    being sold, everybody already has it and there is nobody to advertise to.
+    See Config.subscription and docs/subscription.md.
     """
     rows = conn.execute(
         "SELECT * FROM bot_users WHERE active = 1 ORDER BY id"
     ).fetchall()
     return [
         row for row in rows
-        if dbm.subscription_state(conn, row["id"]) == "free"
+        if subscription and dbm.subscription_state(conn, row["id"]) == "free"
     ]

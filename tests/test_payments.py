@@ -18,6 +18,9 @@ def _config(tmp_path: Path) -> Config:
         bot_token="123:AA", chat_id="42", concurrency=1,
         shopify_rate=1.0, shopify_host_rate=1.0, max_shopify_stores=1,
         log_level="INFO", filters=Filters(),
+        # Selling is off by default (Config.subscription); this whole file is
+        # about what happens when it is on, so it turns it on.
+        subscription=True,
     )
 
 
@@ -381,7 +384,9 @@ class TestTheOwnersPanel:
     @pytest.mark.asyncio
     async def test_the_owner_gets_the_panel(self, owner, calls, conn):
         dbm.upsert_bot_user(conn, 8, "8")
-        dbm.grant(conn, 8, days=30)
+        # With stars, because `is_comped` asks the money and not the date: a
+        # grant of days alone is a comp, and the panel counts those apart.
+        dbm.grant(conn, 8, days=30, stars=150)
 
         await owner.handle(_dm("/admin"))
 
@@ -633,3 +638,43 @@ class TestCompsAreNotCustomers:
 
         assert "бессрочно" in listed
         assert "2076" not in listed
+
+
+def _config_off(tmp_path: Path) -> Config:
+    return Config(**{**_config(tmp_path).__dict__, "subscription": False})
+
+
+@pytest.fixture
+def robot_off(conn, tmp_path, calls, monkeypatch):
+    """The bot as it ships today: nothing for sale."""
+    instance = bot.Bot(_config_off(tmp_path), conn)
+
+    async def record(method, payload):
+        calls.append((method, payload))
+        return {"username": "test"}
+
+    monkeypatch.setattr(instance, "_call", record)
+    return instance
+
+
+class TestWithNothingBeingSold:
+    """Switched off, not removed. Everything above still applies when it is on."""
+
+    @pytest.mark.asyncio
+    async def test_subscription_says_plainly_that_there_is_none(self, robot_off, calls):
+        await robot_off.handle(_message("/subscription"))
+        text = calls[0][1]["text"]
+        assert "Подписки сейчас нет" in text
+        assert "Что даёт подписка" not in text
+
+    @pytest.mark.asyncio
+    async def test_a_stale_buy_button_opens_no_invoice(self, robot_off, calls):
+        """A keyboard from before the switch must not charge anybody."""
+        await robot_off.handle(_press("buy:month"))
+        assert "createInvoiceLink" not in [method for method, _ in calls]
+
+    @pytest.mark.asyncio
+    async def test_the_menu_does_not_offer_it(self, robot_off, calls):
+        await robot_off.handle(_message("/settings"))
+        buttons = str(calls[-1][1].get("reply_markup", ""))
+        assert "pitch" not in buttons

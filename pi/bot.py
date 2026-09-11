@@ -616,12 +616,26 @@ class Bot:
     # -- state --
 
     @staticmethod
-    def _is_private(sender: dict, chat_id: str) -> bool:
-        """Whether this is a one-to-one chat. Telegram gives a person's private
-        chat the same id as the person."""
-        return str(chat_id) == str(sender.get("id"))
+    def _is_private(chat: dict, sender: dict | None = None) -> bool:
+        """Whether this is a one-to-one chat.
 
-    def _user(self, sender: dict, chat_id: str) -> sqlite3.Row:
+        Asked of `chat.type`, which Telegram states, rather than inferred from
+        the chat id matching the sender's. The inference holds today — group ids
+        are negative and Telegram substitutes a positive fake sender for
+        anonymous admins and channel posts rather than leaking the chat id into
+        `from` — but it is an invariant nobody promised, and it would break
+        quietly the first time `allowed_updates` grew a new shape.
+
+        The id comparison stays as a fallback for the callback path, where the
+        message Telegram attaches to a query is not guaranteed to carry a type.
+        Both fail closed.
+        """
+        kind = chat.get("type")
+        if kind:
+            return kind == "private"
+        return sender is not None and str(chat.get("id")) == str(sender.get("id"))
+
+    def _user(self, sender: dict, chat: dict) -> sqlite3.Row:
         """The reader behind this update, with their feed still pointed at them.
 
         The stored chat id is only ever their private one. It used to be
@@ -629,12 +643,16 @@ class Bot:
         group moved their own hourly notifications into that group until they
         next wrote to the bot directly — and a group is exactly where somebody
         would type /admin without thinking.
+
+        The whole chat is taken rather than its id, because `_is_private` asks
+        Telegram's own `chat.type` and only falls back to comparing ids. An id
+        alone cannot answer the first question at all.
         """
-        private = self._is_private(sender, chat_id)
+        private = self._is_private(chat, sender)
         return dbm.upsert_bot_user(
             self.conn,
             sender["id"],
-            str(chat_id) if private else str(sender["id"]),
+            str(chat.get("id")) if private else str(sender["id"]),
             sender.get("username"),
         )
 
@@ -796,7 +814,7 @@ class Bot:
 
     # -- the owner's panel --
 
-    def _may_admin(self, user: sqlite3.Row, chat_id: str) -> bool:
+    def _may_admin(self, user: sqlite3.Row, chat: dict) -> bool:
         """Both halves: the right person, and a chat only they can read.
 
         `is_owner` authenticates the sender; the reply goes to the chat. In a
@@ -804,7 +822,7 @@ class Bot:
         panel lists every reader's id, username, paid-to date and stars, and
         answering it into a group publishes all of that to everybody in it.
         """
-        return self.is_owner(user) and self._is_private({"id": user["id"]}, chat_id)
+        return self.is_owner(user) and self._is_private(chat, {"id": user["id"]})
 
     def is_owner(self, user: sqlite3.Row) -> bool:
         """Whether this is the person who runs the collector.
@@ -817,11 +835,12 @@ class Bot:
         """
         return bool(self.config.chat_id) and str(user["id"]) == str(self.config.chat_id)
 
-    async def show_admin(self, chat_id: str, user: sqlite3.Row) -> None:
-        if self.is_owner(user) and not self._may_admin(user, chat_id):
+    async def show_admin(self, chat: dict, user: sqlite3.Row) -> None:
+        chat_id = str(chat["id"])
+        if self.is_owner(user) and not self._may_admin(user, chat):
             await self.send(chat_id, "Панель открывается только в личном чате.")
             return
-        if not self._may_admin(user, chat_id):
+        if not self._may_admin(user, chat):
             # Not "you may not": nothing says the command exists. Somebody
             # guessing at /admin learns only that the bot did not understand.
             await self.send(chat_id, "Не понял. Пришлите артикул или название.")
@@ -830,8 +849,9 @@ class Bot:
             chat_id, admin_panel(self.conn, self.config.web_url), admin_keyboard()
         )
 
-    async def admin_action(self, chat_id: str, user: sqlite3.Row, action: str) -> None:
-        if not self._may_admin(user, chat_id):
+    async def admin_action(self, chat: dict, user: sqlite3.Row, action: str) -> None:
+        chat_id = str(chat["id"])
+        if not self._may_admin(user, chat):
             return
         if action == "readers":
             await self.send(
@@ -872,7 +892,7 @@ class Bot:
                 chat_id, admin_panel(self.conn, self.config.web_url), admin_keyboard()
             )
 
-    async def admin_input(self, chat_id: str, user: sqlite3.Row, step: str, text: str):
+    async def admin_input(self, chat: dict, user: sqlite3.Row, step: str, text: str):
         """The id typed after "grant" or "revoke" was pressed.
 
         Asks who this is, rather than trusting that only `admin_action` could
@@ -881,7 +901,8 @@ class Bot:
         from comping themselves. The column is fixed, and this check is what
         makes that fix not the only thing holding.
         """
-        if not self._may_admin(user, chat_id):
+        chat_id = str(chat["id"])
+        if not self._may_admin(user, chat):
             self._save(user["id"], wizard_step=None)
             return
         self._save(user["id"], wizard_step=None)
@@ -978,6 +999,14 @@ class Bot:
 
     async def show_subscription(self, chat_id: str, user: sqlite3.Row) -> None:
         """What this reader has, in the plainest words available."""
+        if not self.config.subscription:
+            await self.send(
+                chat_id,
+                "Подписки сейчас нет — всё открыто для всех.\n\n"
+                "Лента находок, витрина, поиск по артикулу и избранное работают "
+                "без оплаты. Когда подписка появится, бот скажет об этом сам.",
+            )
+            return
         state = dbm.subscription_state(self.conn, user["id"])
         if state == "free":
             await self.send(chat_id, subscription_pitch(self.conn), subscription_keyboard())
@@ -1113,7 +1142,11 @@ class Bot:
             "⚙️ <b>Что показывать</b>\n\n" + describe_profile(user),
             menu_keyboard(
                 user, self.config.web_url,
-                subscribed=dbm.subscription_state(self.conn, user["id"]) != "free",
+                # Not sold means not offered: no button, no nagging.
+                subscribed=(
+                    not self.config.subscription
+                    or dbm.subscription_state(self.conn, user["id"]) != "free"
+                ),
                 owner=self.is_owner(user),
             ),
         )
@@ -1165,7 +1198,7 @@ class Bot:
         sender = message.get("from") or {}
         if not sender:
             return
-        user = self._user(sender, chat_id)
+        user = self._user(sender, message["chat"])
         text = (message.get("text") or "").strip()
 
         # Before anything is read as a command: a payment arrives as a message
@@ -1182,7 +1215,7 @@ class Bot:
             await self.cancel_subscription(chat_id, user)
             return
         if text.startswith("/admin"):
-            await self.show_admin(chat_id, user)
+            await self.show_admin(message["chat"], user)
             return
         if text.startswith("/terms"):
             await self.send(chat_id, TERMS)
@@ -1220,7 +1253,7 @@ class Bot:
 
         step = user["wizard_step"]
         if step in ("admin_grant", "admin_revoke"):
-            await self.admin_input(chat_id, user, step, text)
+            await self.admin_input(message["chat"], user, step, text)
             return
         if step in ("sizes", "brands"):
             value = self._clean(step, text)
@@ -1256,14 +1289,20 @@ class Bot:
         sender = query.get("from") or {}
         if not chat_id or not sender:
             return
-        user = self._user(sender, chat_id)
+        user = self._user(sender, message.get("chat") or {})
         # Always answer, or the button spins on the sender's phone until it times out.
         await self._call("answerCallbackQuery", {"callback_query_id": query["id"]})
 
         if data == "wizard":
             await self.ask(chat_id, user, "genders", wizard=True)
         elif data.startswith("adm:"):
-            await self.admin_action(chat_id, user, data[4:])
+            await self.admin_action(message.get("chat") or {}, user, data[4:])
+        elif data in ("pitch",) and not self.config.subscription:
+            await self.show_subscription(chat_id, user)
+        elif data.startswith("buy:") and not self.config.subscription:
+            # A stale keyboard from before the switch was thrown must not open
+            # an invoice for something that is not for sale.
+            await self.show_subscription(chat_id, user)
         elif data.startswith("buy:"):
             await self.send_invoice(chat_id, data[4:])
         elif data == "pitch":
