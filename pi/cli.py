@@ -202,6 +202,7 @@ def cmd_web(args, config: Config) -> int:
         # matches nobody — locking the owner out of their own shelf with nothing
         # anywhere saying why.
         exempt_id=int(config.chat_id) if (config.chat_id or "").isdigit() else None,
+        subscription=config.subscription,
     )
     return 0
 
@@ -273,6 +274,12 @@ def cmd_find(args, config: Config) -> int:
         watched=pipeline.watched_products(conn, pipeline.read_watchlist(config.watchlist_file)),
         kids=args.kids,
     )
+    # The shop's own boundary, drawn here rather than inside `arrange_for`:
+    # that function also writes the shelf (pipeline.py, `on_offer`), and a row
+    # never written cannot be revealed by asking. So women's stay in the table
+    # and out of the answer — the same split the page makes.
+    if not args.women:
+        found = [pair for pair in found if pair[1]["gender"] != "women"]
     if args.shop:
         wanted = same_host(args.shop.strip().lower())
         found = [pair for pair in found if same_host(pair[1]["domain"]) == wanted]
@@ -508,7 +515,7 @@ def cmd_digest(args, config: Config) -> int:
         print("TELEGRAM_BOT_TOKEN not set", file=sys.stderr)
         return 1
 
-    audience = digest.readers(conn)
+    audience = digest.readers(conn, config.subscription)
     if not audience:
         print("бесплатных читателей нет — нечего рассылать")
         return 0
@@ -835,6 +842,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--kids", action="store_true",
         help="include children's clothing, which is left out by default",
+    )
+    p.add_argument(
+        "--women", action="store_true",
+        help="include women's, which this shop does not stock — for checking a"
+             " misreading, since one nobody can see is one nobody can report",
     )
     p.add_argument("--shop", help="only this shop's domain")
     p.add_argument("--min-discount", type=float, metavar="PCT")

@@ -83,19 +83,40 @@ class TestShelf:
         assert total == 1
         assert rows[0]["size_norm"] == "EU44"
 
-    def test_asking_for_women_excludes_the_unknown(self, conn):
+    def test_women_are_not_stocked_at_all(self, conn):
+        """Not a filter the reader turns off — this is a men's shop.
+
+        The row stays written, because it is still evidence about the price of
+        the same article elsewhere, and because a misreading nobody can see is a
+        misreading nobody can report. It is simply never shown.
+        """
         make_offer(conn, gender="women", title="Wmns")
         make_offer(conn, gender=None, title="Unsaid")
-        _, total = dbm.offers_for(conn, genders=["women"])
+        _, total = dbm.offers_for(conn)
+        assert total == 1
+        _, asked = dbm.offers_for(conn, genders=["women"])
+        assert asked == 0, "asking for women does not put them back"
+
+    def test_the_owner_can_still_see_them(self, conn):
+        """Otherwise a men's shoe read as women's is invisible and unfixable."""
+        make_offer(conn, gender="women", title="Wmns")
+        _, total = dbm.offers_for(conn, women=True)
         assert total == 1
 
-    def test_asking_for_men_lets_the_unknown_through(self, conn):
-        """87% of the catalogue never says, so excluding it would hide the shop."""
+    def test_asking_for_men_means_the_confirmed_ones(self, conn):
+        """Once women are out of the shop, "men" stops being protection from
+        them and starts being a preference: show me only what actually says so.
+
+        57% of the shelf says nothing, so this narrows hard on purpose — it is
+        the reader's choice, not the shop's boundary.
+        """
         make_offer(conn, gender="men", title="Mens")
         make_offer(conn, gender=None, title="Unsaid")
         make_offer(conn, gender="women", title="Wmns")
         _, total = dbm.offers_for(conn, genders=["men"])
-        assert total == 2
+        assert total == 1
+        _, everything = dbm.offers_for(conn)
+        assert everything == 2, "by default the unsaid are shown too"
 
     def test_a_brand_filter_matches_the_family(self, conn):
         """Asking for Nike finds a Jordan, which is the point of the family."""

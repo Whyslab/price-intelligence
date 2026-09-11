@@ -874,6 +874,19 @@ def get_bot_user(conn: sqlite3.Connection, user_id: int) -> sqlite3.Row | None:
     return conn.execute("SELECT * FROM bot_users WHERE id = ?", (user_id,)).fetchone()
 
 
+# Every column anything may write through `upsert_bot_user`. The union of what
+# the bot writes and what `comp` needs — narrower policies live closer to their
+# callers (see Bot.WRITABLE), but the SQL below is built from caller-supplied
+# keys, and that is the surface an allowlist has to cover. Until recently this
+# table held nothing but profile fields and the absence of a check here cost
+# nothing; the day it held `paid_until`, a forged button payload was a free
+# subscription. A future caller cannot forget to consult this one.
+BOT_USER_COLUMNS = frozenset(
+    {"chat_id", "username", "genders", "kinds", "sizes", "brands",
+     "wizard_step", "onboarded", "active"}
+)
+
+
 def upsert_bot_user(
     conn: sqlite3.Connection, user_id: int, chat_id: str, username: str | None = None, **fields
 ) -> sqlite3.Row:
@@ -893,6 +906,9 @@ def upsert_bot_user(
         (user_id, chat_id, username, utcnow()),
     )
     if fields:
+        unknown = set(fields) - BOT_USER_COLUMNS
+        if unknown:
+            raise ValueError(f"not writable through upsert_bot_user: {sorted(unknown)}")
         assigns = ", ".join(f"{key} = :{key}" for key in fields)
         conn.execute(
             f"UPDATE bot_users SET {assigns} WHERE id = :id", {**fields, "id": user_id}
@@ -1131,25 +1147,34 @@ class StillRecurring(Exception):
 def is_comped(row: sqlite3.Row | None) -> bool:
     """Whether this access was given rather than bought.
 
-    A comp is a date beyond any plan anyone can buy, which is what `COMP_DAYS`
-    makes it. Deliberately not a second column or a flag: the whole subscription
-    module answers one question — until when? — and a second way of saying yes
-    would have to be taught to `subscription_state`, `expire_due`,
-    `expiring_soon`, the reminder and the summary, and the one that got
-    forgotten would be the bug.
+    Asked of the money, not of the date. A first attempt used "paid_until more
+    than five years out", and it was wrong in both directions at once: `grant`
+    is additive, so six yearly renewals cross five years and turn a customer who
+    paid 9,000 stars into a gift — subtracted from the very number the summary
+    exists to give — while a 90-day comp, which is what the panel's own help
+    text offers, was counted as a purchase. Duration was never the question.
+    `stars_paid == 0` beside a date is exactly "has access, paid nothing".
 
-    This is for reporting only. Nothing about access depends on it — a comped
-    reader is a subscriber in every code path that matters.
+    Reporting only. Nothing about access consults this: a comped reader is a
+    subscriber in every path that matters, which is the point of there being
+    one notion of access and one column holding it.
+    """
+    return bool(row is not None and row["paid_until"] and not row["stars_paid"])
+
+
+def is_open_ended(row: sqlite3.Row | None) -> bool:
+    """Whether to write "indefinitely" instead of a date.
+
+    What the date test is actually good at. A paid-to date in 2076 is correct
+    and reads as a bug, so it is shown as what it means rather than as what it
+    says; nothing decides anything from this.
     """
     if row is None or not row["paid_until"]:
         return False
     try:
-        until = _moment(row["paid_until"])
+        return _moment(row["paid_until"]) > datetime.now(UTC) + timedelta(days=365 * 5)
     except ValueError:
         return False
-    # Anything past the longest thing that can be sold, plus a wide margin, was
-    # given. The yearly plan is 365 days; five years is nobody's purchase.
-    return until > datetime.now(UTC) + timedelta(days=365 * 5)
 
 
 def revoke(conn: sqlite3.Connection, user_id: int, force: bool = False) -> bool:
@@ -1246,12 +1271,13 @@ def offers_for(
     brands: list[str] | None = None,
     limit: int = 10,
     offset: int = 0,
-    order_by: str = "o.score DESC, o.discount_pct DESC",
+    order_by: str = "o.score DESC, o.discount_pct DESC, o.variant_id DESC",
     search: str | None = None,
     min_price: float | None = None,
     max_price: float | None = None,
     min_discount: float | None = None,
     kids: bool = False,
+    women: bool = False,
 ) -> tuple[list[sqlite3.Row], int]:
     """What is on offer for one person, best first. Returns (page, total).
 
@@ -1277,11 +1303,23 @@ def offers_for(
     params: list = []
     if not kids:
         where.append("(p.audience IS NULL OR p.audience <> 'kids')")
+    # This is a men's shop, so what is read as women's is not a filter the
+    # reader turns off — it is not stocked. The row is still written and still
+    # counts as a price witness for the same article elsewhere; it is simply
+    # never shown. `women=True` exists for the owner, because a misclassified
+    # men's item is otherwise invisible and therefore unreportable.
+    if not women:
+        where.append("(p.gender IS NULL OR p.gender <> 'women')")
+    # What is left is "confirmed men" and "nobody said". Asking for men narrows
+    # to the confirmed half; 57% of the shelf says nothing, so this is a
+    # preference rather than the shop's own boundary. Asking for anything else
+    # answers "nothing", which is the truth: it is not that the filter found no
+    # match today, it is that the shop does not carry it.
     if genders:
-        if "women" in genders and "men" not in genders:
-            where.append("p.gender = 'women'")
-        elif "men" in genders and "women" not in genders:
-            where.append("(p.gender = 'men' OR p.gender IS NULL)")
+        if "men" in genders:
+            where.append("p.gender = 'men'")
+        else:
+            where.append("1 = 0")
     if kinds:
         where.append(f"p.kind IN ({','.join('?' * len(kinds))})")
         params += kinds
@@ -1312,26 +1350,56 @@ def offers_for(
         params += [f"%{search}%"] * 3
     clause = " AND ".join(where)
 
-    total = conn.execute(
-        f"""
-        SELECT COUNT(*) FROM offers o
-          JOIN variants v ON v.id = o.variant_id
-          JOIN products p ON p.id = o.product_id
-         WHERE {clause}
-        """,
-        params,
-    ).fetchone()[0]
-
-    rows = conn.execute(
-        f"""
+    # A product's sizes are folded into one card only when they all cost the
+    # same. Measured on the live shelf: 1,539 products hold more than one card,
+    # but 910 of them are priced differently by size — one Salomon is $90 in
+    # US10 and $180 in US11 — and folding those would put a price on a card that
+    # is not the price of the size somebody wants. The other 629 are the same
+    # shoe listed three times at one price, which is the shelf repeating itself,
+    # and folding them removes 636 cards.
+    #
+    # So the count is neither offers nor products: it is cards, and it has to be
+    # counted the same way the page builds them.
+    # `KEEP` is the rule, written once and used by both queries so the count can
+    # never disagree with the page: keep the chosen row of a product whose sizes
+    # all cost the same, and keep every row of one whose sizes do not.
+    KEEP = "o.pick = 1 OR o.lo <> o.hi"
+    folded = f"""
         SELECT o.*, v.size_norm, v.size, v.sku,
-               p.title, p.url, p.image_url, p.brand, p.brand_norm, p.brand_family,
-               p.gender, p.kind, s.domain, s.name AS store_name, s.country, s.currency
+               p.title, p.url, p.image_url, p.brand, p.brand_norm,
+               p.brand_family, p.gender, p.kind, p.store_id,
+               s.domain, s.name AS store_name, s.country, s.currency,
+               ROW_NUMBER() OVER (
+                   PARTITION BY o.product_id
+                   ORDER BY o.score DESC, o.price_usd ASC, o.variant_id DESC
+               ) AS pick,
+               COUNT(*) OVER (PARTITION BY o.product_id) AS folded_sizes,
+               MIN(o.price_usd) OVER (PARTITION BY o.product_id) AS lo,
+               MAX(o.price_usd) OVER (PARTITION BY o.product_id) AS hi
           FROM offers o
           JOIN variants v ON v.id = o.variant_id
           JOIN products p ON p.id = o.product_id
           JOIN stores s   ON s.id = p.store_id
          WHERE {clause}
+    """
+
+    total = conn.execute(
+        f"SELECT COUNT(*) FROM ({folded}) o WHERE {KEEP}", params
+    ).fetchone()[0]
+
+    # Folding happens after the WHERE, which is what keeps a size filter
+    # meaningful: asking for EU44 narrows to the offers in EU44 and only then
+    # picks one per product, rather than picking first and then finding that the
+    # winner was a different size.
+    #
+    # `sizes_on_offer` is how many rows went into this card — 1 whenever nothing
+    # was folded, so the page can say "3 sizes at this price" and never imply it
+    # about a card that is only one of several prices.
+    rows = conn.execute(
+        f"""
+        SELECT *, CASE WHEN o.lo = o.hi THEN o.folded_sizes ELSE 1 END AS sizes_on_offer
+          FROM ({folded}) o
+         WHERE {KEEP}
          ORDER BY {order_by}
          LIMIT ? OFFSET ?
         """,
@@ -1385,7 +1453,8 @@ def _size_order(label: str) -> tuple:
     return (2, 0.0, label)
 
 
-def shelf_facets(conn: sqlite3.Connection, kids: bool = False) -> dict:
+def shelf_facets(conn: sqlite3.Connection, kids: bool = False,
+                 women: bool = False) -> dict:
     """What the shelf actually contains, for building filters out of.
 
     Offered rather than hardcoded because a filter listing a size nothing is on
@@ -1397,8 +1466,14 @@ def shelf_facets(conn: sqlite3.Connection, kids: bool = False) -> dict:
     counts are a promise about what a click returns, and the shelf hides
     children's clothing unless asked — so a facet counting it would be a
     promise the page then breaks.
+
+    Counted in products for the same reason, since `offers_for` folds a
+    product's sizes into one card. Counting offers here would promise 33,215
+    where the page then draws 31,653.
     """
     hide = "" if kids else " AND (p.audience IS NULL OR p.audience <> 'kids')"
+    if not women:
+        hide += " AND (p.gender IS NULL OR p.gender <> 'women')"
 
     def tally(sql: str) -> list[dict]:
         return [
@@ -1410,7 +1485,7 @@ def shelf_facets(conn: sqlite3.Connection, kids: bool = False) -> dict:
     return {
         "kinds": tally(
             f"""
-            SELECT p.kind, COUNT(*) FROM offers o
+            SELECT p.kind, COUNT(DISTINCT o.product_id) FROM offers o
               JOIN products p ON p.id = o.product_id
              WHERE 1 = 1{hide}
              GROUP BY p.kind ORDER BY 2 DESC
@@ -1418,7 +1493,7 @@ def shelf_facets(conn: sqlite3.Connection, kids: bool = False) -> dict:
         ),
         "genders": tally(
             f"""
-            SELECT p.gender, COUNT(*) FROM offers o
+            SELECT p.gender, COUNT(DISTINCT o.product_id) FROM offers o
               JOIN products p ON p.id = o.product_id
              WHERE 1 = 1{hide}
              GROUP BY p.gender ORDER BY 2 DESC
@@ -1428,7 +1503,7 @@ def shelf_facets(conn: sqlite3.Connection, kids: bool = False) -> dict:
         # person scans for are the ones with anything behind them.
         "sizes": tally(
             f"""
-            SELECT v.size_norm, COUNT(*) FROM offers o
+            SELECT v.size_norm, COUNT(DISTINCT o.product_id) FROM offers o
               JOIN variants v ON v.id = o.variant_id
               JOIN products p ON p.id = o.product_id
              WHERE 1 = 1{hide}
@@ -1437,15 +1512,28 @@ def shelf_facets(conn: sqlite3.Connection, kids: bool = False) -> dict:
         ),
         "brands": tally(
             f"""
-            SELECT p.brand_family, COUNT(*) FROM offers o
+            SELECT p.brand_family, COUNT(DISTINCT o.product_id) FROM offers o
               JOIN products p ON p.id = o.product_id
              WHERE 1 = 1{hide}
              GROUP BY p.brand_family ORDER BY 2 DESC LIMIT 80
             """
         ),
+        # Counted in cards by the same rule `offers_for` folds by, or the page
+        # would head itself with a number it then fails to draw.
         "total": conn.execute(
-            f"SELECT COUNT(*) FROM offers o JOIN products p ON p.id = o.product_id"
-            f" WHERE 1 = 1{hide}"
+            f"""
+            SELECT COUNT(*) FROM (
+                SELECT ROW_NUMBER() OVER (
+                           PARTITION BY o.product_id
+                           ORDER BY o.score DESC, o.price_usd ASC, o.variant_id DESC
+                       ) AS pick,
+                       MIN(o.price_usd) OVER (PARTITION BY o.product_id) AS lo,
+                       MAX(o.price_usd) OVER (PARTITION BY o.product_id) AS hi
+                  FROM offers o
+                  JOIN products p ON p.id = o.product_id
+                 WHERE 1 = 1{hide}
+            ) WHERE pick = 1 OR lo <> hi
+            """
         ).fetchone()[0],
         # Where the prices actually start and stop, so a range control has ends
         # rather than guesses. Rounded outwards: a slider that cannot reach the

@@ -528,7 +528,16 @@ class TestStarringSomethingOverHttp:
     @staticmethod
     @contextmanager
     def _serving(conn, **attrs):
+        """A server with the paywall **on**.
+
+        It ships off (Config.subscription), because nothing is being sold yet.
+        These tests are about what the paywall does when it is switched on, so
+        they switch it on rather than assert the default — otherwise the rules
+        that guard the thing being sold would quietly stop being tested the day
+        selling was paused.
+        """
         path = Path(conn.execute("PRAGMA database_list").fetchone()[2])
+        attrs = {"subscription": True, **attrs}
         handler = type("Bound", (web.Handler,), {"db_path": path, **attrs})
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         # A short poll, or every one of these tests spends half a second in
@@ -893,3 +902,204 @@ class TestTheOwnerFlagBehindAProxy:
         request = Request(url, headers=headers)
         with urlopen(request, timeout=5) as response:
             return response.read().decode("utf-8")
+
+
+def a_tied_shelf(conn, n=1200, stores=2):
+    """n offers that tie on every key the shelf can sort by.
+
+    The duplicate this exists to catch is not a duplicate row — it is one row
+    served twice. OFFSET paging over a non-unique ORDER BY is undefined: SQLite
+    may hand back tied rows in a different order for each page, so the same card
+    lands on page one and again on page two while another is never drawn at all.
+
+    Two shops rather than one because the default sort ranks within a shop
+    first, so a single-shop fixture would leave that window unexercised. On the
+    live database 29,703 of 33,277 offers sit in a group tied on
+    (shop, score, discount), so this fixture is the ordinary case.
+    """
+    for i in range(n):
+        store = dbm.upsert_store(
+            conn, f"tied{i % stores}.example", platform="shopify", currency="USD"
+        )
+        product = dbm.upsert_product(
+            conn, store, f"t{i}", f"Tied {i}", f"https://tied.example/{i}",
+            brand="Nike", image_url="https://img.example/x.jpg",
+        )
+        conn.execute(
+            "UPDATE products SET kind = 'shoes', gender = 'men', brand_family = 'Nike'"
+            " WHERE id = ?", (product,),
+        )
+        variant = dbm.upsert_variant(
+            conn, product, f"tv{i}", size="US 10", size_norm="US10"
+        )
+        conn.execute(
+            """
+            INSERT INTO offers (variant_id, product_id, found_at, checked_at,
+                                price_usd, reference_usd, reference_source,
+                                discount_pct, saving_usd, score, all_time_low)
+            VALUES (?, ?, ?, ?, 100.0, 200.0, 'market', 50.0, 100.0, 77, 0)
+            """,
+            (variant, product, ts(1), ts(0)),
+        )
+
+
+def _walk(conn, order_by, limit=24):
+    """Every variant id the shelf hands out, page by page, in order."""
+    seen, page = [], 0
+    while True:
+        rows, total = dbm.offers_for(
+            conn, order_by=order_by, limit=limit, offset=page * limit
+        )
+        if not rows:
+            return seen, total
+        seen += [row["variant_id"] for row in rows]
+        page += 1
+        assert page < 500, "paging did not terminate"
+
+
+class TestPagingNeverServesTheSameOfferTwice:
+    """A shelf of ties, walked to the end, must yield each offer exactly once.
+
+    Honest about what this does and does not show. Walked against the live
+    database of 32,139 standing offers, the ordering *without* a unique
+    tiebreaker also returned every card exactly once: SQLite's order for tied
+    rows is undefined by contract but stable in practice while the query plan
+    and the data both hold still. So this test did not fail before the
+    tiebreaker was added and does not demonstrate that it fixed anything.
+
+    It is kept as a guard on the contract rather than as proof of a bug. What
+    the tiebreaker actually buys is that a plan change — a new index, a widened
+    filter — cannot silently start dropping cards. The repetition a reader
+    really sees on the shelf is a different thing entirely: 1,539 products hold
+    more than one card because they are discounted in several sizes, and 2,428
+    title-and-brand groups repeat across shops. That is folding, and no ordering
+    fixes it.
+    """
+
+    def test_every_offered_sort(self, conn):
+        a_tied_shelf(conn)
+        for name, order_by in web.SORTS.items():
+            seen, total = _walk(conn, order_by)
+            assert len(seen) == len(set(seen)), f"{name}: an offer was served twice"
+            assert len(seen) == total, f"{name}: walked {len(seen)} of {total}"
+
+    def test_the_default_ordering_of_offers_for(self, conn):
+        """`pi.bot` pages the same table without passing a sort of its own."""
+        a_tied_shelf(conn, n=200)
+        seen, total = _walk(conn, dbm.offers_for.__defaults__[4])
+        assert len(seen) == len(set(seen))
+        assert len(seen) == total
+
+
+class TestSizesAreFoldedOnlyWhenTheyCostTheSame:
+    """One shoe listed in three sizes at one price is the shelf repeating itself.
+
+    The same shoe at three different prices is not: folding it would put a price
+    on the card that is not the price of the size somebody came for. Measured on
+    the live shelf, 1,539 products hold more than one card and 910 of them are
+    priced differently by size, so both halves of this are the common case.
+    """
+
+    @staticmethod
+    def _product(conn, prices, handle="p"):
+        """One product offered in len(prices) sizes, at the prices given."""
+        store = dbm.upsert_store(conn, f"{handle}.example", platform="shopify", currency="USD")
+        product = dbm.upsert_product(
+            conn, store, handle, "Salomon XT-6", f"https://{handle}.example/p",
+            brand="Salomon", image_url="https://img.example/x.jpg",
+        )
+        for i, price in enumerate(prices):
+            variant = dbm.upsert_variant(
+                conn, product, f"{handle}v{i}", size=f"US{10 + i}", size_norm=f"US{10 + i}"
+            )
+            conn.execute(
+                """
+                INSERT INTO offers (variant_id, product_id, found_at, checked_at,
+                                    price_usd, reference_usd, reference_source,
+                                    discount_pct, saving_usd, score, all_time_low)
+                VALUES (?, ?, ?, ?, ?, 290.0, 'market', 50.0, ?, 70, 0)
+                """,
+                (variant, product, ts(1), ts(0), price, 290.0 - price),
+            )
+        return product
+
+    def test_one_price_across_sizes_becomes_one_card(self, conn):
+        self._product(conn, [90.0, 90.0, 90.0])
+        page = web.shelf_page(conn, web.read_query(""))
+        assert len(page["offers"]) == 1
+        assert page["offers"][0]["sizes_on_offer"] == 3
+        assert page["total"] == 1
+
+    def test_prices_that_differ_by_size_stay_apart(self, conn):
+        self._product(conn, [90.0, 180.0])
+        page = web.shelf_page(conn, web.read_query(""))
+        assert len(page["offers"]) == 2
+        assert page["total"] == 2
+        # Never "3 sizes at this price" on a card that is one price of several.
+        assert {card["sizes_on_offer"] for card in page["offers"]} == {1}
+
+    def test_the_count_matches_what_paging_hands_out(self, conn):
+        """`total` drives the page counter, so a disagreement is visible."""
+        self._product(conn, [90.0, 90.0], handle="same")
+        self._product(conn, [70.0, 140.0], handle="split")
+        seen, total = _walk(conn, web.SORTS[web.DEFAULT_SORT], limit=1)
+        assert total == 3  # one folded card, two unfolded
+        assert len(seen) == total
+
+    def test_a_size_filter_still_picks_the_size_asked_for(self, conn):
+        """Folding after the WHERE, not before: the card must be the US11 row."""
+        self._product(conn, [90.0, 90.0])
+        page = web.shelf_page(conn, web.read_query("size=US11"))
+        assert len(page["offers"]) == 1
+        assert page["offers"][0]["size"] == "US11"
+        assert page["offers"][0]["sizes_on_offer"] == 1
+
+
+class TestTheShelfIsNotGivenAwayOnTheFirstRequest:
+    """Inside Telegram the signature rides in the URL fragment, which browsers
+    never send. So the first GET cannot know who is asking — and must neither
+    refuse a paying reader nor hand the shelf to a stranger."""
+
+    def test_an_unsigned_request_gets_no_offers_in_the_page(self, conn):
+        a_shelf(conn, 3)
+        page = web.render_page(conn, web.read_query(""), None, seeded=False)
+        assert b'{"seed": null}' in page
+        assert b"Nike Air Max" not in page
+
+    def test_a_known_reader_still_gets_the_first_screen(self, conn):
+        a_shelf(conn, 3)
+        page = web.render_page(conn, web.read_query(""), 42)
+        assert b'{"seed": null}' not in page
+        assert b"Nike Air Max" in page
+
+
+class TestWithNothingBeingSold:
+    """Selling is switched off, not removed (Config.subscription).
+
+    The paywall, Stars, renewal, grace and refunds all stay in the code and
+    stay tested; what changes is that the shelf is open. Проверяется именно
+    выключенное состояние, потому что оно сейчас и работает у людей.
+    """
+
+    def test_the_shelf_opens_without_any_signature(self, conn):
+        a_shelf(conn, 3)
+        serving = TestStarringSomethingOverHttp._serving(conn, subscription=False)
+        with serving as base, urlopen(base + "/api/offers?limit=3") as r:
+            assert r.status == 200
+            assert json.loads(r.read())["total"] == 3
+
+    def test_the_page_still_carries_its_first_screen(self, conn):
+        """With no paywall there is nobody to withhold it from."""
+        a_shelf(conn, 3)
+        page = web.render_page(conn, web.read_query(""), None)
+        assert b"Nike Air Max" in page
+
+    def test_the_paywall_is_still_there_when_switched_on(self, conn):
+        """The point of a switch: the rules it guards do not rot while it is off."""
+        a_shelf(conn, 3)
+        with TestStarringSomethingOverHttp._serving(conn, subscription=True) as base:
+            try:
+                urlopen(base + "/api/offers?limit=3")
+                raise AssertionError("the shelf was handed over without a subscription")
+            except HTTPError as refused:
+                assert refused.code == 402

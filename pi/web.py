@@ -55,17 +55,33 @@ LOOKUP_LIMIT = 40
 # eight identical blazers is a worse answer than eight different shops even
 # when every one of the claims is true. The other sorts stay literal — "по
 # скидке" is asked precisely when the deepest cut is the whole question.
+#
+# Every ordering ends on `o.variant_id`, which is the offers table's primary
+# key, because none of the keys above is unique and OFFSET paging over a
+# non-unique ORDER BY is undefined: SQLite may return tied rows in a different
+# order for each page, so the same card appears twice and another is never
+# shown. Measured on the live database, 29,703 of 33,277 offers — 89% — sit in
+# a group tied on (shop, score, discount), so this is the common case and not
+# the corner one.
+#
+# The default needs it twice. Its first key is the window's rank, and a rank
+# assigned over a tied ORDER BY is itself arbitrary, so a tiebreaker only on
+# the outside would stabilise nothing: the rank would keep moving underneath it.
+# `o.store_id` and not `p.store_id`: offers_for folds to one row per product
+# in a subquery aliased `o`, and the products table is no longer in scope out
+# here. The column is carried through that subquery for exactly this.
 BY_SHOP_THEN_SCORE = (
-    "ROW_NUMBER() OVER (PARTITION BY p.store_id ORDER BY o.score DESC, o.discount_pct DESC), "
-    "o.score DESC, o.discount_pct DESC"
+    "ROW_NUMBER() OVER (PARTITION BY o.store_id"
+    " ORDER BY o.score DESC, o.discount_pct DESC, o.variant_id DESC), "
+    "o.score DESC, o.discount_pct DESC, o.variant_id DESC"
 )
 SORTS = {
     "score": BY_SHOP_THEN_SCORE,
-    "discount": "o.discount_pct DESC, o.score DESC",
-    "saving": "o.saving_usd DESC",
-    "cheapest": "o.price_usd ASC",
-    "newest": "o.found_at DESC",
-    "freshest": "o.checked_at DESC",
+    "discount": "o.discount_pct DESC, o.score DESC, o.variant_id DESC",
+    "saving": "o.saving_usd DESC, o.variant_id DESC",
+    "cheapest": "o.price_usd ASC, o.variant_id DESC",
+    "newest": "o.found_at DESC, o.variant_id DESC",
+    "freshest": "o.checked_at DESC, o.variant_id DESC",
 }
 DEFAULT_SORT = "score"
 
@@ -144,11 +160,16 @@ def offer_json(row: sqlite3.Row) -> dict:
     shelf and a graveyard, and it is the one thing a page like this normally
     hides: a listing that four days ago was 60% off may simply be gone.
     """
+    keys = row.keys()
     return {
         "id": row["product_id"],
         # Which size this card is, so opening it lands on the same row rather
         # than on whichever one the database happened to return first.
         "variant": row["variant_id"],
+        # How many of this product's sizes are on offer, so a folded card can
+        # say "3 sizes" instead of naming one and implying the rest are gone.
+        # Absent on the product page, which is already showing every size.
+        "sizes_on_offer": row["sizes_on_offer"] if "sizes_on_offer" in keys else 1,
         "title": row["title"],
         "url": row["url"],
         "image": row["image_url"],
@@ -395,7 +416,8 @@ def _spaced(n: int) -> str:
 
 
 def render_page(
-    conn: sqlite3.Connection, args: dict, user_id: int | None = None
+    conn: sqlite3.Connection, args: dict, user_id: int | None = None,
+    seeded: bool = True,
 ) -> bytes:
     """The page with its first screenful already in it.
 
@@ -410,6 +432,13 @@ def render_page(
     signature travels in the URL fragment, which browsers do not send — so the
     page asks for it and the seed says nobody.
     """
+    # `seeded=False` sends the shell and nothing else. It is what goes out when
+    # the request could not say who it is, and the shelf is the thing being
+    # sold: seeding it there would hand the first screenful to anybody who knows
+    # the address, which is the paywall with a hole in it rather than a paywall.
+    if not seeded:
+        return PAGE.read_text(encoding="utf-8").encode("utf-8")
+
     seed = json.dumps(
         {"seed": {
             "facets": dbm.shelf_facets(conn, kids=args["kids"]),
@@ -452,6 +481,9 @@ class Handler(BaseHTTPRequestHandler):
     # this grants no identity — the reader still proves who they are with
     # Telegram's signature — so it is safe on an address other people reach.
     exempt_id: int | None = None
+    # Whether the shelf is behind a paywall at all. Off by default: the
+    # subscription is built and switched off, not removed.
+    subscription: bool = False
     server_version = "price-intelligence"
 
     def log_message(self, fmt: str, *args) -> None:
@@ -531,6 +563,10 @@ class Handler(BaseHTTPRequestHandler):
         period keeps a feed alive through a failed renewal, and handing back the
         thing being sold as well would make grace a free month.
         """
+        # Nothing is being sold yet, so nothing is being withheld. See
+        # Config.subscription and docs/subscription.md.
+        if not self.subscription:
+            return True
         reader = self._reader()
         if reader is None:
             return False
@@ -587,15 +623,34 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if parsed.path in ("/", "/index.html"):
                 with self._open() as conn:
-                    if not self._paying(conn):
-                        # A page, not a 402. Somebody who followed a link here
-                        # from the bot should find out what this is and how to
-                        # open it, and an error code tells them neither.
-                        self._send(
-                            200, locked_page(conn), "text/html; charset=utf-8"
+                    reader = self._reader()
+                    if reader is None:
+                        # Nobody has said who this is *yet*, and on this request
+                        # nobody can: inside Telegram the signature arrives in
+                        # the URL fragment, which browsers never send to a
+                        # server. Judging the subscription here therefore showed
+                        # the paywall to paying readers — the shelf they had
+                        # bought, refused on the one request that could not
+                        # carry proof of having bought it.
+                        #
+                        # So the shell goes out unseeded, carrying no offers at
+                        # all, and the page proves itself on its first API call.
+                        # Every one of those is signed and every one of them
+                        # checks `_paying`, so nothing is given away here: an
+                        # unsubscribed reader gets the same pitch, drawn by the
+                        # page instead of served in its place.
+                        body = render_page(
+                            conn, read_query(parsed.query), None, seeded=False
                         )
+                    elif not self._paying(conn):
+                        # Known, and not paying. Here the answer is certain, so
+                        # it is given straight: a page rather than a 402,
+                        # because whoever followed a link out of the bot needs
+                        # to learn what this is, and a status code says nothing.
+                        self._send(200, locked_page(conn), "text/html; charset=utf-8")
                         return
-                    body = render_page(conn, read_query(parsed.query), self._reader())
+                    else:
+                        body = render_page(conn, read_query(parsed.query), reader)
                 self._send(200, body, "text/html; charset=utf-8")
                 return
             if parsed.path == "/api/facets":
@@ -744,6 +799,7 @@ def serve(
     bot_token: str | None = None,
     owner_id: int | None = None,
     exempt_id: int | None = None,
+    subscription: bool = False,
 ) -> None:
     """Run until interrupted.
 
@@ -758,6 +814,7 @@ def serve(
         {
             "db_path": Path(db_path), "bot_token": bot_token,
             "owner_id": owner_id, "exempt_id": exempt_id,
+            "subscription": subscription,
         },
     )
     server = ThreadingHTTPServer((host, port), handler)
