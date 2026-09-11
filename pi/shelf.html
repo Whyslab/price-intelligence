@@ -27,8 +27,13 @@ button,input,select{font:inherit;color:inherit}
 /* --- шапка --- */
 header{position:sticky;top:0;z-index:20;background:var(--bg);
        border-bottom:1px solid var(--line)}
-.bar{display:flex;gap:8px;align-items:center;padding:10px 12px;max-width:1400px;margin:0 auto}
-.field{flex:1 1 auto;position:relative;min-width:0}
+.bar{display:flex;gap:8px;align-items:center;padding:10px 12px;max-width:1400px;margin:0 auto;
+     flex-wrap:wrap}
+/* On a phone the search, the filter button, the sort and the count do not fit
+   on one line, and flexbox resolved that by crushing the search into a 40px
+   square. It takes the whole first row instead and the controls sit under it. */
+.field{flex:1 1 100%;position:relative;min-width:0;order:-1}
+@media (min-width:560px){ .field{flex:1 1 auto;order:0} }
 .field input{width:100%;background:var(--card);border:1px solid var(--line);
              border-radius:10px;padding:9px 32px 9px 12px}
 .field button{position:absolute;right:4px;top:50%;transform:translateY(-50%);
@@ -85,8 +90,13 @@ select.tool{padding-right:8px}
 /* --- сетка ---
    Шире, чем было: на 168px карточка на ноутбуке выходила размером с иконку, а
    вещь выбирают глазами. */
-main{display:grid;gap:16px;padding:16px 14px 8px;max-width:1400px;margin:0 auto;
-     grid-template-columns:repeat(auto-fill,minmax(206px,1fr))}
+/* 150px so a 390px phone gets two columns. At 206 it got one, and one card of
+   seven hundred pixels means one product per screenful — which is how a shelf
+   of five thousand things comes to feel empty. */
+main{display:grid;gap:10px;padding:12px 12px 8px;max-width:1400px;margin:0 auto;
+     grid-template-columns:repeat(auto-fill,minmax(150px,1fr))}
+@media (min-width:560px){ main{gap:16px;padding:16px 14px 8px;
+     grid-template-columns:repeat(auto-fill,minmax(206px,1fr))} }
 .card{background:var(--card);border:1px solid var(--line);border-radius:14px;
       overflow:hidden;display:flex;flex-direction:column;text-decoration:none;
       color:inherit;transition:box-shadow .18s,transform .18s,border-color .18s}
@@ -95,18 +105,26 @@ main{display:grid;gap:16px;padding:16px 14px 8px;max-width:1400px;margin:0 auto;
    у них отрезает то носок, то капюшон. И `contain`, а не `cover` — магазины
    снимают на белом, обрезка ради заполнения портит именно те кадры, которые
    изначально были хорошими. */
-.thumb{aspect-ratio:4/5;background:#fff;position:relative}
+/* Square, not portrait. Portrait plus `contain` left a product shot swimming in
+   white — the photographs are not all the same shape, and the taller the box the
+   more of it is empty. */
+/* `min-height:0` и абсолютная картинка — иначе собственная высота фотографии
+   участвует в расчёте флекс-элемента и перебивает `aspect-ratio`: измерено,
+   превью выходили 248, 294 и 314 пикселей при ширине 236, и сетка ехала. */
+.thumb{aspect-ratio:1;background:#fff;position:relative;flex:0 0 auto;min-height:0}
 @media (prefers-color-scheme: dark){ .thumb{background:#17140f} }
-.thumb img{width:100%;height:100%;object-fit:contain;display:block}
-/* Бейдж скидки раньше был красным на каждой карточке. Когда кричит всё, не
-   кричит ничто — и полка из 25 тысяч одинаково-красных плашек читается как
-   свалка, а не как подборка. Поэтому обычная скидка набрана спокойно, а цветом
-   отмечено только то, что действительно редкость: от половины и ниже. */
+.thumb img{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;display:block}
+/* Бейдж скидки спокойный, без цвета. Сначала красным метились скидки от 50% —
+   и это была ошибка калибровки: правило подбиралось на полке, где лежали и
+   мелкие фальшивые уценки. Когда полка стала честной, на ней почти всё глубже
+   70%, и красным залило всё подряд — ровно то, от чего уходили.
+
+   Цвет остался за тем, что действительно редкость: зелёная метка «минимум»,
+   то есть цена ниже всего, что мы когда-либо видели у этого товара. */
 .badge{position:absolute;top:8px;left:8px;background:rgba(255,255,255,.92);
        color:var(--ink);border-radius:8px;padding:3px 8px;font-size:12px;
        font-weight:700;backdrop-filter:blur(4px);font-variant-numeric:tabular-nums}
 @media (prefers-color-scheme: dark){ .badge{background:rgba(28,25,23,.9);color:var(--ink)} }
-.badge.deep{background:var(--hot);color:#fff}
 .low{position:absolute;top:8px;right:8px;background:var(--accent);color:#fff;
      border-radius:8px;padding:3px 8px;font-size:11px;font-weight:700;
      letter-spacing:.02em}
@@ -589,7 +607,7 @@ function freshness(iso){
    обязана быть ценой того размера, который на ней написан. */
 function sizes_label(o){
   const n = o.sizes_on_offer || 1;
-  if (n < 2) return o.size || "—";
+  if (n < 2) return o.size || "";
   const word = n % 10 === 1 && n % 100 !== 11 ? "размер"
              : [2,3,4].includes(n % 10) && ![12,13,14].includes(n % 100) ? "размера"
              : "размеров";
@@ -608,7 +626,7 @@ function card(o){
   a.innerHTML = `
     <div class="thumb">
       ${o.image ? `<img loading="lazy" src="${esc(o.image)}" alt="">` : ""}
-      <span class="badge${o.discount >= 50 ? " deep" : ""}">−${o.discount}%</span>
+      <span class="badge">−${o.discount}%</span>
       ${o.all_time_low ? `<span class="low">минимум</span>` : ""}
     </div>
     <div class="body">
@@ -617,7 +635,7 @@ function card(o){
       <div class="prices"><span class="now">${money(o.price)}</span>
         <span class="then">${money(o.was)}</span>
         <span class="save">−${money(o.saving)}</span></div>
-      <div class="meta"><span>${esc(sizes_label(o))} · ${esc(o.shop)}</span>
+      <div class="meta"><span>${[sizes_label(o), o.shop].filter(Boolean).map(esc).join(" · ")}</span>
         <span class="${f.stale ? "stale" : ""}">${f.text}</span></div>
     </div>`;
   wrap.append(a);
@@ -642,7 +660,7 @@ function fav_card(o){
   a.innerHTML = `
     <div class="thumb">
       ${o.image ? `<img loading="lazy" src="${esc(o.image)}" alt="">` : ""}
-      ${o.discount ? `<span class="badge${o.discount >= 50 ? " deep" : ""}">−${o.discount}%</span>` : ""}
+      ${o.discount ? `<span class="badge">−${o.discount}%</span>` : ""}
     </div>
     <div class="body">
       <div class="brand">${esc(o.brand || o.shop)}</div>
