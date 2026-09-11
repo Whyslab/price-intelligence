@@ -44,6 +44,10 @@ FREE_READER = dbm.DIGEST_READER
 CANDIDATE_DEPTH = 200
 
 
+# How stale a price may be and still be worth advertising with. See the query.
+MAX_AGE_HOURS = 48
+
+
 def pick(conn: sqlite3.Connection, count: int = 2) -> list[sqlite3.Row]:
     """The best offers not shown before, at most one per shop and per brand.
 
@@ -79,11 +83,22 @@ def pick(conn: sqlite3.Connection, count: int = 2) -> list[sqlite3.Row]:
                                     WHERE variant_id = o.variant_id)
                )
            AND (p.audience IS NULL OR p.audience <> 'kids')
+           -- And the price has to be one somebody still stands behind. The
+           -- digest is what a reader who has paid nothing sees of this product,
+           -- and a run of it led with a find the shop had last confirmed seven
+           -- days earlier. Showing a stale price to somebody deciding whether
+           -- this is worth paying for undoes the one claim being made.
+           --
+           -- Measured on the shelf: 33,141 offers stand, 2,883 were confirmed
+           -- within a day and 4,049 within two. Two days leaves room to pick
+           -- two finds from different shops and different brands, and matches
+           -- the ceiling the shelf itself is held to.
+           AND o.checked_at >= datetime('now', ?)
          ORDER BY (o.reference_source = 'market') DESC, o.score DESC,
                   o.discount_pct DESC
          LIMIT {CANDIDATE_DEPTH}
         """,
-        (FREE_READER,),
+        (FREE_READER, f"-{MAX_AGE_HOURS} hours"),
     ).fetchall()
 
     chosen: list[sqlite3.Row] = []

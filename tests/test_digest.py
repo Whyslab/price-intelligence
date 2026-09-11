@@ -19,6 +19,7 @@ def _offer(
     in_stock: bool = True,
     audience: str | None = None,
     price: float = 100.0,
+    checked_at: str | None = None,
 ) -> int:
     """One product on the shelf, with its latest price point saying availability."""
     store = dbm.upsert_store(conn, domain, platform="shopify", currency="USD")
@@ -46,7 +47,7 @@ def _offer(
                             score, all_time_low)
         VALUES (?, ?, ?, ?, ?, ?, ?, 50.0, 100.0, ?, 0)
         """,
-        (variant, product, ts(1), ts(0), price, price * 2, source, score),
+        (variant, product, ts(1), checked_at or ts(0), price, price * 2, source, score),
     )
     return product
 
@@ -152,3 +153,26 @@ def test_readers_are_the_ones_not_paying(conn):
     audience = [row["id"] for row in digest.readers(conn, subscription=True)]
     # 2 pays and gets the real feed; 3 is in grace and still gets it; 4 left.
     assert audience == [1]
+
+
+class TestTheDigestDoesNotAdvertiseAStalePrice:
+    """This is what somebody who has paid nothing sees of the product. A run of
+    it led with a find the shop had last confirmed seven days earlier — showing
+    a stale price to the person deciding whether this is worth paying for undoes
+    the one claim being made."""
+
+    def test_a_price_confirmed_today_is_offered(self, conn):
+        _offer(conn, "a.example", "Nike", score=90, checked_at=ts(0))
+        assert len(digest.pick(conn, count=2)) == 1
+
+    def test_a_price_nobody_has_confirmed_for_a_week_is_not(self, conn):
+        _offer(conn, "a.example", "Nike", score=99, checked_at=ts(7))
+        assert digest.pick(conn, count=2) == []
+
+    def test_the_line_is_the_same_one_the_shelf_is_held_to(self, conn):
+        """48 hours, and measured: 4,049 of the shelf's 33,141 offers clear it,
+        which is room enough to pick two from different shops."""
+        _offer(conn, "a.example", "Nike", score=90, checked_at=ts(1))
+        _offer(conn, "b.example", "Adidas", score=99, checked_at=ts(3))
+        picked = digest.pick(conn, count=2)
+        assert [row["domain"] for row in picked] == ["a.example"]
