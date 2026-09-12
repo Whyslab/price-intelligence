@@ -34,6 +34,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+import httpx
+
 from . import db as dbm
 from . import webauth
 
@@ -360,6 +362,38 @@ SUBSCRIPTION_REQUIRED = {
     "error": "subscription required",
     "detail": "Витрина открывается по подписке. Оформить её можно в боте.",
 }
+
+
+def nudge_in_chat(bot_token: str | None, chat_id: int) -> bool:
+    """Попросить бота положить в чат предложение подписки.
+
+    Кнопка на закрытой полке называется «Вернуться в бота и оформить», но
+    умела только закрыть окно: человек оказывался в чате, где ничего не
+    происходило. Оформить было негде.
+
+    Отправляем от имени бота одну строку с кнопкой `pitch` — тем же нажатием,
+    что и в меню. Бот сам решит, что показать: пока продажа выключена — из
+    чего она будет состоять, когда включат — счёт на оплату. Дублировать эту
+    развилку здесь нельзя, она живёт в одном месте и должна там остаться.
+    """
+    if not bot_token:
+        return False
+    try:
+        response = httpx.post(
+            f"https://api.telegram.org/bot{bot_token}/sendMessage",
+            json={
+                "chat_id": chat_id,
+                "text": "Полка открывается по подписке.",
+                "reply_markup": {"inline_keyboard": [[
+                    {"text": "💎 Что даёт подписка", "callback_data": "pitch"},
+                ]]},
+            },
+            timeout=8,
+        )
+        return response.is_success
+    except httpx.HTTPError as exc:
+        log.info("не смог позвать бота: %s", exc)
+        return False
 
 
 def locked_page(conn: sqlite3.Connection) -> bytes:
@@ -737,6 +771,13 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
         try:
+            if parsed.path == "/api/pitch":
+                who = self._reader()
+                if who is None:
+                    self._json({"error": "not signed in"}, 401)
+                    return
+                self._json({"sent": nudge_in_chat(self.bot_token, who)})
+                return
             if parsed.path != "/api/favorites":
                 self._json({"error": "not found"}, 404)
                 return

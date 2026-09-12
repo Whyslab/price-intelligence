@@ -15,6 +15,9 @@ from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
+import httpx
+import respx
+
 from pi import db as dbm
 from pi import web
 
@@ -1163,3 +1166,76 @@ class TestOnlyDiscountsSomebodyElseVouchesFor:
         assert web.read_query("")["all_discounts"] is False
         assert web.read_query("all_discounts=1")["all_discounts"] is True
         assert web.read_query("all_discounts=nonsense")["all_discounts"] is False
+
+
+class TestTheButtonThatPromisesToTakeYouBackAndSubscribe:
+    """«Вернуться в бота и оформить» должно оформлять, а не только закрывать.
+
+    Кнопка на закрытой полке умела ровно одно — закрыть окно. Человек
+    оказывался в чате, где ничего не происходило, и оформить было негде.
+    Теперь страница сперва просит бота положить туда предложение.
+    """
+
+    @staticmethod
+    @contextmanager
+    def _serving(conn, **attrs):
+        path = Path(conn.execute("PRAGMA database_list").fetchone()[2])
+        handler = type("Bound", (web.Handler,), {"db_path": path, "bot_token": TOKEN, **attrs})
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        thread = threading.Thread(target=server.serve_forever, args=(0.02,), daemon=True)
+        thread.start()
+        try:
+            yield f"http://127.0.0.1:{server.server_address[1]}"
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+    @staticmethod
+    def _call(url, headers=None):
+        request = Request(url, method="POST", data=b"{}",
+                          headers={"Content-Type": "application/json", **(headers or {})})
+        try:
+            with urlopen(request, timeout=5) as response:
+                return response.status, json.loads(response.read() or b"{}")
+        except HTTPError as failure:
+            return failure.code, json.loads(failure.read() or b"{}")
+
+    def test_a_stranger_cannot_make_the_bot_write_to_anybody(self, conn):
+        """Без подписи неизвестно, чей это чат, — и писать некому."""
+        with self._serving(conn) as base:
+            code, body = self._call(f"{base}/api/pitch")
+        assert code == 401
+        assert body["error"] == "not signed in"
+
+    @respx.mock
+    def test_a_signed_reader_gets_the_offer_put_in_their_chat(self, conn):
+        route = respx.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage").mock(
+            return_value=httpx.Response(200, json={"ok": True})
+        )
+        with self._serving(conn) as base:
+            code, body = self._call(f"{base}/api/pitch",
+                                    {"X-Telegram-Init-Data": signed(user_id=77)})
+
+        assert code == 200
+        assert body == {"sent": True}
+        assert route.called
+        sent = json.loads(route.calls[0].request.content)
+        assert sent["chat_id"] == 77, "предложение должно уйти тому, кто нажал"
+        button = sent["reply_markup"]["inline_keyboard"][0][0]
+        assert button["callback_data"] == "pitch", (
+            "развилка «продажа включена или нет» живёт в боте — "
+            "страница только нажимает ту же кнопку, что и меню"
+        )
+
+    @respx.mock
+    def test_telegram_being_down_does_not_break_the_page(self, conn):
+        """Не дозвонились — честно говорим «не отправил», а не падаем с 500."""
+        respx.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage").mock(
+            side_effect=httpx.ConnectError("нет сети")
+        )
+        with self._serving(conn) as base:
+            code, body = self._call(f"{base}/api/pitch",
+                                    {"X-Telegram-Init-Data": signed(user_id=77)})
+        assert code == 200
+        assert body == {"sent": False}

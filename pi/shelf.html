@@ -317,7 +317,22 @@ function show_paywall(){
     <p><b>150 звёзд в месяц</b> или 1500 за год — два месяца в подарок.</p>
     <button id="back">Вернуться в бота и оформить</button>
   </div>`;
-  el("back").onclick = () => {
+  el("back").onclick = async () => {
+    /* Кнопка обещает «вернуться в бота и оформить», а раньше только закрывала
+     * окно: человек оказывался в чате, где ничего не происходило. Теперь
+     * сначала просим бота положить туда предложение, и только потом уходим —
+     * иначе возвращаться не к чему. */
+    const b = el("back");
+    b.disabled = true;
+    const was = b.textContent;
+    b.textContent = "Открываю…";
+    try {
+      await fetch("/api/pitch", { method: "POST", headers: tg_headers() });
+    } catch (e) {
+      /* Не дозвонились — всё равно закрываем: держать человека в тупике хуже,
+       * чем вернуть его в чат без сообщения. */
+    }
+    b.textContent = was;
     const tg = window.Telegram?.WebApp;
     if (tg?.close) tg.close(); else history.back();
   };
