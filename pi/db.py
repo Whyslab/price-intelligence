@@ -1850,8 +1850,13 @@ def _products_by_key(
     return found, None
 
 
-def _products_by_name(conn: sqlite3.Connection, text: str) -> list[int]:
-    """Products whose title or brand contains what was typed."""
+def products_by_name(conn: sqlite3.Connection, text: str) -> list[int]:
+    """Products whose title or brand contains what was typed.
+
+    Public because the watchlist searches by the same words the shelf does:
+    a name typed into `pi price` and the same name put on the watchlist must
+    mean the same thing.
+    """
     like = f"%{text}%"
     return [
         row[0]
@@ -1934,7 +1939,7 @@ def lookup_article(conn: sqlite3.Connection, query: str, limit: int = 25) -> dic
             result["matched_by"], result["key"] = reference.SKU, text.upper()
 
     if not ids:
-        ids = _products_by_name(conn, text)
+        ids = products_by_name(conn, text)
         if ids:
             result["matched_by"], result["key"] = reference.TITLE, text
 

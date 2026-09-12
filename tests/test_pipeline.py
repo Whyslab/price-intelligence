@@ -1695,3 +1695,78 @@ class TestSeenIsNotTheSameAsChanged:
             "SELECT variant_id FROM offers WHERE checked_at >= ?", (ts(1),)
         ).fetchall()
         assert [row[0] for row in fresh] == [one]
+
+
+class TestTheWatchlistTakesNamesAsWellAsNumbers:
+    """Отслеживать можно было только по номеру модели.
+
+    Человек, который хочет следить за «Salomon XT-6», номера её не знает и
+    знать не обязан. Номер и название — разные вопросы, и читаются они
+    по-разному, но оба должны работать.
+    """
+
+    @staticmethod
+    def _file(tmp_path, text):
+        path = tmp_path / "watchlist.txt"
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def test_a_number_is_read_as_a_number(self, tmp_path):
+        watch = pipeline.read_watchlist(self._file(tmp_path, "CW2288-111\nM2002RDB\n"))
+        assert watch.articles == {"CW2288-111", "M2002RDB"}
+        assert watch.names == ()
+
+    def test_words_are_read_as_a_name(self, tmp_path):
+        watch = pipeline.read_watchlist(self._file(tmp_path, "Salomon XT-6\n"))
+        assert watch.names == ("Salomon XT-6",)
+        assert watch.articles == frozenset()
+
+    def test_a_single_word_without_digits_is_a_name_not_an_article(self, tmp_path):
+        """`nike` стоит в поле SKU ровно у одного магазина.
+
+        Принять это за номер значило бы отдать один магазин тому, кто явно
+        спросил про марку.
+        """
+        watch = pipeline.read_watchlist(self._file(tmp_path, "Salomon\n"))
+        assert watch.names == ("Salomon",)
+        assert watch.articles == frozenset()
+
+    def test_comments_and_blank_lines_are_still_ignored(self, tmp_path):
+        watch = pipeline.read_watchlist(
+            self._file(tmp_path, "# так и оставить\n\nCW2288-111  # тот самый\n")
+        )
+        assert watch.articles == {"CW2288-111"}
+        assert watch.names == ()
+
+    def test_a_missing_file_watches_nothing(self, tmp_path):
+        watch = pipeline.read_watchlist(tmp_path / "нет-такого.txt")
+        assert not watch
+
+    def test_a_name_finds_the_products_a_number_would_have_missed(self, conn):
+        store = dbm.upsert_store(conn, "shop.example", platform="shopify", currency="USD")
+        wanted = dbm.upsert_product(
+            conn, store, "p1", "Salomon XT-6 Expanse", "https://shop.example/p1",
+            brand="Salomon",
+        )
+        dbm.upsert_product(
+            conn, store, "p2", "Nike Air Force 1 '07", "https://shop.example/p2",
+            brand="Nike",
+        )
+        conn.commit()
+
+        watch = pipeline.Watchlist(names=("Salomon XT-6",))
+        assert pipeline.watched_products(conn, watch) == {wanted}
+
+    def test_numbers_and_names_are_both_honoured_at_once(self, conn):
+        store = dbm.upsert_store(conn, "shop.example", platform="shopify", currency="USD")
+        by_name = dbm.upsert_product(
+            conn, store, "p1", "Salomon XT-6", "https://shop.example/p1", brand="Salomon",
+        )
+        by_number = dbm.upsert_product(
+            conn, store, "p2", "Nike Air Force 1", "https://shop.example/p2", brand="Nike",
+        )
+        dbm.set_product_keys(conn, by_number, [(reference.STYLE, "CW2288-111")])
+        conn.commit()
+
+        watch = pipeline.Watchlist(frozenset({"CW2288-111"}), ("Salomon XT-6",))
+        assert pipeline.watched_products(conn, watch) == {by_name, by_number}

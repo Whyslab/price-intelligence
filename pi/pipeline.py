@@ -537,37 +537,78 @@ def _cap_per_store(
     return kept
 
 
-def read_watchlist(path: Path) -> set[str]:
-    """Article numbers to be told about regardless of the thresholds.
+@dataclass(frozen=True)
+class Watchlist:
+    """Что отслеживать: номера моделей и названия. Это разные вопросы.
 
-    One per line, blank lines and # comments ignored. Written as the
-    manufacturer writes them — CW2288-111, M2002RDB — and matched against both
-    the article numbers we extract and the shops' own SKUs, because a shop that
-    uses the manufacturer's number as its SKU is the common case.
+    Номер — это то, к чему два магазина приходят независимо, и совпадение по
+    нему есть совпадение. Название — это поиск: «air force 1 07» найдёт 242
+    разных товара. Поэтому они и хранятся врозь, как и в `lookup_article`.
+    """
+
+    articles: frozenset[str] = frozenset()
+    names: tuple[str, ...] = ()
+
+    def __bool__(self) -> bool:
+        return bool(self.articles or self.names)
+
+
+def read_watchlist(path: Path) -> Watchlist:
+    """Что отслеживать вне зависимости от порогов.
+
+    По строке на запись, пустые строки и # — комментарии.
+
+    Строка читается как **номер модели**, если она написана так, как их пишут
+    производители: без пробелов и хотя бы с одной цифрой — CW2288-111, M2002RDB.
+    Такие сверяются и с извлечёнными артикулами, и с собственными SKU магазинов,
+    потому что магазин, кладущий номер производителя в своё поле SKU, — обычное
+    дело.
+
+    Всё остальное читается как **название**: «Salomon XT-6», «прострочка».
+    Слово без цифр тоже название — `nike` стоит в поле SKU ровно у одного
+    магазина, и принять это за номер значило бы отдать один магазин тому, кто
+    явно спросил про марку.
     """
     if not path.exists():
-        return set()
-    codes = set()
+        return Watchlist()
+    articles: set[str] = set()
+    names: list[str] = []
     for line in path.read_text(encoding="utf-8").splitlines():
-        code = line.split("#", 1)[0].strip().upper()
-        if code:
-            codes.add(code)
-    return codes
+        entry = line.split("#", 1)[0].strip()
+        if not entry:
+            continue
+        if " " not in entry and any(ch.isdigit() for ch in entry):
+            articles.add(entry.upper())
+        else:
+            names.append(entry)
+    return Watchlist(frozenset(articles), tuple(names))
 
 
-def watched_products(conn: sqlite3.Connection, codes: set[str]) -> set[int]:
-    """Which products those article numbers refer to, in any shop."""
-    if not codes:
+def watched_products(conn: sqlite3.Connection, watch: Watchlist) -> set[int]:
+    """Какие товары имеются в виду — в любом магазине.
+
+    Номера сверяются по ключам, названия ищутся тем же запросом, что и ручной
+    поиск `pi price`: одна и та же строка должна находить одно и то же, где бы
+    её ни набрали.
+    """
+    if not watch:
         return set()
-    placeholders = ",".join("?" * len(codes))
-    rows = conn.execute(
-        f"""
-        SELECT product_id FROM product_keys
-        WHERE key_type IN ('style', 'sku') AND key IN ({placeholders})
-        """,
-        sorted(codes),
-    )
-    return {row[0] for row in rows}
+    found: set[int] = set()
+
+    if watch.articles:
+        placeholders = ",".join("?" * len(watch.articles))
+        rows = conn.execute(
+            f"""
+            SELECT product_id FROM product_keys
+            WHERE key_type IN ('style', 'sku') AND key IN ({placeholders})
+            """,
+            sorted(watch.articles),
+        )
+        found.update(row[0] for row in rows)
+
+    for name in watch.names:
+        found.update(dbm.products_by_name(conn, name))
+    return found
 
 
 def _one_alert_per_article(
