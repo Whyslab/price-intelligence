@@ -824,6 +824,12 @@ class Bot:
         """
         return self.is_owner(user) and self._is_private(chat, {"id": user["id"]})
 
+    def shelf_url(self, user: sqlite3.Row) -> str | None:
+        """The shelf's address for this reader's menu, or None for no button."""
+        if self.config.web_private and not self.is_owner(user):
+            return None
+        return self.config.web_url
+
     def is_owner(self, user: sqlite3.Row) -> bool:
         """Whether this is the person who runs the collector.
 
@@ -1114,7 +1120,7 @@ class Bot:
             await self.send(
                 chat_id,
                 f"✅ Подписка активна до <b>{_date(user['paid_until'])}</b>.",
-                menu_keyboard(user, self.config.web_url, subscribed=True),
+                menu_keyboard(user, self.shelf_url(user), subscribed=True),
             )
             return
 
@@ -1133,7 +1139,7 @@ class Bot:
             (f"✅ Подписка продлена до <b>{until}</b>." if renewal else
              f"✅ Готово. Подписка активна до <b>{until}</b>.\n\n"
              "Полка, поиск по артикулу и лента под ваш профиль открыты."),
-            menu_keyboard(row, self.config.web_url, subscribed=True),
+            menu_keyboard(row, self.shelf_url(row), subscribed=True),
         )
 
     async def show_menu(self, chat_id: str, user: sqlite3.Row):
@@ -1141,7 +1147,7 @@ class Bot:
             chat_id,
             "⚙️ <b>Что показывать</b>\n\n" + describe_profile(user),
             menu_keyboard(
-                user, self.config.web_url,
+                user, self.shelf_url(user),
                 # Not sold means not offered: no button, no nagging.
                 subscribed=(
                     not self.config.subscription
@@ -1240,7 +1246,7 @@ class Bot:
                     [{"text": "Настроить", "callback_data": "wizard"},
                      {"text": "Показать всё", "callback_data": "p:0"}],
                     [{"text": "💎 Что даёт подписка", "callback_data": "pitch"}],
-                    *([shelf] if (shelf := shelf_button(self.config.web_url)) else []),
+                    *([shelf] if (shelf := shelf_button(self.shelf_url(user))) else []),
                 ]},
             )
             return

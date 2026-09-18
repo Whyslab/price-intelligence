@@ -154,6 +154,10 @@ class Config:
     # localhost, and offering a link to a machine the reader is not sitting at
     # is worse than offering nothing.
     web_url: str | None = None
+    # The shelf is reachable only inside the owner's own Tailscale network, so
+    # anybody else would be handed a button that opens nothing. PI_WEB_PRIVATE=on
+    # keeps it in the owner's menu alone; off, every reader gets it.
+    web_private: bool = False
     filters: Filters = field(default_factory=Filters)
 
     @property
@@ -201,6 +205,7 @@ def load_config(env_file: Path | None = None) -> Config:
         # PI_SUBSCRIPTION=on turns selling back on. Anything else, including
         # absent, leaves it off.
         subscription=(os.getenv("PI_SUBSCRIPTION") or "").strip().lower() == "on",
+        web_private=(os.getenv("PI_WEB_PRIVATE") or "").strip().lower() == "on",
         concurrency=int(os.getenv("PI_CONCURRENCY", "8")),
         shopify_rate=float(os.getenv("PI_SHOPIFY_RATE", "2.0")),
         shopify_host_rate=float(os.getenv("PI_SHOPIFY_HOST_RATE", "0.5")),

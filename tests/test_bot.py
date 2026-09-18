@@ -250,6 +250,36 @@ class TestRouting:
         buttons = calls[0][1]["reply_markup"]["inline_keyboard"][0]
         assert [b["callback_data"] for b in buttons] == ["wizard", "p:0"]
 
+    @staticmethod
+    def _shelf_buttons(calls) -> list[dict]:
+        rows = calls[0][1]["reply_markup"]["inline_keyboard"]
+        return [b for row in rows for b in row if "web_app" in b or "url" in b]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("private, sender, sees", [
+        (False, 7, True),    # an open shelf is everybody's
+        (True, 42, True),    # a private one is the owner's (TELEGRAM_CHAT_ID=42)
+        (True, 7, False),    # and nobody else gets a button that opens nothing
+    ])
+    async def test_who_is_offered_the_shelf(self, conn, tmp_path, monkeypatch, private, sender, sees):
+        from dataclasses import replace
+
+        config = replace(
+            self._config(tmp_path), web_url="https://shelf.example", web_private=private
+        )
+        robot = bot.Bot(config, conn)
+        calls = []
+
+        async def record(method, payload):
+            calls.append((method, payload))
+            return {"username": "test"}
+
+        monkeypatch.setattr(robot, "_call", record)
+        await robot.handle({"message": {
+            "chat": {"id": sender}, "from": {"id": sender, "username": "u"}, "text": "/start",
+        }})
+        assert bool(self._shelf_buttons(calls)) is sees
+
     @pytest.mark.asyncio
     async def test_the_list_button_sends_a_photo_for_every_offer(self, robot, calls, conn):
         """Clothes are chosen by looking at them."""
