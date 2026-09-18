@@ -42,6 +42,9 @@ header{position:sticky;top:0;z-index:20;background:var(--bg);
 .tool{flex:0 0 auto;background:var(--card);border:1px solid var(--line);
       border-radius:10px;padding:9px 12px;cursor:pointer;white-space:nowrap}
 .tool[aria-expanded=true]{background:var(--ink);color:var(--bg);border-color:var(--ink)}
+/* Почему нет сердечек — только в обычном браузере, где об этом иначе не узнать. */
+.nofav{max-width:1400px;margin:0 auto;padding:0 12px 8px;font-size:12px;color:var(--dim)}
+.nofav code{font-size:11px}
 .tool .n{display:inline-block;min-width:18px;margin-left:5px;padding:0 5px;
          border-radius:9px;background:var(--hot);color:#fff;font-size:12px;text-align:center}
 /* display on the class would otherwise beat the hidden attribute, and the
@@ -230,6 +233,8 @@ tr.cheap td.p{color:var(--accent);font-weight:600}
     </select>
     <span class="count" id="count"></span>
   </div>
+  <p class="nofav" id="nofav" hidden>Сердечек нет: страница не знает, кто смотрит. Они есть в
+    Telegram и при запуске <code>pi web --owner &lt;ваш Telegram id&gt;</code>.</p>
   <div class="active" id="active"></div>
   <div class="panel" id="panel"><div class="inner">
     <div class="group">
@@ -354,7 +359,13 @@ async function identity(){
   if (me === null){
     let r;
     try { r = await fetch("/api/favorites", {headers: tg_headers()}); } catch { return; }
-    if (!r.ok) return;
+    if (!r.ok){
+      // 13.09 сердечки «пропали» у того, кто открыл полку командой без
+      // --owner, — и страница никак не сказала почему. Внутри Telegram
+      // подсказка не нужна: там это отказ, а не забытый ключ.
+      if (r.status === 401 && !window.Telegram?.WebApp?.initData) el("nofav").hidden = false;
+      return;
+    }
     const d = await r.json();
     announce(d.user, d.items.map(i => i.id));
     // Лист, открытый по ссылке из бота, успел нарисоваться без сердечка.
