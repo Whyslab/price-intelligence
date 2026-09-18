@@ -264,6 +264,46 @@ async def test_prices_are_converted_from_the_shops_currency(config, shopify_payl
 
 
 @respx.mock
+async def test_the_currency_a_shop_serves_in_is_what_the_store_remembers(config, shopify_payload):
+    """Stadium Goods says USD in /meta.json and served kroner; the answer wins,
+    and the shop is remembered in the currency its prices were written in."""
+    _mock_rates()
+    _mock_telegram()
+    respx.get("https://shop.example/products.json?limit=250").mock(
+        return_value=httpx.Response(
+            200, json=shopify_payload, headers={"set-cookie": "cart_currency=USD; path=/"}
+        )
+    )
+    _mock_product_pages(shopify_payload)
+
+    conn = dbm.connect(config.db_path)
+    known_store(conn)  # recorded as GBP
+    await pipeline.run(config, conn, collect_only=True)
+
+    assert conn.execute("SELECT currency FROM stores").fetchone()[0] == "USD"
+    assert {r[0] for r in conn.execute("SELECT DISTINCT currency FROM price_points")} == {"USD"}
+
+
+@respx.mock
+async def test_a_currency_without_a_rate_is_not_written_onto_the_shop(config, shopify_payload):
+    _mock_rates()
+    _mock_telegram()
+    respx.get("https://shop.example/products.json?limit=250").mock(
+        return_value=httpx.Response(
+            200, json=shopify_payload, headers={"set-cookie": "cart_currency=XTS; path=/"}
+        )
+    )
+    _mock_product_pages(shopify_payload)
+
+    conn = dbm.connect(config.db_path)
+    known_store(conn)
+    await pipeline.run(config, conn, collect_only=True)
+
+    assert conn.execute("SELECT currency FROM stores").fetchone()[0] == "GBP"
+    assert conn.execute("SELECT COUNT(*) FROM price_points").fetchone()[0] == 0
+
+
+@respx.mock
 async def test_the_same_deal_is_not_sent_twice(config, shopify_payload):
     _mock_rates()
     _mock_product_pages(shopify_payload)

@@ -61,3 +61,19 @@ def make_history(
             (ts(days_ago), price, compare, money, price, compare),
         )
     return scratch.execute("SELECT * FROM p ORDER BY ts").fetchall()
+
+
+@pytest.fixture(autouse=True)
+def _shopify_unstated_currency_keeps_the_record(request, monkeypatch):
+    """Most tests stand in a shop that names no currency, and are about
+    something else. Asking /meta.json again would be a request they never
+    mocked, so they keep the recorded currency; tests of that very path mark
+    themselves `asks_meta` and get the real thing."""
+    if request.node.get_closest_marker("asks_meta"):
+        return
+    from pi.sources import shopify
+
+    async def keep(client, base, limiter, recorded):
+        return recorded
+
+    monkeypatch.setattr(shopify, "currency_when_unstated", keep)

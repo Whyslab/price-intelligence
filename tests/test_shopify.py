@@ -192,6 +192,201 @@ async def test_a_meta_currency_that_is_not_a_currency_is_not_believed():
 
 
 @respx.mock
+async def test_the_currency_the_answer_names_beats_the_one_on_record(shopify_payload):
+    """A Markets shop quotes the visitor's currency and says so in a cookie.
+
+    www.stadiumgoods.com states USD in /meta.json and served NOK to a reader in
+    Norway, so a 1,095 kr Air Force 1 was stored — and shown — as $1095.
+    """
+    respx.get("https://shop.example/products.json?limit=250").mock(
+        return_value=httpx.Response(
+            200, json=shopify_payload,
+            headers={"set-cookie": "cart_currency=NOK; path=/; SameSite=Lax"},
+        )
+    )
+    async with httpx.AsyncClient() as client:
+        result = await shopify.fetch(client, "shop.example", currency="USD")
+
+    assert result.ok and result.currency == "NOK"
+    assert {p.currency for p in result.products} == {"NOK"}
+
+
+@respx.mock
+async def test_the_cookie_carried_back_still_names_the_currency(shopify_payload):
+    """Once the client holds the cookie the shop stops setting it; the request
+    that carried it is then the only statement of what the page is priced in."""
+    route = respx.get("https://shop.example/products.json?limit=250").mock(
+        return_value=httpx.Response(200, json=shopify_payload)
+    )
+    async with httpx.AsyncClient(cookies={"cart_currency": "NOK"}) as client:
+        result = await shopify.fetch(client, "shop.example", currency="USD")
+
+    assert route.called
+    assert result.currency == "NOK"
+    assert {p.currency for p in result.products} == {"NOK"}
+
+
+@respx.mock
+async def test_a_shop_that_answers_in_its_base_keeps_it(shopify_payload):
+    """The 2 September repair still holds: www.slamcity.com serves pounds and
+    says GBP, whatever the storefront shows a visitor."""
+    respx.get("https://shop.example/products.json?limit=250").mock(
+        return_value=httpx.Response(
+            200, json=shopify_payload, headers={"set-cookie": "cart_currency=GBP; path=/"}
+        )
+    )
+    async with httpx.AsyncClient() as client:
+        result = await shopify.fetch(client, "shop.example", currency="GBP")
+
+    assert result.currency == "GBP"
+    assert {p.currency for p in result.products} == {"GBP"}
+
+
+@respx.mock
+async def test_an_answer_that_names_nothing_keeps_the_currency_on_record(shopify_payload):
+    respx.get("https://shop.example/products.json?limit=250").mock(
+        return_value=httpx.Response(200, json=shopify_payload)
+    )
+    async with httpx.AsyncClient() as client:
+        result = await shopify.fetch(client, "shop.example", currency="USD")
+
+    assert result.currency == "USD"
+    assert {p.currency for p in result.products} == {"USD"}
+
+
+@respx.mock
+async def test_one_product_is_priced_in_the_currency_it_names(shopify_payload):
+    raw = dict(shopify_payload["products"][0])
+    raw["variants"] = [
+        {**v, "price": "1110.00", "price_currency": "NOK"} for v in raw["variants"]
+    ]
+    respx.get("https://shop.example/products/thing.json").mock(
+        return_value=httpx.Response(200, json={"product": raw})
+    )
+    async with httpx.AsyncClient() as client:
+        status, product = await shopify.fetch_product(client, "shop.example", "thing")
+
+    assert status == "ok" and product.currency == "NOK"
+
+
+@respx.mock
+async def test_one_product_without_price_currency_falls_back_to_the_cookie(shopify_payload):
+    raw = shopify_payload["products"][0]
+    respx.get("https://shop.example/products/thing.json").mock(
+        return_value=httpx.Response(
+            200, json={"product": raw}, headers={"set-cookie": "cart_currency=NOK; path=/"}
+        )
+    )
+    async with httpx.AsyncClient() as client:
+        status, product = await shopify.fetch_product(client, "shop.example", "thing")
+
+    assert status == "ok" and product.currency == "NOK"
+
+
+@respx.mock
+async def test_only_the_first_page_needs_to_name_the_currency(shopify_payload):
+    """A client that keeps its cookies to itself (curl_cffi) names nothing
+    after page one; those pages are still the same catalogue in the same money."""
+    base = "https://shop.example"
+    repeats = -(-shopify.PAGE_SIZE // len(shopify_payload["products"]))
+    full = {"products": shopify_payload["products"] * repeats}
+    respx.get(f"{base}/products.json?limit=250").mock(
+        return_value=httpx.Response(200, json=full, headers={"set-cookie": "cart_currency=NOK"})
+    )
+    later = dict(shopify_payload["products"][0], id=987654321)
+    respx.get(f"{base}/products.json?limit=250&page=2").mock(
+        return_value=httpx.Response(200, json={"products": [later]})
+    )
+    async with httpx.AsyncClient() as client:
+        result = await shopify.fetch(client, "shop.example", currency="USD")
+
+    assert result.currency == "NOK"
+    stored = [p.currency or result.currency for p in result.products]
+    assert set(stored) == {"NOK"}
+
+
+@respx.mock
+async def test_a_redirect_that_set_the_cookie_still_counts(shopify_payload):
+    respx.get("https://apex.example/products.json?limit=250").mock(
+        return_value=httpx.Response(
+            301, headers={"location": "https://www.apex.example/products.json?limit=250",
+                          "set-cookie": "cart_currency=SEK; path=/; domain=other.example"},
+        )
+    )
+    respx.get("https://www.apex.example/products.json?limit=250").mock(
+        return_value=httpx.Response(200, json=shopify_payload)
+    )
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        resp = await client.get("https://apex.example/products.json?limit=250")
+    assert shopify.served_currency(resp) == "SEK"
+
+
+@pytest.mark.asks_meta
+@respx.mock
+async def test_an_answer_naming_nothing_asks_the_shop_not_the_record(shopify_payload):
+    """The record may be a cookie from another address. A shop that stops
+    saying what it serves is asked again, or dollars go in as kroner."""
+    respx.get("https://shop.example/products.json?limit=250").mock(
+        return_value=httpx.Response(200, json=shopify_payload)
+    )
+    meta = respx.get("https://shop.example/meta.json").mock(
+        return_value=httpx.Response(200, json={"country": "US", "currency": "USD"})
+    )
+    async with httpx.AsyncClient() as client:
+        result = await shopify.fetch(client, "shop.example", currency="NOK")
+
+    assert meta.call_count == 1
+    assert result.currency == "USD"
+    assert {p.currency for p in result.products} == {"USD"}
+
+
+@pytest.mark.asks_meta
+@respx.mock
+async def test_a_shop_that_names_its_currency_is_not_asked_again(shopify_payload):
+    respx.get("https://shop.example/products.json?limit=250").mock(
+        return_value=httpx.Response(200, json=shopify_payload, headers={"set-cookie": "cart_currency=NOK"})
+    )
+    meta = respx.get("https://shop.example/meta.json")
+    async with httpx.AsyncClient() as client:
+        result = await shopify.fetch(client, "shop.example", currency="USD")
+
+    assert not meta.called and result.currency == "NOK"
+
+
+@pytest.mark.asks_meta
+@respx.mock
+async def test_a_shop_that_answers_no_meta_keeps_the_record(shopify_payload):
+    respx.get("https://shop.example/products.json?limit=250").mock(
+        return_value=httpx.Response(200, json=shopify_payload)
+    )
+    respx.get("https://shop.example/meta.json").mock(return_value=httpx.Response(404))
+    respx.get("https://shop.example/").mock(return_value=httpx.Response(200, text="<html></html>"))
+    async with httpx.AsyncClient() as client:
+        result = await shopify.fetch(client, "shop.example", currency="NOK")
+
+    assert result.currency == "NOK"
+
+
+def test_cart_currency_is_found_among_other_cookies():
+    resp = httpx.Response(
+        200, headers=[
+            ("set-cookie", "_shopify_y=abc; path=/"),
+            ("set-cookie", "cart_currency=nok; path=/; expires=Fri, 02 Oct 2026 10:48:36 GMT"),
+        ],
+    )
+    assert shopify.served_currency(resp) == "NOK"
+    # curl_cffi folds every Set-Cookie into one comma-joined value, and a
+    # cookie's own expiry date has a comma in it too.
+    folded = httpx.Response(200, headers={"set-cookie": (
+        "_y=1; path=/; expires=Fri, 02 Oct 2026 10:48:36 GMT, cart_currency=NOK; path=/"
+    )})
+    assert shopify.served_currency(folded) == "NOK"
+    assert shopify.served_currency(httpx.Response(200)) is None
+    lookalike = httpx.Response(200, headers={"set-cookie": "old_cart_currency=EUR; path=/"})
+    assert shopify.served_currency(lookalike) is None
+
+
+@respx.mock
 async def test_currency_falls_back_to_the_shops_country():
     """An older shop whose /meta.json names a country and no currency."""
     respx.get("https://shop.example/").mock(return_value=httpx.Response(200, text="<html></html>"))

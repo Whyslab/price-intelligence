@@ -43,6 +43,38 @@ _CURRENCY_META = re.compile(
     re.IGNORECASE,
 )
 _LINK_NEXT = re.compile(r'<([^>]+)>\s*;\s*rel="next"')
+_CART_CURRENCY = re.compile(r"(?:^|[;,\s])cart_currency=([A-Za-z]{3})(?:[;,\s]|$)")
+
+
+def served_currency(resp: httpx.Response) -> str | None:
+    """The currency this particular answer is priced in, as the shop said so.
+
+    With Shopify Markets on, /products.json is not quoted in the shop's base
+    currency but in the one it chose for the visitor, and it names that choice
+    in the `cart_currency` cookie of the very same answer — or, once the cookie
+    is held, in the one the request carried back. Measured on 18.09.2026 from
+    Norway: www.stadiumgoods.com states USD in /meta.json and served NOK, and
+    seven other shops did the same, so from 2 September their kroner went into
+    the database as dollars — a 1,095 kr Air Force 1 shown at $1095. The same
+    cookie says GBP at www.slamcity.com, whose prices really are pounds, so
+    trusting the answer over /meta.json keeps that fix without the damage.
+    """
+    # The last statement wins: a redirect may set the cookie on the way in,
+    # and a later answer that sets it again has changed its mind.
+    stated = None
+    for answer in (*resp.history, resp):
+        for value in answer.headers.get_list("set-cookie"):
+            for found in _CART_CURRENCY.finditer(value):
+                stated = found.group(1).upper()
+    if stated:
+        return stated
+    try:
+        sent = resp.request.headers.get("cookie", "")
+    except RuntimeError:  # a response built by hand has no request behind it
+        return None
+    found = _CART_CURRENCY.search(sent)
+    return found.group(1).upper() if found else None
+
 
 # Used only when the storefront gives nothing away.
 _COUNTRY_CURRENCY = {
@@ -60,10 +92,14 @@ _COUNTRY_CURRENCY = {
 async def detect_currency(
     client: httpx.AsyncClient, base: str, limiter: RateLimiter | NullLimiter | None = None
 ) -> str | None:
-    """Which currency /products.json is denominated in.
+    """Which currency /products.json is denominated in, before it has answered.
+
+    Only the first guess: a Markets shop may quote the visitor's currency
+    instead, and then the answer itself says so — see `served_currency`, which
+    wins over this whenever the shop names one.
 
     `/meta.json` is asked first because it is the shop's own statement of its
-    base currency, and that is what /products.json quotes. The storefront names
+    base currency, and that is what /products.json quotes otherwise. The storefront names
     something else: with Shopify Markets on, `Shopify.currency.active` is the
     currency chosen for *this visitor*, converted from the base for display, and
     which one that is depends on where the request appeared to come from.
@@ -109,6 +145,14 @@ async def detect_currency(
     except httpx.HTTPError as exc:
         log.debug("%s: storefront unreadable for currency (%s)", base, exc)
     return None
+
+
+async def currency_when_unstated(
+    client: httpx.AsyncClient, base: str, limiter: RateLimiter | NullLimiter,
+    recorded: str | None,
+) -> str | None:
+    """The shop's own statement, for an answer that named no currency at all."""
+    return await detect_currency(client, base, limiter) or recorded
 
 
 async def _get_page(
@@ -314,6 +358,17 @@ async def fetch_product(
     if not isinstance(raw, dict):
         return "unreachable", None
     parsed = parse_products({"products": [raw]}, base)
+    if parsed:
+        # The single-product form names its currency on every variant; the
+        # cookie is the same statement, kept for an answer that leaves it out.
+        stated = next(
+            (str(v.get("price_currency") or "") for v in raw.get("variants") or []
+             if isinstance(v, dict) and v.get("price_currency")),
+            "",
+        ).strip().upper()
+        parsed[0].currency = (
+            stated if len(stated) == 3 and stated.isalpha() else served_currency(resp)
+        )
     # Still published, but with nothing left that has a price: no variant can be
     # bought, which is the same thing as gone as far as a shelf is concerned.
     return ("ok", parsed[0]) if parsed else ("gone", None)
@@ -388,9 +443,22 @@ async def fetch(
             return FetchResult(domain=domain, currency=currency, error="not a Shopify catalogue")
 
         raw = payload.get("products") or []
+        served = served_currency(resp)
+        if served is None and not products:
+            # The record may be a cookie from another day and another address:
+            # a collector that moves country and meets a shop which no longer
+            # says what it serves would otherwise store dollars as kroner, ten
+            # times too cheap and every one of them a "deal". Only the first
+            # page asks — later ones are the same answer, and a client that
+            # keeps its cookies to itself (curl_cffi) names nothing after it.
+            served = await currency_when_unstated(client, base, limiter, currency)
+        if served and served != currency:
+            log.info("%s: priced in %s, not the %s on record", domain, served, currency)
+            currency = served
         for product in parse_products(payload, base):
             if product.external_id not in seen_ids:
                 seen_ids.add(product.external_id)
+                product.currency = served
                 products.append(product)
 
         # The storefront endpoint paginates with ?page=N and sends no Link header —

@@ -1104,8 +1104,13 @@ async def run(
                 "last_error": None,
                 "product_count": len(result.products),
             }
-            if result.currency:
+            if result.currency and result.currency in rates:
                 fields["currency"] = result.currency
+            elif result.currency:
+                # Every price was already dropped for want of a rate; keeping
+                # the shop's last known currency lets the next pass recover.
+                log.warning("%s: priced in %s, which has no exchange rate",
+                            store["domain"], result.currency)
             fields["sitemap_cursor"] = result.next_cursor
             dbm.upsert_store(conn, store["domain"], **fields)
             log.info(
