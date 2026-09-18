@@ -30,9 +30,10 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+from contextlib import closing
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urljoin, urlparse
 
 import httpx
 
@@ -40,6 +41,23 @@ from . import db as dbm
 from . import webauth
 
 log = logging.getLogger(__name__)
+
+
+def shop_link(url: str | None, domain: str | None) -> str | None:
+    """The address a card opens, or None when it is not a web page at all.
+
+    Shops write the link themselves, and 2,769 products carry one relative to
+    the shop (`/products/…`): opened from the shelf it resolved against the
+    shelf's own address and gave a 404. Resolved against the shop instead.
+    Anything that is not http(s) afterwards — `javascript:` above all — is
+    refused: the page runs inside Telegram with the reader's signature to hand.
+    """
+    raw = (url or "").strip()
+    if not raw:
+        return None
+    if domain:
+        raw = urljoin(f"https://{domain}/", raw)
+    return raw if urlparse(raw).scheme in ("http", "https") else None
 
 PAGE = Path(__file__).with_name("shelf.html")
 PAGE_SIZE = 60
@@ -180,7 +198,7 @@ def offer_json(row: sqlite3.Row) -> dict:
         # Absent on the product page, which is already showing every size.
         "sizes_on_offer": row["sizes_on_offer"] if "sizes_on_offer" in keys else 1,
         "title": row["title"],
-        "url": row["url"],
+        "url": shop_link(row["url"], row["domain"]),
         "image": row["image_url"],
         "brand": row["brand_family"] or row["brand"],
         "shop": row["store_name"] or row["domain"],
@@ -242,7 +260,7 @@ def product_page(
             "shop": other["store_name"] or other["domain"],
             "domain": other["domain"],
             "country": other["country"],
-            "url": other["url"],
+            "url": shop_link(other["url"], other["domain"]),
             "title": other["title"],
             "price": round(other["price_usd"], 2),
             "checked_at": other["last_ok"],
@@ -269,7 +287,7 @@ def lookup_json(row: sqlite3.Row) -> dict:
         "shop": row["store_name"] or row["domain"],
         "domain": row["domain"],
         "country": row["country"],
-        "url": row["url"],
+        "url": shop_link(row["url"], row["domain"]),
         "title": row["title"],
         "brand": row["brand_norm"],
         "price": round(row["price_usd"], 2),
@@ -313,7 +331,7 @@ def favorite_json(item: dict) -> dict:
         "id": item["product_id"],
         "variant": item["variant_id"],
         "title": item["title"],
-        "url": item["url"],
+        "url": shop_link(item["url"], item["domain"]),
         "image": item["image_url"],
         "brand": item["brand"],
         "shop": item["store_name"] or item["domain"],
@@ -513,6 +531,9 @@ MAX_BODY = 4096
 
 
 class Handler(BaseHTTPRequestHandler):
+    # A client that stops sending mid-request would otherwise hold its thread
+    # for good; the server now runs as a service rather than for an evening.
+    timeout = 15
     """One request. A connection per request, because the server is threaded."""
 
     db_path: Path = Path("data/pi.db")
@@ -666,7 +687,7 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         try:
             if parsed.path in ("/", "/index.html"):
-                with self._open() as conn:
+                with closing(self._open()) as conn:
                     reader = self._reader()
                     if reader is None:
                         # Nobody has said who this is *yet*, and on this request
@@ -698,7 +719,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, body, "text/html; charset=utf-8")
                 return
             if parsed.path == "/api/facets":
-                with self._open() as conn:
+                with closing(self._open()) as conn:
                     if not self._paying(conn):
                         self._json(SUBSCRIPTION_REQUIRED, 402)
                         return
@@ -716,7 +737,7 @@ class Handler(BaseHTTPRequestHandler):
                 except ValueError:
                     self._json({"error": "not a product id"}, 400)
                     return
-                with self._open() as conn:
+                with closing(self._open()) as conn:
                     if not self._paying(conn):
                         self._json(SUBSCRIPTION_REQUIRED, 402)
                         return
@@ -727,14 +748,14 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if parsed.path == "/api/lookup":
                 wanted = (parse_qs(parsed.query).get("q", [""])[0] or "").strip()
-                with self._open() as conn:
+                with closing(self._open()) as conn:
                     if not self._paying(conn):
                         self._json(SUBSCRIPTION_REQUIRED, 402)
                         return
                     self._json(lookup_page(conn, wanted))
                 return
             if parsed.path == "/api/offers":
-                with self._open() as conn:
+                with closing(self._open()) as conn:
                     if not self._paying(conn):
                         self._json(SUBSCRIPTION_REQUIRED, 402)
                         return
@@ -748,7 +769,7 @@ class Handler(BaseHTTPRequestHandler):
                 if user_id is None:
                     self._json({"error": "not signed in"}, 401)
                     return
-                with self._open() as conn:
+                with closing(self._open()) as conn:
                     # Gated like the shelf, because it *is* the shelf. A starred
                     # row carries the title, the shop, the live price and the
                     # discount — the same fields the card draws. Left on the
@@ -795,7 +816,7 @@ class Handler(BaseHTTPRequestHandler):
                 variant_id = int(payload["variant_id"])
             except (KeyError, TypeError, ValueError):
                 variant_id = None
-            with self._open_rw() as conn:
+            with closing(self._open_rw()) as conn, conn:
                 # Starring is a subscriber feature: `pipeline` only sends
                 # followed-price alerts to `subscribers()`, so a free reader
                 # gets nothing from a star except a row they could read a price
@@ -837,7 +858,7 @@ class Handler(BaseHTTPRequestHandler):
             # lapsed must still be able to take their own things off their own
             # list, and un-starring reveals nothing: it reads no product row and
             # answers with the id the caller already sent.
-            with self._open_rw() as conn:
+            with closing(self._open_rw()) as conn, conn:
                 removed = dbm.remove_favorite(conn, user_id, product_id)
                 conn.commit()
             self._json({"product_id": product_id, "removed": removed})

@@ -287,6 +287,9 @@ const plural = (n, one, few, many) => {
   const t = Math.abs(n) % 100, u = t % 10;
   return n + " " + (t > 10 && t < 20 ? many : u === 1 ? one : u > 1 && u < 5 ? few : many);
 };
+// The server already refuses anything that is not a web page; this is the
+// second lock, because a card's link is written by a shop, not by us.
+const safe = u => /^https?:\/\//i.test(String(u ?? "")) ? u : "#";
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c =>
   ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 
@@ -644,7 +647,7 @@ function card(o){
   const wrap = document.createElement("div");
   wrap.className = "wrap";
   const a = document.createElement("a");
-  a.className = "card"; a.href = o.url; a.target = "_blank"; a.rel = "noopener";
+  a.className = "card"; a.href = safe(o.url); a.target = "_blank"; a.rel = "noopener";
   // The link is real, so middle-click and "open in new tab" still work; the
   // click is intercepted only to show what everyone else charges first.
   a.onclick = e => { e.preventDefault(); open_sheet(o.id, o.variant); };
@@ -678,7 +681,7 @@ function fav_card(o){
   const wrap = document.createElement("div");
   wrap.className = "wrap";
   const a = document.createElement("a");
-  a.className = "card"; a.href = o.url; a.target = "_blank"; a.rel = "noopener";
+  a.className = "card"; a.href = safe(o.url); a.target = "_blank"; a.rel = "noopener";
   a.onclick = e => { e.preventDefault(); open_sheet(o.id, o.variant); };
   const f = freshness(o.checked_at);
   const move = (o.price != null && o.since) ? o.price - o.since : null;
@@ -847,7 +850,7 @@ async function open_sheet(id, variant){
       ${gone.map(s => `<span class="sz out">${esc(s.size)}</span>`).join("")}
     </div>` : ""}
     ${elsewhere.length ? `<table>${all.map(o => shop_row(o, ours, cheap)).join("")}</table>` : ""}
-    <a class="go" href="${esc(ours.url)}" target="_blank" rel="noopener">Открыть в ${esc(ours.shop)}</a>`;
+    <a class="go" href="${esc(safe(ours.url))}" target="_blank" rel="noopener">Открыть в ${esc(ours.shop)}</a>`;
   wire_hearts(el("sheet-body"));
 }
 
@@ -898,7 +901,7 @@ async function open_lookup(query){
       <td>${f.same_thing ? "" : esc(String(o.title).slice(0, 46))}</td>
       <td style="text-align:right">${money(o.price)}${
         o.discount_pct ? ` <span class="badge" style="position:static">−${Math.round(o.discount_pct)}%</span>` : ""}</td>
-      <td><a href="${esc(o.url)}" target="_blank" rel="noopener">открыть</a></td>
+      <td><a href="${esc(safe(o.url))}" target="_blank" rel="noopener">открыть</a></td>
       ${me === null ? "" : `<td>${heart_inline(o.product_id, null)}</td>`}
     </tr>`).join("");
 

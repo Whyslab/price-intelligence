@@ -384,6 +384,21 @@ systemctl --user enable --now price-intelligence-bot.service
 journalctl --user -u price-intelligence-bot -f
 ```
 
+Витрина — тоже долгоживущий юнит. Кнопка «Все скидки» в боте открывает её
+мини-приложением, а Telegram пускает туда только по https, поэтому снаружи её
+отдаёт `tailscale serve` — и только внутри своей сети Tailscale:
+
+```bash
+systemctl --user enable --now price-intelligence-web.service   # 127.0.0.1:8000
+tailscale serve --bg --https=10000 http://127.0.0.1:8000
+# в .env: PI_WEB_URL=https://<машина>.<tailnet>.ts.net:10000, затем перезапустить бота
+```
+
+В юните нет `--owner` и не должно быть: за прокси Tailscale каждый запрос
+приходит с 127.0.0.1, и `--owner` сделал бы владельцем любого, кто дошёл до
+порта. Сердечки там работают по подписи Telegram. `scripts/tunnel.sh` при этом
+не запускать — он перепишет `PI_WEB_URL` на временный адрес.
+
 Сбор идёт каждый час, сводка о здоровье — раз в сутки, чистка истории — раз
 в неделю.
 

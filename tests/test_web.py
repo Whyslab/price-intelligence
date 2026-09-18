@@ -1239,3 +1239,73 @@ class TestTheButtonThatPromisesToTakeYouBackAndSubscribe:
                                     {"X-Telegram-Init-Data": signed(user_id=77)})
         assert code == 200
         assert body == {"sent": False}
+
+
+class TestTheLinkACardOpens:
+    """A shop writes the link itself, so the shelf decides what it may be."""
+
+    def test_a_link_relative_to_the_shop_opens_the_shop(self):
+        # 2,769 products carried one; from the shelf it opened the shelf's 404.
+        assert web.shop_link("/products/thing", "shop.example") == "https://shop.example/products/thing"
+
+    def test_an_absolute_link_is_left_alone(self):
+        url = "https://other.example/p/1?x=2"
+        assert web.shop_link(url, "shop.example") == url
+
+    def test_a_link_that_is_not_a_web_page_is_refused(self):
+        # The page runs inside Telegram with the reader's signature to hand.
+        for bad in ("javascript:alert(1)", " JavaScript:alert(1)", "data:text/html,x", "vbscript:x"):
+            assert web.shop_link(bad, "shop.example") is None, bad
+
+    def test_no_link_is_no_link(self):
+        assert web.shop_link(None, "shop.example") is None
+        assert web.shop_link("", "shop.example") is None
+
+    def test_the_shelf_hands_out_the_resolved_link(self, conn):
+        a_shelf(conn, n=1)
+        conn.execute("UPDATE products SET url = '/products/relative'")
+        conn.commit()
+        page = web.shelf_page(conn, web.read_query(""))
+        urls = [o["url"] for o in page["offers"]]
+        assert urls and all(u.startswith("https://") and u.endswith("/products/relative") for u in urls)
+
+
+class TestTheServerLetsGoOfTheDatabase:
+    def test_many_requests_leave_no_open_handles_behind(self, conn):
+        import gc
+        import os
+
+        a_shelf(conn, n=3)
+        path = Path(conn.execute("PRAGMA database_list").fetchone()[2])
+
+        def db_handles() -> int:
+            n = 0
+            for fd in os.listdir("/proc/self/fd"):
+                try:
+                    if os.readlink(f"/proc/self/fd/{fd}").startswith(str(path)):
+                        n += 1
+                except OSError:
+                    pass
+            return n
+
+        handler = type("Bound", (web.Handler,), {"db_path": path})
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        thread = threading.Thread(target=server.serve_forever, args=(0.02,), daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        gc.disable()  # a leak that only garbage collection hides is still a leak
+        try:
+            before = db_handles()
+            for _ in range(40):
+                with urlopen(base + "/api/offers?limit=3") as r:
+                    r.read()
+            after = db_handles()
+        finally:
+            gc.enable()
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+        assert after - before < 5, (before, after)
+
+    def test_a_slow_client_cannot_hold_a_thread_for_good(self):
+        assert web.Handler.timeout and web.Handler.timeout <= 60
