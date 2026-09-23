@@ -313,6 +313,30 @@ class TestGivingBackWhatAShortPageWithdrew:
         assert missing(on_sale) is None
         assert migrated.execute("PRAGMA user_version").fetchone()[0] == 16
 
+    def test_stored_addresses_are_repaired_once(self, tmp_path):
+        path = tmp_path / "old.db"
+        conn = dbm.connect(path)
+        store = dbm.upsert_store(conn, "www.43einhalb.com", platform="jsonld")
+        relative = dbm.upsert_product(conn, store, "a", "Laces", "/es/p/laces-1")
+        pictured = dbm.upsert_product(
+            conn, store, "b", "Skirt", "https://www.43einhalb.com/p/b",
+            image_url="https://img.ssensemedia.com/images/__IMAGE_PARAMS__/1_1/skirt.jpg",
+        )
+        conn.execute("PRAGMA user_version = 15")
+        conn.close()
+
+        migrated = dbm.connect(path)
+
+        def column(name, product_id):
+            return migrated.execute(
+                f"SELECT {name} FROM products WHERE id = ?", (product_id,)
+            ).fetchone()[0]
+
+        assert column("url", relative) == "https://www.43einhalb.com/es/p/laces-1"
+        assert column("image_url", pictured) == (
+            "https://img.ssensemedia.com/images/b_white,g_center,f_auto,q_auto:best/1_1/skirt.jpg"
+        )
+
     def test_a_fresh_database_is_not_touched(self, tmp_path):
         conn = dbm.connect(tmp_path / "new.db")
         assert conn.execute("PRAGMA user_version").fetchone()[0] == dbm.SCHEMA_VERSION

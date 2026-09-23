@@ -357,6 +357,19 @@ def _migrate_15_to_16(conn: sqlite3.Connection) -> None:
     ).rowcount
     if resolved:
         log.info("resolved %d relative product link(s) against their shop", resolved)
+    # And www.ssense.com's picture addresses, stored with the template marker
+    # its pages fill in by script, so every one of them answered 404. The same
+    # substitution the crawler now makes as it reads (jsonld.IMAGE_TEMPLATES).
+    pictures = conn.execute(
+        """
+        UPDATE products
+           SET image_url = replace(image_url, '__IMAGE_PARAMS__',
+                                   'b_white,g_center,f_auto,q_auto:best')
+         WHERE instr(image_url, '__IMAGE_PARAMS__') > 0
+        """
+    ).rowcount
+    if pictures:
+        log.info("filled in the picture template on %d product(s)", pictures)
 
 
 def _rebuild_alerts(conn: sqlite3.Connection) -> None:

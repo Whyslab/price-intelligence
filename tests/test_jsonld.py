@@ -760,3 +760,38 @@ class TestAShopThatStoppedLettingUsIn:
             result = await jsonld.fetch(client, "shop.example")
 
         assert result.error == jsonld.NO_MARKUP
+
+
+def test_a_picture_address_written_as_a_template_is_filled_in():
+    """www.ssense.com's pages fill `__IMAGE_PARAMS__` in by script; taken as
+    written, all 25,110 of its pictures answered 404."""
+    page = """<script type="application/ld+json">{"@type": "Product",
+      "name": "Miniskirt", "sku": "232541F090003",
+      "image": "https://img.ssensemedia.com/images/__IMAGE_PARAMS__/232541F090003_1/skirt.jpg",
+      "offers": {"@type": "Offer", "price": "46", "priceCurrency": "USD",
+                 "availability": "https://schema.org/InStock"}}</script>"""
+    product, _ = jsonld.parse_product(page, "https://www.ssense.com/en-us/women/product/x/1")
+    assert product.image_url == (
+        "https://img.ssensemedia.com/images/b_white,g_center,f_auto,q_auto:best/"
+        "232541F090003_1/skirt.jpg"
+    )
+
+
+def test_a_relative_product_address_is_resolved_against_the_page():
+    """www.toddsnyder.com and www.43einhalb.com write `/nl/p/…`; 2,993 products
+    were stored that way and opened nothing."""
+    page = """<script type="application/ld+json">{"@type": "Product",
+      "name": "Laces", "sku": "194194", "url": "/es/p/43einhalb-laces-194194",
+      "offers": {"@type": "Offer", "price": "5", "priceCurrency": "EUR",
+                 "availability": "https://schema.org/InStock"}}</script>"""
+    product, _ = jsonld.parse_product(page, "https://www.43einhalb.com/es/p/laces")
+    assert product.url == "https://www.43einhalb.com/es/p/43einhalb-laces-194194"
+
+
+def test_a_product_address_that_is_not_a_web_page_falls_back_to_the_page():
+    page = """<script type="application/ld+json">{"@type": "Product",
+      "name": "Laces", "sku": "1", "url": "javascript:alert(1)",
+      "offers": {"@type": "Offer", "price": "5", "priceCurrency": "EUR",
+                 "availability": "https://schema.org/InStock"}}</script>"""
+    product, _ = jsonld.parse_product(page, "https://shop.example/p/laces")
+    assert product.url == "https://shop.example/p/laces"

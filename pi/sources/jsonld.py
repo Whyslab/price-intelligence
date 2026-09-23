@@ -282,6 +282,22 @@ def _offers_of(node: dict) -> tuple[list[ScrapedVariant], str] | None:
     return (found, currency) if currency else None
 
 
+# www.ssense.com writes its picture addresses as a template the page fills in
+# with script: `/images/__IMAGE_PARAMS__/…`. Taken as written, every one of its
+# 25,110 products had a picture that answered 404. These are the parameters its
+# own pages use.
+IMAGE_TEMPLATES = {"__IMAGE_PARAMS__": "b_white,g_center,f_auto,q_auto:best"}
+
+
+def resolve_image_template(image: str | None) -> str | None:
+    """An image address with any known page-side template filled in."""
+    if not image:
+        return image
+    for marker, value in IMAGE_TEMPLATES.items():
+        image = image.replace(marker, value)
+    return image
+
+
 def _image_of(node: dict, url: str) -> str | None:
     image = node.get("image")
     if isinstance(image, dict):
@@ -290,7 +306,9 @@ def _image_of(node: dict, url: str) -> str | None:
         image = next(
             (i if isinstance(i, str) else (i or {}).get("url") for i in image if i), None
         )
-    return urljoin(url, html.unescape(image).strip()) if isinstance(image, str) else None
+    if not isinstance(image, str):
+        return None
+    return resolve_image_template(urljoin(url, html.unescape(image).strip()))
 
 
 def _variants_of(node: dict) -> tuple[list[ScrapedVariant], str] | None:
