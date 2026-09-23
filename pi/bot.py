@@ -37,7 +37,7 @@ from . import landed
 from .config import Config
 from .domains import shop_link
 from .fx import load_rates
-from .notify import _money
+from .notify import _money, telegram_photo
 
 log = logging.getLogger(__name__)
 
@@ -585,7 +585,9 @@ class Bot:
             )
             body = resp.json()
         except (httpx.HTTPError, ValueError) as exc:
-            log.warning("%s failed: %s", method, exc)
+            # The type as well: a timeout's message is empty, and the journal
+            # filled with "getUpdates failed: " and nothing after it.
+            log.warning("%s failed: %s: %s", method, type(exc).__name__, exc)
             return None
         if not body.get("ok"):
             log.warning("%s refused: %s", method, body.get("description"))
@@ -604,8 +606,12 @@ class Bot:
     async def send_photo(
         self, chat_id: str, photo: str, caption: str, keyboard: dict | None = None
     ) -> bool:
+        # A size Telegram will actually fetch — see notify.telegram_photo.
+        address = telegram_photo(photo)
+        if not address:
+            return False
         payload = {
-            "chat_id": chat_id, "photo": photo, "caption": caption, "parse_mode": "HTML"
+            "chat_id": chat_id, "photo": address, "caption": caption, "parse_mode": "HTML"
         }
         if keyboard:
             payload["reply_markup"] = keyboard
@@ -1373,8 +1379,17 @@ class Bot:
     async def poll(self) -> None:
         async with httpx.AsyncClient(timeout=70) as client:
             self._client = client
-            me = await self._call("getMe", {})
-            log.info("bot @%s is listening", (me or {}).get("username", "?"))
+            # The user manager starts this before the network is up — its
+            # network-online.target is the system's and means nothing here —
+            # so the first few asks fail on DNS. Asked again until it answers,
+            # rather than announcing "bot @? is listening" to nobody.
+            me, delay = None, 5.0
+            while not isinstance(me, dict):
+                me = await self._call("getMe", {})
+                if not isinstance(me, dict):
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, 60.0)
+            log.info("bot @%s is listening", me.get("username", "?"))
             while True:
                 updates = await self._call(
                     "getUpdates",

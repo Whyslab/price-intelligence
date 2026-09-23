@@ -148,9 +148,77 @@ class TestDelivery:
         text = respx.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage").mock(
             return_value=httpx.Response(200, json={"ok": True})
         )
+        respx.get("https://cdn.example/broken.jpg").mock(return_value=httpx.Response(404))
         async with notify.Telegram(TOKEN, CHAT) as tg:
             assert await tg.send_deal("caption", "https://cdn.example/broken.jpg") is True
         assert text.called
+
+    @respx.mock
+    async def test_a_picture_telegram_would_not_fetch_is_uploaded_instead(self):
+        """Some hosts turn Telegram's fetcher away and not ours."""
+        photo = respx.post(f"https://api.telegram.org/bot{TOKEN}/sendPhoto").mock(
+            side_effect=[
+                httpx.Response(
+                    400, json={"ok": False, "description": "failed to get HTTP URL content"}
+                ),
+                httpx.Response(200, json={"ok": True}),
+            ]
+        )
+        text = respx.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage")
+        respx.get("https://img.example/shoe.jpg").mock(
+            return_value=httpx.Response(
+                200, content=b"\xff\xd8jpeg", headers={"content-type": "image/jpeg"}
+            )
+        )
+        async with notify.Telegram(TOKEN, CHAT) as tg:
+            assert await tg.send_deal("caption", "https://img.example/shoe.jpg") is True
+        assert photo.call_count == 2
+        assert b"multipart/form-data" in photo.calls[1].request.headers["content-type"].encode()
+        assert not text.called
+
+    @respx.mock
+    async def test_a_page_that_is_not_a_picture_is_not_uploaded(self):
+        respx.post(f"https://api.telegram.org/bot{TOKEN}/sendPhoto").mock(
+            return_value=httpx.Response(
+                400, json={"ok": False, "description": "failed to get HTTP URL content"}
+            )
+        )
+        text = respx.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage").mock(
+            return_value=httpx.Response(200, json={"ok": True})
+        )
+        respx.get("https://img.example/shoe.jpg").mock(
+            return_value=httpx.Response(200, text="<html>captcha</html>",
+                                        headers={"content-type": "text/html"})
+        )
+        async with notify.Telegram(TOKEN, CHAT) as tg:
+            assert await tg.send_deal("caption", "https://img.example/shoe.jpg") is True
+        assert text.called
+
+
+class TestTheAddressTelegramFetchesAPictureFrom:
+    """Shopify's CDN serves the original upload unless asked for a size, and
+    Telegram gave up on a 4284×5712, 2.3 MB one: 18 of 209 alerts in a week
+    went out without their photo."""
+
+    def test_a_shopify_picture_is_asked_for_at_a_sane_width(self):
+        url = "https://cdn.shopify.com/s/files/1/0605/files/shoe.jpg?v=1790129347"
+        assert notify.telegram_photo(url) == (
+            "https://cdn.shopify.com/s/files/1/0605/files/shoe.jpg?v=1790129347&width=1000"
+        )
+
+    def test_a_shop_domain_cdn_path_counts_too(self):
+        url = "https://shop.example/cdn/shop/files/shoe.jpg?v=1&width=4000"
+        assert notify.telegram_photo(url) == (
+            "https://shop.example/cdn/shop/files/shoe.jpg?v=1&width=1000"
+        )
+
+    def test_any_other_host_is_left_alone(self):
+        url = "https://images.example/shoe.jpg?w=2000"
+        assert notify.telegram_photo(url) == url
+
+    def test_nothing_that_is_not_a_web_address(self):
+        assert notify.telegram_photo(None) is None
+        assert notify.telegram_photo("javascript:alert(1)") is None
 
     @respx.mock
     async def test_no_image_goes_straight_to_text(self):

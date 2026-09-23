@@ -1309,3 +1309,28 @@ class TestTheServerLetsGoOfTheDatabase:
 
     def test_a_slow_client_cannot_hold_a_thread_for_good(self):
         assert web.Handler.timeout and web.Handler.timeout <= 60
+
+
+class TestAReaderWhoLeavesMidAnswer:
+    """A page closed before its answer arrived printed a twenty-line traceback
+    into the journal every time; nothing was wrong."""
+
+    def test_a_broken_pipe_is_not_an_error(self, caplog):
+        import io
+        import logging
+
+        class Gone(io.BytesIO):
+            def write(self, data):
+                raise BrokenPipeError(32, "Broken pipe")
+
+        handler = web.Handler.__new__(web.Handler)
+        handler.request_version = "HTTP/1.1"
+        handler.requestline = "GET /api/offers HTTP/1.1"
+        handler.command = "GET"
+        handler.client_address = ("127.0.0.1", 1)
+        handler.wfile = Gone()
+        caplog.set_level(logging.DEBUG, logger="pi.web")
+
+        handler._send(200, b"{}", "application/json")
+
+        assert "went away" in caplog.text

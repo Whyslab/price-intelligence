@@ -373,6 +373,10 @@ async def test_a_failed_send_is_not_recorded_as_sent(config, shopify_payload):
     respx.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage").mock(
         return_value=httpx.Response(403, json={"ok": False, "description": "blocked"})
     )
+    # After Telegram refuses the address, the picture is fetched to be uploaded.
+    respx.get(url__regex=r"https://cdn\.shopify\.com/.*").mock(
+        return_value=httpx.Response(404)
+    )
     end_of_catalogue()
     respx.get("https://shop.example/products.json?limit=250").mock(
         return_value=httpx.Response(200, json=shopify_payload)

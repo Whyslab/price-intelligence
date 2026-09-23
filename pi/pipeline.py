@@ -1335,6 +1335,12 @@ async def run(
             if pending:
                 await asyncio.gather(*pending, return_exceptions=True)
 
+        if rates.dropped:
+            log.warning(
+                "prices dropped for want of an exchange rate: %s",
+                ", ".join(f"{code} ×{n}" for code, n in rates.dropped.most_common()),
+            )
+
         # Before scoring, so a deal is judged with the product already known to
         # be a women's shoe rather than an unclassified row.
         if classified:

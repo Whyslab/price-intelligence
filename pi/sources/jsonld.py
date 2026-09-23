@@ -27,6 +27,7 @@ import html
 import json
 import logging
 import re
+from collections import Counter
 from urllib.parse import urljoin, urlparse
 
 import httpx
@@ -52,6 +53,8 @@ PER_HOST_CONCURRENCY = 4
 # crawled every hour for a week.
 NO_PRODUCT_URLS = "no product URLs in the sitemap or by crawling"
 NO_MARKUP = "no schema.org/Product markup found"
+# Not one product page answered 200: a wall or an outage, not a markup problem.
+PAGES_WOULD_NOT_LOAD = "product pages would not load"
 
 SITEMAP_CANDIDATES = ("/sitemap.xml", "/sitemap_index.xml", "/sitemap/products.xml")
 # robots.txt is where a site is supposed to declare its sitemap, and plenty put
@@ -694,17 +697,30 @@ async def fetch(
         )
 
     start = cursor % len(urls)
-    window = (urls + urls)[start : start + budget]
+    # Never more than the catalogue: the window wraps around the end of the
+    # list, and with a budget larger than the shop every page was read twice
+    # in the same pass — twice the requests to a small shop for nothing.
+    window = (urls + urls)[start : start + min(budget, len(urls))]
     next_cursor = (start + len(window)) % len(urls)
 
     semaphore = asyncio.Semaphore(PER_HOST_CONCURRENCY)
     products: list[ScrapedProduct] = []
     currencies: dict[str, int] = {}
+    # How the pages answered, so a shop that stopped letting us in is not
+    # reported as a shop whose pages carry no prices: www.kickz.com said "no
+    # schema.org/Product markup" for three weeks, which is a different problem
+    # with a different fix.
+    answered: Counter[str] = Counter()
 
     async def one(url: str) -> None:
         async with semaphore:
-            resp = await _get(client, url)
-        if resp is None:
+            try:
+                resp = await client.get(url, follow_redirects=True)
+            except httpx.HTTPError as exc:
+                answered[type(exc).__name__] += 1
+                return
+        answered[f"HTTP {resp.status_code}"] += 1
+        if resp.status_code != 200:
             return
         parsed = parse_product(resp.text, url)
         if parsed is None:
@@ -719,11 +735,17 @@ async def fetch(
     await asyncio.gather(*(one(u) for u in window))
 
     if not products:
+        if not answered.get("HTTP 200"):
+            how = ", ".join(f"{what} ×{n}" for what, n in answered.most_common(3))
+            return FetchResult(
+                domain=domain, error=f"{PAGES_WOULD_NOT_LOAD} ({how})",
+                next_cursor=next_cursor,
+            )
         return FetchResult(
             domain=domain, error=NO_MARKUP, next_cursor=next_cursor
         )
 
-    dominant = currency or max(currencies, key=currencies.get)
+    dominant = currency or max(currencies, key=lambda code: currencies[code])
     return FetchResult(
         domain=domain, products=products, currency=dominant, next_cursor=next_cursor
     )

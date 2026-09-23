@@ -68,3 +68,21 @@ def test_built_in_rates_are_the_last_resort(tmp_path):
 def test_a_malformed_reply_does_not_crash_the_run(tmp_path):
     respx.get(fx.API_URL).mock(return_value=httpx.Response(200, json={"unexpected": True}))
     assert fx.load_rates(tmp_path / "fx.json").source == "fallback"
+
+
+def test_an_unknown_currency_is_counted_not_logged_price_by_price(caplog):
+    """www.ssense.com's Saudi pages quote "USE", which is no currency: 536
+    identical warnings a day. The run now reports one tally instead."""
+    import logging
+    from datetime import UTC, datetime
+
+    from pi.fx import Rates
+
+    rates = Rates({"USD": 1.0}, datetime.now(UTC), "test")
+    caplog.set_level(logging.WARNING, logger="pi.fx")
+
+    assert rates.to_usd(94.0, "USE") is None
+    assert rates.to_usd(120.0, "use") is None
+
+    assert rates.dropped == {"USE": 2}
+    assert caplog.text == ""

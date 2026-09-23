@@ -540,16 +540,23 @@ class Handler(BaseHTTPRequestHandler):
         log.debug("%s - %s", self.address_string(), fmt % args)
 
     def _send(self, code: int, body: bytes, content_type: str) -> None:
-        self.send_response(code)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
-        # The page is the only thing allowed to script this origin, and it
-        # carries no third-party anything.
-        self.send_header("Content-Security-Policy", "default-src 'self' 'unsafe-inline' data: https:")
-        self.send_header("Referrer-Policy", "no-referrer")
-        self.end_headers()
-        if self.command != "HEAD":
-            self.wfile.write(body)
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            # The page is the only thing allowed to script this origin, and it
+            # carries no third-party anything.
+            self.send_header(
+                "Content-Security-Policy", "default-src 'self' 'unsafe-inline' data: https:"
+            )
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            # The reader closed the page before the answer arrived. Nothing is
+            # wrong, and a twenty-line traceback in the journal said otherwise.
+            log.debug("%s went away before the answer was written", self.client_address)
 
     def _json(self, payload: dict, code: int = 200) -> None:
         self._send(

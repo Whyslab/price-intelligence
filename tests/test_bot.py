@@ -556,3 +556,35 @@ class TestCountingInRussian:
         assert say(11) == "11 магазинов", "the teens are the exception"
         assert say(21) == "21 магазин"
         assert say(112) == "112 магазинов"
+
+
+class TestStartingBeforeTheNetwork:
+    """The user manager starts the bot before DNS works, so the first getMe
+    failed and the journal said "bot @? is listening"."""
+
+    async def test_it_asks_again_until_telegram_answers(self, conn, tmp_path, monkeypatch, caplog):
+        import asyncio
+        import logging
+
+        instance = bot.Bot(TestRouting._config(tmp_path), conn)
+        asked: list[str] = []
+
+        async def answer(method, payload):
+            asked.append(method)
+            if method == "getMe":
+                return None if asked.count("getMe") < 3 else {"username": "pi_bot"}
+            raise asyncio.CancelledError  # stop at the first poll
+
+        async def no_wait(_seconds):
+            return None
+
+        monkeypatch.setattr(instance, "_call", answer)
+        monkeypatch.setattr(bot.asyncio, "sleep", no_wait)
+        caplog.set_level(logging.INFO, logger="pi.bot")
+
+        with pytest.raises(asyncio.CancelledError):
+            await instance.poll()
+
+        assert asked[:4] == ["getMe", "getMe", "getMe", "getUpdates"]
+        assert "@pi_bot is listening" in caplog.text
+        assert "@?" not in caplog.text

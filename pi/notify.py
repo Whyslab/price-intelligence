@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from html import escape
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import httpx
 
@@ -20,6 +21,36 @@ log = logging.getLogger(__name__)
 
 API = "https://api.telegram.org/bot{token}/{method}"
 CAPTION_LIMIT = 1024
+# The width asked of an image CDN that can resize. Wider than any phone shows a
+# notification photo, a fraction of the original's weight.
+PHOTO_WIDTH = 1000
+# Telegram takes an uploaded photo up to 10 MB; past that it is not worth a try.
+UPLOAD_LIMIT = 10 * 1024 * 1024
+
+
+def telegram_photo(url: str | None) -> str | None:
+    """The address Telegram should fetch a product's picture from.
+
+    Shopify's CDN hands out the original upload unless it is asked for a size —
+    4284×5712 pixels and 2.3 MB for one www.thesneakcity.com sneaker — and
+    Telegram gives up fetching those: 18 of 209 alerts in a week went out as
+    bare text. Asked for 1000 pixels wide the same file is 350 KB. Other hosts
+    are left alone; nothing says what they would do with the parameter.
+    """
+    if not url:
+        return None
+    parts = urlsplit(url.strip())
+    if parts.scheme not in ("http", "https"):
+        return None
+    if parts.netloc != "cdn.shopify.com" and "/cdn/shop/" not in parts.path:
+        return url
+    query = [
+        (key, value)
+        for key, value in parse_qsl(parts.query, keep_blank_values=True)
+        if key not in ("width", "height", "crop")
+    ]
+    query.append(("width", str(PHOTO_WIDTH)))
+    return urlunsplit(parts._replace(query=urlencode(query)))
 MESSAGE_LIMIT = 4096
 MAX_RETRIES = 3
 
@@ -212,17 +243,27 @@ class Telegram:
             await self._client.aclose()
             self._client = None
 
-    async def _call(self, method: str, payload: dict) -> tuple[bool, str]:
-        """POST to the Bot API, obeying retry_after. Returns (ok, description)."""
+    async def _call(
+        self, method: str, payload: dict, files: dict | None = None
+    ) -> tuple[bool, str]:
+        """POST to the Bot API, obeying retry_after. Returns (ok, description).
+
+        With `files` the payload goes as a multipart form, which is how a photo
+        is uploaded rather than fetched by Telegram from an address.
+        """
         assert self._client is not None, "use Telegram as an async context manager"
         for attempt in range(1, MAX_RETRIES + 1):
             try:
-                resp = await self._client.post(
-                    API.format(token=self.token, method=method), json=payload
-                )
+                url = API.format(token=self.token, method=method)
+                if files:
+                    resp = await self._client.post(url, data=payload, files=files)
+                else:
+                    resp = await self._client.post(url, json=payload)
             except httpx.HTTPError as exc:
                 if attempt == MAX_RETRIES:
-                    return False, f"network error: {exc}"
+                    # The type, because some of these carry no message at all:
+                    # "network error: " told nobody it was a timeout.
+                    return False, f"network error: {type(exc).__name__}: {exc}"
                 await asyncio.sleep(2**attempt)
                 continue
 
@@ -260,19 +301,48 @@ class Telegram:
         return ok
 
     async def send_deal(self, caption: str, image_url: str | None) -> bool:
-        """Photo with caption, falling back to text if there is no usable image."""
-        if image_url:
-            ok, why = await self._call(
-                "sendPhoto",
-                {
-                    "chat_id": self.chat_id,
-                    "photo": image_url,
-                    "caption": _trim(caption, CAPTION_LIMIT),
-                    "parse_mode": "HTML",
-                },
-            )
+        """Photo with caption, falling back to text if there is no usable image.
+
+        Three tries at the picture before giving up on it: Telegram fetching it
+        (from a CDN-resized address where there is one), then fetching it
+        ourselves and uploading it — some image hosts turn Telegram's fetcher
+        away and not a browser's — and only then the caption as plain text.
+        """
+        photo = telegram_photo(image_url)
+        if photo:
+            fields = {
+                "chat_id": self.chat_id,
+                "caption": _trim(caption, CAPTION_LIMIT),
+                "parse_mode": "HTML",
+            }
+            ok, why = await self._call("sendPhoto", {**fields, "photo": photo})
             if ok:
                 return True
-            # Telegram could not fetch the image — the deal still deserves to be sent.
+            if self.chat_is_gone:
+                return False
+            picture = await self._download(photo)
+            if picture is not None:
+                ok, upload_why = await self._call(
+                    "sendPhoto", fields, files={"photo": ("photo.jpg", picture)}
+                )
+                if ok:
+                    return True
+                why = f"{why}; upload: {upload_why}"
+            # Nothing worked — the deal still deserves to be sent.
             log.warning("sendPhoto failed (%s), falling back to text", why)
         return await self.send_text(caption, disable_preview=False)
+
+    async def _download(self, url: str) -> bytes | None:
+        """The picture's bytes, or None if it is not a picture we can upload."""
+        assert self._client is not None
+        try:
+            resp = await self._client.get(url, follow_redirects=True, timeout=20)
+        except httpx.HTTPError as exc:
+            log.info("could not fetch the picture myself either: %s", type(exc).__name__)
+            return None
+        kind = resp.headers.get("content-type", "")
+        if resp.status_code != 200 or not kind.startswith("image/"):
+            return None
+        if len(resp.content) > UPLOAD_LIMIT:
+            return None
+        return resp.content
