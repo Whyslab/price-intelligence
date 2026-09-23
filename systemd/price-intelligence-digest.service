@@ -1,0 +1,15 @@
+[Unit]
+Description=Price Intelligence — the free tier's two finds of the day
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/Projects/price-intelligence
+ExecStart=%h/Projects/price-intelligence/.venv/bin/python -m pi digest
+TimeoutStartSec=15min
+Nice=10
+
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/Projects/price-intelligence/data
+NoNewPrivileges=yes

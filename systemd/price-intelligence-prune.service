@@ -5,7 +5,9 @@ Description=Price Intelligence — drop old price history and reclaim disk space
 Type=oneshot
 WorkingDirectory=%h/Projects/price-intelligence
 ExecStart=%h/Projects/price-intelligence/.venv/bin/python -m pi prune --keep-days 90
-TimeoutStartSec=30min
+# Up to 25 minutes waiting for an hourly run to finish, then the deletes in
+# small batches. VACUUM is no longer part of it (pi prune --vacuum by hand).
+TimeoutStartSec=60min
 Nice=15
 IOSchedulingClass=idle
 

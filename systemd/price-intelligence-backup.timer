@@ -1,0 +1,14 @@
+[Unit]
+Description=Snapshot the Price Intelligence database before the nightly backup
+
+[Timer]
+# bm-backup.timer fires at 03:20 with up to ten minutes of jitter. Forty
+# minutes earlier leaves room for the snapshot of a database this size and for
+# both timers to drift without the backup catching a half-written file.
+OnCalendar=*-*-* 02:40:00
+RandomizedDelaySec=5min
+Persistent=yes
+Unit=price-intelligence-backup.service
+
+[Install]
+WantedBy=timers.target

@@ -8,9 +8,10 @@ Wants=network-online.target
 Type=oneshot
 WorkingDirectory=%h/Projects/price-intelligence
 ExecStart=%h/Projects/price-intelligence/.venv/bin/python -m pi run
-# A run must finish well inside the hour before the next one, and a slice of
-# twenty-odd shops takes minutes. Anything approaching this is stuck.
-TimeoutStartSec=30min
+# A run must finish well inside the hour before the next one: up to ten minutes
+# waiting its turn behind a prune or a rebuild (pi.db.collector_lock), then a
+# sweep of a quarter of an hour. Anything approaching this is stuck.
+TimeoutStartSec=45min
 Nice=10
 IOSchedulingClass=idle
 

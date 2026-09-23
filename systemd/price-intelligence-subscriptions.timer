@@ -1,0 +1,13 @@
+[Unit]
+Description=Check subscriptions once a day
+
+[Timer]
+# Late morning, well away from the digest: a reminder and an advertisement
+# arriving together read as one nagging message.
+OnCalendar=*-*-* 11:20:00
+RandomizedDelaySec=15min
+Persistent=yes
+Unit=price-intelligence-subscriptions.service
+
+[Install]
+WantedBy=timers.target
