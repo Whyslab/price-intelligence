@@ -805,3 +805,14 @@ def test_the_shipped_exclusion_file_parses(tmp_path):
         "# a comment\n\nWWW.Gone.Example  # trailing\nother.example\n", encoding="utf-8"
     )
     assert load_excluded(path) == frozenset({"gone.example", "other.example"})
+
+
+class TestHowFreshTheShelfIs:
+    def test_the_share_confirmed_within_two_days_is_counted(self, conn):
+        store = dbm.upsert_store(conn, "shop.example", platform="shopify", status="ok",
+                                 last_ok=ts(0))
+        _a_card(conn, store, "today", checked=ts(0.5))
+        _a_card(conn, store, "stale", checked=ts(3))
+        _a_card(conn, store, "tagged", checked=ts(0), source="tag")  # not on the default shelf
+
+        assert dbm.shelf_freshness(conn) == (1, 2)

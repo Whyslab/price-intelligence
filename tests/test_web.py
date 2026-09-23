@@ -1334,3 +1334,31 @@ class TestAReaderWhoLeavesMidAnswer:
         handler._send(200, b"{}", "application/json")
 
         assert "went away" in caplog.text
+
+
+class TestTheCardShowsItsPriceHistory:
+    """The evidence behind «было»: a discount against the shop's own lowest
+    price of the month is as convincing as being able to see the month."""
+
+    def test_the_history_is_the_shops_own_price_change_by_change(self, conn):
+        a_shelf(conn, n=1)
+        variant, product = conn.execute("SELECT variant_id, product_id FROM offers").fetchone()
+        dbm.record_price(conn, variant, 150.0, None, True, "USD", 150.0, 1.0, ts=ts(20))
+        dbm.record_price(conn, variant, 80.0, None, True, "USD", 80.0, 1.0, ts=ts(0))
+
+        history = web.product_page(conn, product)["history"]
+
+        assert history["currency"] == "USD"
+        assert [point["p"] for point in history["points"]][-2:] == [150.0, 80.0]
+
+    def test_a_shop_that_changed_currency_draws_only_the_current_one(self, conn):
+        a_shelf(conn, n=1)
+        variant, product = conn.execute("SELECT variant_id, product_id FROM offers").fetchone()
+        dbm.record_price(conn, variant, 100.0, None, True, "USD", 100.0, 1.0, ts=ts(9))
+        dbm.record_price(conn, variant, 96.0, None, True, "CAD", 131.0, 1.36, ts=ts(1))
+        dbm.record_price(conn, variant, 90.0, None, True, "CAD", 122.0, 1.36, ts=ts(0))
+
+        history = web.product_page(conn, product)["history"]
+
+        assert history["currency"] == "CAD"
+        assert [point["p"] for point in history["points"]] == [131.0, 122.0]

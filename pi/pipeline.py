@@ -1931,8 +1931,15 @@ def health_report(conn: sqlite3.Connection) -> str:
         lines.append("⚠️ Не поверил полному чтению (магазин будто потерял большую часть "
                      "каталога, но проверка нашла товары в продаже):")
         lines += [f"  • {d}: {escape(note)}" for d, note in held]
+    fresh, shown = dbm.shelf_freshness(conn)
+    freshness = (
+        f"Полка: {shown:,} предложений, подтверждены за 48 ч — {fresh / shown:.0%}"
+        + (" ⚠️ цель ≥95%" if fresh < 0.95 * shown else "")
+        if shown else "Полка пуста"
+    )
     lines += [
         f"Уведомлений за сутки: {day}",
+        freshness,
         "",
         _readers_line(conn),
         "",

@@ -1794,6 +1794,31 @@ def _size_order(label: str) -> tuple:
     return (2, 0.0, label)
 
 
+def shelf_freshness(conn: sqlite3.Connection, hours: int = 48) -> tuple[int, int]:
+    """(confirmed within `hours`, all) — cards the default shelf shows.
+
+    The one number that says whether the shelf is a shelf. docs/product.md set
+    the bar at no more than 5% of offers older than 48 hours; until this was in
+    the daily summary nobody could see whether it held.
+    """
+    cutoff = (datetime.now(UTC) - timedelta(hours=hours)).isoformat(timespec="seconds")
+    fresh, fresh_params = fresh_shop_clause("s")
+    row = conn.execute(
+        f"""
+        SELECT COALESCE(SUM(o.checked_at >= ?), 0), COUNT(*)
+          FROM offers o
+          JOIN products p ON p.id = o.product_id
+          JOIN stores   s ON s.id = p.store_id
+         WHERE {fresh}
+           AND (p.audience IS NULL OR p.audience <> 'kids')
+           AND (p.gender IS NULL OR p.gender <> 'women')
+           AND (o.all_time_low = 1 OR o.reference_source IN ('history', 'market'))
+        """,
+        [cutoff, *fresh_params],
+    ).fetchone()
+    return int(row[0]), int(row[1])
+
+
 def shelf_facets(conn: sqlite3.Connection, kids: bool = False,
                  women: bool = False, all_discounts: bool = False) -> dict:
     """What the shelf actually contains, for building filters out of.

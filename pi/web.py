@@ -263,6 +263,35 @@ def product_page(
         # Said plainly, because a page that only ever flatters the offer it is
         # showing is an advertisement. Sometimes the answer is "not here".
         "cheapest_elsewhere": cheaper[0] if cheaper else None,
+        "history": price_history_json(conn, row["variant_id"]),
+    }
+
+
+# How much of a variant's history the card draws. Points are changes, not
+# readings, so this is months for most things and never a heavy answer.
+HISTORY_POINTS = 120
+
+
+def price_history_json(conn: sqlite3.Connection, variant_id: int) -> dict:
+    """This size's price as the shop quoted it, change by change.
+
+    The evidence behind "было": a discount judged against the shop's own lowest
+    price of the last thirty days is only as convincing as being able to see
+    those thirty days. In the shop's currency, because that is what the shop
+    charged — in dollars a moving exchange rate draws steps nobody took — and
+    only in its latest currency, so a shop that switched does not draw a cliff.
+    """
+    points = dbm.price_history(conn, variant_id)
+    if not points:
+        return {"currency": None, "points": []}
+    currency = points[-1]["currency"]
+    kept = [p for p in points if p["currency"] == currency][-HISTORY_POINTS:]
+    return {
+        "currency": currency,
+        "points": [
+            {"t": p["ts"], "p": round(p["price_native"], 2), "in_stock": bool(p["in_stock"])}
+            for p in kept
+        ],
     }
 
 
