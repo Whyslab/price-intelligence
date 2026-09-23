@@ -27,7 +27,12 @@ CREATE TABLE IF NOT EXISTS stores (
     -- fingerprint. Measured on the 25 shops that reply 403 to us: nine answer
     -- 200 that way and three of those go on to yield products. See
     -- pi.sources.impersonate.
-    impersonate   INTEGER NOT NULL DEFAULT 0
+    impersonate   INTEGER NOT NULL DEFAULT 0,
+    -- The last full read that claimed a large part of this shop had gone and
+    -- was not believed, as "<when> · <how many> of <how many>". Shown in the
+    -- daily summary; cleared by the next read that withdraws normally. See
+    -- pipeline.withdraw_missing.
+    withdrawal_held TEXT
 );
 
 CREATE TABLE IF NOT EXISTS products (
@@ -157,7 +162,13 @@ CREATE TABLE IF NOT EXISTS offers (
     discount_pct     REAL    NOT NULL,
     saving_usd       REAL    NOT NULL,
     score            INTEGER NOT NULL,
-    all_time_low     INTEGER NOT NULL DEFAULT 0
+    all_time_low     INTEGER NOT NULL DEFAULT 0,
+    -- When a one-by-one check last tried this card, answered or not. The queue
+    -- is ordered by the later of this and checked_at, so a card whose page
+    -- will not load goes to the back instead of holding the front for ever:
+    -- 34 kickz.com cards did exactly that for three weeks, taking 45 of every
+    -- 60 checks. Never shown: it says we asked, not that the shop answered.
+    tried_at         TEXT
 );
 CREATE INDEX IF NOT EXISTS ix_offers_score ON offers(score DESC);
 CREATE INDEX IF NOT EXISTS ix_offers_product ON offers(product_id);

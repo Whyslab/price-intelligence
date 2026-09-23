@@ -5,12 +5,42 @@ import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import httpx
 import pytest
+import respx
 
 from pi import db as dbm
 from pi.config import Filters
 
 FIXTURES = Path(__file__).parent / "fixtures"
+
+
+def end_of_catalogue(base: str = "https://shop.example", page: int = 2):
+    """The empty page a Shopify catalogue ends with.
+
+    A short page is not the end — Shopify filters a page after cutting it, so
+    one comes back short in the middle of a catalogue — and the walk only stops
+    when a page lists nothing. A test standing in a whole shop therefore ends
+    it the way a real shop does. A test that mocks this page itself afterwards
+    replaces it: respx keeps one route per pattern.
+    """
+    return respx.get(f"{base}/products.json?limit=250&page={page}").mock(
+        return_value=httpx.Response(200, json={"products": []})
+    )
+
+
+def numbered_products(payload: dict, page: int, count: int = 250) -> dict:
+    """A catalogue page of `count` products shaped like the fixture's, with ids
+    and handles no other page uses — a real shop never repeats a product on
+    two pages, and a walk now stops at a page that lists nothing new."""
+    template = payload["products"]
+    out = []
+    for n in range(count):
+        product = json.loads(json.dumps(template[n % len(template)]))
+        product["id"] = page * 1_000_000 + n
+        product["handle"] = f"p{page}-{n}"
+        out.append(product)
+    return {"products": out}
 
 
 @pytest.fixture

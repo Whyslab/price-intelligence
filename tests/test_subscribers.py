@@ -6,6 +6,8 @@ because the first one never noticed.
 """
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from pi import db as dbm
@@ -208,6 +210,29 @@ class TestArrangingOneReadersList:
         assert len(pipeline.arrange_for(
             conn, scored, config, market=None, fold_duplicates=False, kids=True
         )) == 1
+
+    def test_the_shelf_keeps_every_discounted_size_and_a_message_one(self, config, conn):
+        """The shelf is filtered by size against the variant on offer.
+
+        Holding only a product's best-scoring size made a shoe discounted in
+        EU44 invisible to somebody filtering for EU44 whenever EU42 had scored
+        a point higher. A message is different: one hoodie in six sizes is one
+        thing to hear about.
+        """
+        (deal, row), = self._scored(conn)
+        other_size = replace(deal, variant_id=deal.variant_id + 1000, score=deal.score - 1)
+        scored = [(deal, row), (other_size, row)]
+
+        shelf = pipeline.arrange_for(
+            conn, scored, config, market=None, cap_per_store=False,
+            fold_duplicates=False, skip_alerted=False, kids=True, per_product=False,
+        )
+        message = pipeline.arrange_for(
+            conn, scored, config, market=None, fold_duplicates=False
+        )
+
+        assert {d.variant_id for d, _ in shelf} == {deal.variant_id, other_size.variant_id}
+        assert [d.variant_id for d, _ in message] == [deal.variant_id]
 
     def test_an_article_asked_for_by_name_still_arrives(self, config, conn):
         """Naming an article is a clearer statement than a reading of a title."""

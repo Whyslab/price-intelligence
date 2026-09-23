@@ -269,6 +269,145 @@ class TestMigrationCoverage:
         assert migrated.execute("PRAGMA user_version").fetchone()[0] == dbm.SCHEMA_VERSION
 
 
+class TestGivingBackWhatAShortPageWithdrew:
+    """Version 16 undoes the marks a short Shopify page made.
+
+    A pass writes one timestamp for everything it withdraws, so a batch of
+    products sharing a shop and a moment is a pass's verdict — the kind the
+    short page got wrong 110,796 times. A lone mark is a product whose own page
+    answered 404, which was checked and stays.
+    """
+
+    @staticmethod
+    def _product(conn, store_id, name, missing_since=None):
+        product_id = dbm.upsert_product(conn, store_id, name, name, f"https://x/{name}")
+        conn.execute(
+            "UPDATE products SET missing_since = ? WHERE id = ?", (missing_since, product_id)
+        )
+        return product_id
+
+    def test_a_batch_is_given_back_and_a_single_check_is_not(self, tmp_path):
+        path = tmp_path / "old.db"
+        conn = dbm.connect(path)
+        shopify = dbm.upsert_store(conn, "shop.example", platform="shopify")
+        crawled = dbm.upsert_store(conn, "crawl.example", platform="jsonld")
+        batch = [self._product(conn, shopify, f"b{n}", "2026-09-22T18:20:50+00:00") for n in range(3)]
+        single = self._product(conn, shopify, "one", "2026-09-22T19:00:00+00:00")
+        crawled_batch = [
+            self._product(conn, crawled, f"c{n}", "2026-09-21T10:00:00+00:00") for n in range(2)
+        ]
+        on_sale = self._product(conn, shopify, "fine")
+        conn.execute("PRAGMA user_version = 15")
+        conn.close()
+
+        migrated = dbm.connect(path)
+
+        def missing(product_id):
+            return migrated.execute(
+                "SELECT missing_since FROM products WHERE id = ?", (product_id,)
+            ).fetchone()[0]
+
+        assert all(missing(p) is None for p in batch), "the short page's verdict is undone"
+        assert missing(single), "a product whose own page said 404 stays withdrawn"
+        assert all(missing(p) for p in crawled_batch), "only Shopify passes had the fault"
+        assert missing(on_sale) is None
+        assert migrated.execute("PRAGMA user_version").fetchone()[0] == 16
+
+    def test_a_fresh_database_is_not_touched(self, tmp_path):
+        conn = dbm.connect(tmp_path / "new.db")
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == dbm.SCHEMA_VERSION
+
+
+def _a_card(conn, store_id, name, checked, tried=None, score=50, source="market"):
+    """One product with one offer on the shelf, stamped as given."""
+    product = dbm.upsert_product(
+        conn, store_id, name, name, f"https://shop.example/products/{name}"
+    )
+    variant = dbm.upsert_variant(conn, product, name)
+    conn.execute(
+        """
+        INSERT INTO offers (variant_id, product_id, found_at, checked_at, price_usd,
+                            reference_usd, reference_source, discount_pct, saving_usd,
+                            score, all_time_low, tried_at)
+        VALUES (?, ?, ?, ?, 100, 200, ?, 50, 100, ?, 0, ?)
+        """,
+        (variant, product, checked, checked, source, score, tried),
+    )
+    return product
+
+
+class TestTheCheckingQueue:
+    """Which cards `pi verify` opens next.
+
+    Ordered by the last answer alone, a card whose page never loads stayed the
+    oldest thing on the shelf for good: 34 kickz.com cards took 45 of every 60
+    checks for three weeks.
+    """
+
+    def test_a_card_that_did_not_answer_goes_to_the_back(self, conn):
+        store = dbm.upsert_store(conn, "shop.example", platform="shopify", status="ok")
+        stuck = _a_card(conn, store, "stuck", checked=ts(20), tried=ts(0))
+        waiting = _a_card(conn, store, "waiting", checked=ts(2))
+
+        rows = dbm.stale_offers(conn, 10, ("shopify",))
+
+        assert [row["product_id"] for row in rows] == [waiting, stuck]
+
+    def test_an_attempt_is_written_down_whatever_the_answer(self, conn):
+        store = dbm.upsert_store(conn, "shop.example", platform="shopify", status="ok")
+        card = _a_card(conn, store, "card", checked=ts(5))
+
+        dbm.note_attempt(conn, card, ts(0))
+
+        tried, checked = conn.execute(
+            "SELECT tried_at, checked_at FROM offers WHERE product_id = ?", (card,)
+        ).fetchone()
+        assert tried == ts(0)
+        assert checked == ts(5), "asking is not the shop answering"
+
+    def test_a_shop_whose_last_read_failed_is_not_asked_one_card_at_a_time(self, conn):
+        broken = dbm.upsert_store(conn, "broken.example", platform="jsonld", status="error")
+        _a_card(conn, broken, "old", checked=ts(20))
+
+        assert dbm.stale_offers(conn, 10, ("jsonld",)) == []
+
+
+class TestAShopNobodyCouldReadLeavesThePage:
+    """Cards stay in the table and come back the moment the shop reads again;
+    they are only kept off the page while nobody can vouch for them."""
+
+    def _shelf(self, conn, last_ok_days):
+        store = dbm.upsert_store(
+            conn, "shop.example", platform="shopify", status="ok", last_ok=ts(last_ok_days)
+        )
+        return _a_card(conn, store, "card", checked=ts(last_ok_days))
+
+    def test_a_shop_silent_for_days_is_not_on_the_page(self, conn):
+        self._shelf(conn, last_ok_days=4)
+
+        rows, total = dbm.offers_for(conn)
+        facets = dbm.shelf_facets(conn)
+
+        assert rows == [] and total == 0
+        assert facets["total"] == 0, "the counts promise what the page will show"
+
+    def test_a_shop_read_yesterday_is(self, conn):
+        card = self._shelf(conn, last_ok_days=1)
+
+        rows, total = dbm.offers_for(conn)
+
+        assert [row["product_id"] for row in rows] == [card] and total == 1
+        assert dbm.shelf_facets(conn)["total"] == 1
+
+    def test_the_cards_come_back_when_the_shop_does(self, conn):
+        card = self._shelf(conn, last_ok_days=4)
+        dbm.upsert_store(conn, "shop.example", last_ok=ts(0))
+
+        rows, _ = dbm.offers_for(conn)
+
+        assert [row["product_id"] for row in rows] == [card]
+
+
 class TestRecordingWhatIsOnOffer:
     """The shelf's two dates both used to be the clock, and both were wrong.
 

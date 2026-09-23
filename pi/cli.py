@@ -32,6 +32,23 @@ def _log(level: str) -> None:
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
+# How long a heavy command waits for another to finish before standing aside.
+# A sweep takes about a quarter of an hour and the next one is an hour away, so
+# a run that finds the prune still going gives up after ten minutes and leaves
+# the collecting to the next hour. Maintenance started by a timer or by hand is
+# worth waiting for longer: it is rare, and the run it waits for always ends.
+RUN_WAIT_SECONDS = 10 * 60
+MAINTENANCE_WAIT_SECONDS = 25 * 60
+
+
+def _stood_aside(what: str) -> None:
+    print(
+        f"{what}: база занята другой тяжёлой командой (прогон, pi prune, reshelve, "
+        "reindex или reclassify) — ничего не сделано, попробуйте позже",
+        file=sys.stderr,
+    )
+
+
 def read_sites(path: Path) -> list[str]:
     """Read the site list: one URL or bare domain per line, # for comments.
 
@@ -117,20 +134,36 @@ def cmd_detect(args, config: Config) -> int:
     return 0
 
 
+
 def cmd_run(args, config: Config) -> int:
+    with dbm.collector_lock(config.db_path, RUN_WAIT_SECONDS) as held:
+        if not held:
+            _stood_aside("pi run")
+            return 0
+        return _cmd_run(args, config)
+
+
+def _cmd_run(args, config: Config) -> int:
     conn = dbm.connect(config.db_path)
-    stats = asyncio.run(
-        pipeline.run(
-            config, conn,
-            domains=tuple(d.strip() for d in args.stores.split(",")) if args.stores else (),
-            collect_only=args.collect_only,
-            dry_run=args.dry_run,
-            rescan=args.rescan,
-            limit=args.limit,
-            jsonld_budget=args.jsonld_budget,
-            verify_budget=args.verify_budget,
+    try:
+        stats = asyncio.run(
+            pipeline.run(
+                config, conn,
+                domains=tuple(d.strip() for d in args.stores.split(",")) if args.stores else (),
+                collect_only=args.collect_only,
+                dry_run=args.dry_run,
+                rescan=args.rescan,
+                limit=args.limit,
+                jsonld_budget=args.jsonld_budget,
+                verify_budget=args.verify_budget,
+            )
         )
-    )
+    except Exception as exc:
+        # Written down so the daily summary can say a run died, which until now
+        # nothing did: two runs on 20.09 ended in a traceback and the only
+        # trace of it was the journal.
+        dbm.note_failed_run(conn, f"{type(exc).__name__}: {exc}")
+        raise
     print(
         f"\nstores ok {stats.stores_ok} / failed {stats.stores_failed} · "
         f"products {stats.products_seen:,} · price changes {stats.points_written:,} · "
@@ -141,7 +174,16 @@ def cmd_run(args, config: Config) -> int:
     return 0
 
 
+
 def cmd_verify(args, config: Config) -> int:
+    with dbm.collector_lock(config.db_path, RUN_WAIT_SECONDS) as held:
+        if not held:
+            _stood_aside("pi verify")
+            return 0
+        return _cmd_verify(args, config)
+
+
+def _cmd_verify(args, config: Config) -> int:
     """Check the oldest cards on the shelf still exist, without sweeping anything.
 
     A price this finds is scored and sent like any other: it goes through the
@@ -224,7 +266,16 @@ def cmd_health(args, config: Config) -> int:
     return 0 if asyncio.run(go()) else 1
 
 
+
 def cmd_seed(args, config: Config) -> int:
+    with dbm.collector_lock(config.db_path, MAINTENANCE_WAIT_SECONDS) as held:
+        if not held:
+            _stood_aside("pi seed")
+            return 1
+        return _cmd_seed(args, config)
+
+
+def _cmd_seed(args, config: Config) -> int:
     conn = dbm.connect(config.db_path)
     already = conn.execute("SELECT COUNT(*) FROM alerts").fetchone()[0]
     n = pipeline.seed_alerts(conn, config, dry_run=args.dry_run)
@@ -369,7 +420,16 @@ def _renormalise_sizes(conn) -> int:
     return len(changed)
 
 
+
 def cmd_reindex(args, config: Config) -> int:
+    with dbm.collector_lock(config.db_path, MAINTENANCE_WAIT_SECONDS) as held:
+        if not held:
+            _stood_aside("pi reindex")
+            return 1
+        return _cmd_reindex(args, config)
+
+
+def _cmd_reindex(args, config: Config) -> int:
     """Rebuild what the code derives from what the shops actually sent.
 
     Article numbers, so products can be matched between shops, and normalised
@@ -409,7 +469,16 @@ def cmd_reindex(args, config: Config) -> int:
     return 0
 
 
+
 def cmd_reclassify(args, config: Config) -> int:
+    with dbm.collector_lock(config.db_path, MAINTENANCE_WAIT_SECONDS) as held:
+        if not held:
+            _stood_aside("pi reclassify")
+            return 1
+        return _cmd_reclassify(args, config)
+
+
+def _cmd_reclassify(args, config: Config) -> int:
     """Re-derive brand, gender, kind and audience from what the shops wrote.
 
     Separate from `reindex` because it answers a different question — that one
@@ -451,7 +520,16 @@ def cmd_bot(args, config: Config) -> int:
         return 0
 
 
+
 def cmd_prune(args, config: Config) -> int:
+    with dbm.collector_lock(config.db_path, MAINTENANCE_WAIT_SECONDS) as held:
+        if not held:
+            _stood_aside("pi prune")
+            return 1
+        return _cmd_prune(args, config)
+
+
+def _cmd_prune(args, config: Config) -> int:
     conn = dbm.connect(config.db_path)
     before = config.db_path.stat().st_size if config.db_path.exists() else 0
 
@@ -466,9 +544,19 @@ def cmd_prune(args, config: Config) -> int:
         f"{delisted:,} товаров, снятых с продажи больше {grace} дн назад, "
         f"{orphans['variants']:,} вариантов и {orphans['products']:,} товаров без цен"
     )
-    if not args.no_vacuum:
+    page = conn.execute("PRAGMA page_size").fetchone()[0]
+    free = conn.execute("PRAGMA freelist_count").fetchone()[0] * page
+    if args.vacuum:
+        # Rewrites the whole file and holds the write lock the whole time — 47
+        # minutes on 2.7 GB, during which the bot cannot save a thing. Only on
+        # request, and best with the services stopped.
         print("VACUUM…", flush=True)
         conn.execute("VACUUM")
+    else:
+        # Free pages are reused by the next writes, and the file grows back
+        # within days anyway, so shrinking it every week bought nothing.
+        print(f"свободно внутри файла: {free / 1e6:,.0f} MB (займёт новая история; "
+              "сжать файл: pi prune --vacuum при остановленных службах)")
     after = config.db_path.stat().st_size
     print(f"размер базы: {before / 1e6:,.0f} MB -> {after / 1e6:,.0f} MB")
     return 0
@@ -705,6 +793,25 @@ def cmd_subscriptions(args, config: Config) -> int:
     return 0
 
 
+
+def cmd_reshelve(args, config: Config) -> int:
+    with dbm.collector_lock(config.db_path, MAINTENANCE_WAIT_SECONDS) as held:
+        if not held:
+            _stood_aside("pi reshelve")
+            return 1
+        return _cmd_reshelve(args, config)
+
+
+def _cmd_reshelve(args, config: Config) -> int:
+    """Rebuild the shelf from the database: no shop is read, nothing is sent."""
+    conn = dbm.connect(config.db_path)
+    domains = tuple(d.strip() for d in args.stores.split(",")) if args.stores else ()
+    written, withdrawn = pipeline.reshelve(conn, config, domains)
+    total = conn.execute("SELECT COUNT(*) FROM offers").fetchone()[0]
+    print(f"на полке: {written:,} записано, {withdrawn:,} снято; всего предложений {total:,}")
+    return 0
+
+
 def cmd_backup(args, config: Config) -> int:
     conn = dbm.connect(config.db_path)
     dest = Path(args.out) if args.out else config.db_path.with_name("pi-snapshot.db")
@@ -778,13 +885,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="history to keep, in days (default 180; the newest price per "
              "variant is always kept)",
     )
-    p.add_argument("--no-vacuum", action="store_true", help="skip VACUUM (faster, frees nothing)")
+    p.add_argument(
+        "--vacuum", action="store_true",
+        help="shrink the file afterwards; holds the database for the better part of an "
+             "hour, so stop the services first",
+    )
+    # Kept so an old unit or script that passes it still runs; it is the default now.
+    p.add_argument("--no-vacuum", action="store_true", help=argparse.SUPPRESS)
     p.add_argument(
         "--delisted-grace-days", type=int,
         help="delete products their shop stopped listing this many days ago "
              "(default: delisted_grace_days in filters.toml)",
     )
     p.set_defaults(func=cmd_prune)
+
+    p = sub.add_parser(
+        "reshelve",
+        help="rebuild the shelf from the database without reading any shop or "
+             "sending anything (after a repair, or a change to how deals are judged)",
+    )
+    p.add_argument("--stores", help="comma-separated domains: only their part of the shelf")
+    p.set_defaults(func=cmd_reshelve)
 
     p = sub.add_parser(
         "backup",

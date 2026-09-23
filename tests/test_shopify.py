@@ -9,6 +9,8 @@ import respx
 
 from pi.sources import shopify
 
+from .conftest import end_of_catalogue, numbered_products
+
 
 def test_parses_a_real_catalogue(shopify_payload):
     products = shopify.parse_products(shopify_payload, "https://shop.example")
@@ -67,38 +69,107 @@ async def test_fetch_walks_page_numbers_when_there_is_no_link_header(shopify_pay
     the catalogue lost with no error anywhere.
     """
     base = "https://shop.example"
-    repeats = -(-shopify.PAGE_SIZE // len(shopify_payload["products"]))
-    full = {"products": shopify_payload["products"] * repeats}   # a full page
     page1 = respx.get(f"{base}/products.json?limit=250").mock(
-        return_value=httpx.Response(200, json=full)
+        return_value=httpx.Response(200, json=numbered_products(shopify_payload, 1))
     )
     page2 = respx.get(f"{base}/products.json?limit=250&page=2").mock(
-        return_value=httpx.Response(200, json={"products": shopify_payload["products"][:1]})
+        return_value=httpx.Response(200, json=numbered_products(shopify_payload, 2, count=3))
+    )
+    page3 = end_of_catalogue(base, page=3)
+    page4 = respx.get(f"{base}/products.json?limit=250&page=4")
+
+    async with httpx.AsyncClient() as client:
+        result = await shopify.fetch(client, "shop.example", currency="USD")
+
+    assert page1.called and page2.called and page3.called
+    assert not page4.called, "an empty page means the catalogue ended"
+    assert result.ok and result.complete and result.enumerated
+    assert len(result.products) == shopify.PAGE_SIZE + 3
+
+
+@respx.mock
+async def test_a_short_page_is_not_the_end_of_the_catalogue(shopify_payload):
+    """Shopify cuts a page and only then removes what this visitor may not buy.
+
+    Measured 23.09.2026: shop.simon.com answered 245 products on page one and
+    250 on page two. Stopping at the short page told the run it had seen the
+    whole shop, and 76,062 products still for sale were marked as withdrawn.
+    """
+    base = "https://shop.example"
+    respx.get(f"{base}/products.json?limit=250").mock(
+        return_value=httpx.Response(200, json=numbered_products(shopify_payload, 1, count=245))
+    )
+    page2 = respx.get(f"{base}/products.json?limit=250&page=2").mock(
+        return_value=httpx.Response(200, json=numbered_products(shopify_payload, 2))
+    )
+    end_of_catalogue(base, page=3)
+
+    async with httpx.AsyncClient() as client:
+        result = await shopify.fetch(client, "shop.example", currency="USD")
+
+    assert page2.called, "the short first page did not end the walk"
+    assert len(result.products) == 245 + 250
+    assert result.enumerated, "reaching the empty page from page one is the whole shop"
+
+
+@respx.mock
+async def test_a_page_that_repeats_what_was_read_ends_the_walk(shopify_payload):
+    """A storefront that ignored ?page= would serve page one for ever."""
+    base = "https://shop.example"
+    same = numbered_products(shopify_payload, 1, count=40)
+    respx.get(f"{base}/products.json?limit=250").mock(
+        return_value=httpx.Response(200, json=same)
+    )
+    page2 = respx.get(f"{base}/products.json?limit=250&page=2").mock(
+        return_value=httpx.Response(200, json=same)
     )
     page3 = respx.get(f"{base}/products.json?limit=250&page=3")
 
     async with httpx.AsyncClient() as client:
         result = await shopify.fetch(client, "shop.example", currency="USD")
 
-    assert page1.called and page2.called
-    assert not page3.called, "a short page means the catalogue ended"
-    assert result.ok
-    # repeated ids across pages are collapsed rather than counted twice
-    assert len(result.products) == len(shopify_payload["products"])
+    assert page2.called and not page3.called
+    assert len(result.products) == 40
 
 
 @respx.mock
-async def test_a_short_first_page_ends_the_walk(shopify_payload):
+async def test_a_page_of_unpriced_products_is_still_a_page(shopify_payload):
+    """Parsing drops what has no price; the page itself still listed products,
+    so it is not the end of the catalogue."""
     base = "https://shop.example"
+    unpriced = numbered_products(shopify_payload, 1)
+    for product in unpriced["products"]:
+        for variant in product["variants"]:
+            variant["price"] = "0.00"
     respx.get(f"{base}/products.json?limit=250").mock(
-        return_value=httpx.Response(200, json=shopify_payload)
+        return_value=httpx.Response(200, json=unpriced)
     )
-    page2 = respx.get(f"{base}/products.json?limit=250&page=2")
+    page2 = respx.get(f"{base}/products.json?limit=250&page=2").mock(
+        return_value=httpx.Response(200, json=numbered_products(shopify_payload, 2, count=5))
+    )
+    end_of_catalogue(base, page=3)
 
     async with httpx.AsyncClient() as client:
         result = await shopify.fetch(client, "shop.example", currency="USD")
 
-    assert result.ok and not page2.called
+    assert page2.called
+    assert len(result.products) == 5
+
+
+@respx.mock
+async def test_the_walk_stops_before_the_page_shopify_refuses(shopify_payload):
+    """Page 101 of 250 answers HTTP 400; there is no point asking for it."""
+    base = "https://shop.example"
+    respx.get(f"{base}/products.json?limit=250&page=100").mock(
+        return_value=httpx.Response(200, json=numbered_products(shopify_payload, 100))
+    )
+    wall = respx.get(f"{base}/products.json?limit=250&page=101")
+
+    async with httpx.AsyncClient() as client:
+        result = await shopify.fetch(client, "shop.example", currency="USD", cursor=100)
+
+    assert not wall.called
+    assert not result.complete and result.next_cursor == 101
 
 
 @respx.mock
@@ -125,6 +196,7 @@ async def test_a_link_header_is_still_honoured_if_present(shopify_payload):
 @respx.mock
 async def test_rate_limit_is_retried_then_succeeds(shopify_payload):
     base = "https://shop.example"
+    end_of_catalogue(base)
     respx.get(f"{base}/products.json?limit=250").mock(
         side_effect=[
             httpx.Response(429, headers={"Retry-After": "0"}),
@@ -198,6 +270,7 @@ async def test_the_currency_the_answer_names_beats_the_one_on_record(shopify_pay
     www.stadiumgoods.com states USD in /meta.json and served NOK to a reader in
     Norway, so a 1,095 kr Air Force 1 was stored — and shown — as $1095.
     """
+    end_of_catalogue()
     respx.get("https://shop.example/products.json?limit=250").mock(
         return_value=httpx.Response(
             200, json=shopify_payload,
@@ -215,6 +288,7 @@ async def test_the_currency_the_answer_names_beats_the_one_on_record(shopify_pay
 async def test_the_cookie_carried_back_still_names_the_currency(shopify_payload):
     """Once the client holds the cookie the shop stops setting it; the request
     that carried it is then the only statement of what the page is priced in."""
+    end_of_catalogue()
     route = respx.get("https://shop.example/products.json?limit=250").mock(
         return_value=httpx.Response(200, json=shopify_payload)
     )
@@ -230,6 +304,7 @@ async def test_the_cookie_carried_back_still_names_the_currency(shopify_payload)
 async def test_a_shop_that_answers_in_its_base_keeps_it(shopify_payload):
     """The 2 September repair still holds: www.slamcity.com serves pounds and
     says GBP, whatever the storefront shows a visitor."""
+    end_of_catalogue()
     respx.get("https://shop.example/products.json?limit=250").mock(
         return_value=httpx.Response(
             200, json=shopify_payload, headers={"set-cookie": "cart_currency=GBP; path=/"}
@@ -244,6 +319,7 @@ async def test_a_shop_that_answers_in_its_base_keeps_it(shopify_payload):
 
 @respx.mock
 async def test_an_answer_that_names_nothing_keeps_the_currency_on_record(shopify_payload):
+    end_of_catalogue()
     respx.get("https://shop.example/products.json?limit=250").mock(
         return_value=httpx.Response(200, json=shopify_payload)
     )
@@ -290,6 +366,7 @@ async def test_only_the_first_page_needs_to_name_the_currency(shopify_payload):
     base = "https://shop.example"
     repeats = -(-shopify.PAGE_SIZE // len(shopify_payload["products"]))
     full = {"products": shopify_payload["products"] * repeats}
+    end_of_catalogue(base)
     respx.get(f"{base}/products.json?limit=250").mock(
         return_value=httpx.Response(200, json=full, headers={"set-cookie": "cart_currency=NOK"})
     )
@@ -297,6 +374,7 @@ async def test_only_the_first_page_needs_to_name_the_currency(shopify_payload):
     respx.get(f"{base}/products.json?limit=250&page=2").mock(
         return_value=httpx.Response(200, json={"products": [later]})
     )
+    end_of_catalogue(base, page=3)
     async with httpx.AsyncClient() as client:
         result = await shopify.fetch(client, "shop.example", currency="USD")
 
@@ -326,6 +404,7 @@ async def test_a_redirect_that_set_the_cookie_still_counts(shopify_payload):
 async def test_an_answer_naming_nothing_asks_the_shop_not_the_record(shopify_payload):
     """The record may be a cookie from another address. A shop that stops
     saying what it serves is asked again, or dollars go in as kroner."""
+    end_of_catalogue()
     respx.get("https://shop.example/products.json?limit=250").mock(
         return_value=httpx.Response(200, json=shopify_payload)
     )
@@ -343,6 +422,7 @@ async def test_an_answer_naming_nothing_asks_the_shop_not_the_record(shopify_pay
 @pytest.mark.asks_meta
 @respx.mock
 async def test_a_shop_that_names_its_currency_is_not_asked_again(shopify_payload):
+    end_of_catalogue()
     respx.get("https://shop.example/products.json?limit=250").mock(
         return_value=httpx.Response(200, json=shopify_payload, headers={"set-cookie": "cart_currency=NOK"})
     )
@@ -356,6 +436,7 @@ async def test_a_shop_that_names_its_currency_is_not_asked_again(shopify_payload
 @pytest.mark.asks_meta
 @respx.mock
 async def test_a_shop_that_answers_no_meta_keeps_the_record(shopify_payload):
+    end_of_catalogue()
     respx.get("https://shop.example/products.json?limit=250").mock(
         return_value=httpx.Response(200, json=shopify_payload)
     )
@@ -449,6 +530,7 @@ async def test_one_strict_shop_backs_itself_off_not_the_whole_sweep(shopify_payl
     from pi.throttle import RateLimiter
 
     limiter = RateLimiter(rate=1000.0, per_host_rate=1000.0, cooldown=0.01)
+    end_of_catalogue()
     respx.get("https://shop.example/products.json?limit=250").mock(
         side_effect=[httpx.Response(429), httpx.Response(200, json=shopify_payload)]
     )
@@ -499,6 +581,7 @@ async def test_the_limiter_holds_its_slot_across_the_request(shopify_payload):
         async def confirm_blocked(self):
             return False
 
+    end_of_catalogue()
     respx.get("https://shop.example/products.json?limit=250").mock(
         return_value=httpx.Response(200, json=shopify_payload)
     )
@@ -506,10 +589,11 @@ async def test_the_limiter_holds_its_slot_across_the_request(shopify_payload):
         await shopify.fetch(client, "shop.example", currency="USD", limiter=Watching())
 
     # The slot is released as soon as the response arrives; the success is
-    # recorded after, once the status has been looked at.
+    # recorded after, once the status has been looked at. Twice: the catalogue
+    # page, then the empty page that says it ended.
     assert events == [
         "enter:shop.example", "try:shop.example", "exit:shop.example", "ok:shop.example"
-    ]
+    ] * 2
 
 
 @respx.mock
@@ -554,6 +638,7 @@ async def test_a_store_waiting_out_a_false_block_is_still_collected(
     for n in range(4):
         await limiter.penalise(host=f"other{n}.example")
 
+    end_of_catalogue()
     respx.get("https://shop.example/products.json?limit=250").mock(
         return_value=httpx.Response(200, json=shopify_payload)
     )
@@ -590,9 +675,11 @@ class TestFinishingACatalogueOverSeveralRuns:
 
     @respx.mock
     async def test_stopping_at_the_page_cap_says_where_to_resume(self, shopify_payload):
-        respx.route(host="shop.example", path="/products.json").mock(
-            return_value=httpx.Response(200, json=self._full_page(shopify_payload))
-        )
+        def page(request):
+            number = int(request.url.params.get("page", "1"))
+            return httpx.Response(200, json=numbered_products(shopify_payload, number))
+
+        respx.route(host="shop.example", path="/products.json").mock(side_effect=page)
         async with httpx.AsyncClient() as client:
             result = await shopify.fetch(client, "shop.example", currency="USD", max_pages=2)
 
@@ -602,6 +689,7 @@ class TestFinishingACatalogueOverSeveralRuns:
 
     @respx.mock
     async def test_a_finished_catalogue_asks_for_no_second_pass(self, shopify_payload):
+        end_of_catalogue()
         respx.get("https://shop.example/products.json?limit=250").mock(
             return_value=httpx.Response(200, json=shopify_payload)
         )
@@ -616,6 +704,7 @@ class TestFinishingACatalogueOverSeveralRuns:
         page_two = respx.get("https://shop.example/products.json?limit=250&page=2").mock(
             return_value=httpx.Response(200, json=shopify_payload)
         )
+        end_of_catalogue(page=3)
         first_page = respx.get("https://shop.example/products.json?limit=250")
 
         async with httpx.AsyncClient() as client:

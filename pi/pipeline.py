@@ -9,6 +9,7 @@ from collections import Counter
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
+from html import escape
 from itertools import groupby
 from pathlib import Path
 
@@ -55,6 +56,9 @@ class RunStats:
     withdrawn: int = 0
     verified: int = 0
     failures: list[tuple[str, str]] = field(default_factory=list)
+    # Shops whose full read claimed much of the catalogue had gone and was not
+    # believed: (domain, "when · how many of how many").
+    held: list[tuple[str, str]] = field(default_factory=list)
 
 
 def make_client(timeout: float = 30.0, ca_cache: Path | None = None) -> httpx.AsyncClient:
@@ -97,6 +101,26 @@ PRODUCTIVE_INTERVAL_HOURS = 1.0
 QUIET_INTERVAL_HOURS = 24.0
 
 
+def _hours(since: str | None, now: datetime) -> float:
+    if not since:
+        return float("inf")
+    return (now - datetime.fromisoformat(since)).total_seconds() / 3600
+
+
+def _retry_interval(failing_hours: float) -> float:
+    """How long a failing shop waits before it is tried again, in hours.
+
+    A quarter of how long it has been failing, between an hour and a day. A
+    shop that failed once is asked again next hour, which is what a network
+    blip deserves; one that has failed for a week is asked once a day, which
+    is what it deserves. Before this, a failing shop was the most overdue shop
+    there was — its last success only ever got older — so www.kickz.com,
+    lerayonfrais.fr and five others went first in every run for weeks, each
+    one a crawl or a slot of the Shopify budget spent on a certain failure.
+    """
+    return min(QUIET_INTERVAL_HOURS, max(PRODUCTIVE_INTERVAL_HOURS, failing_hours / 4))
+
+
 def _overdue(store: sqlite3.Row, productive: set[int], now: datetime) -> float:
     """How many of this shop's own intervals have passed since it was collected.
 
@@ -105,14 +129,20 @@ def _overdue(store: sqlite3.Row, productive: set[int], now: datetime) -> float:
     hours old is at 1.25, so the productive one goes first — which is the point.
     Sorting by age alone would let a day's worth of quiet shops crowd out every
     shop that has ever found anything.
+
+    A shop whose last attempt failed is on a third clock: time since that
+    attempt, against an interval that grows the longer it has been failing.
     """
+    if store["status"] == "error" and store["last_checked"]:
+        failing = _hours(store["last_ok"], now)
+        waited = _hours(store["last_checked"], now)
+        return waited / _retry_interval(failing)
     interval = (
         PRODUCTIVE_INTERVAL_HOURS if store["id"] in productive else QUIET_INTERVAL_HOURS
     )
     if not store["last_ok"]:
         return float("inf")  # never collected: always first in line
-    age = (now - datetime.fromisoformat(store["last_ok"])).total_seconds() / 3600
-    return age / interval
+    return _hours(store["last_ok"], now) / interval
 
 
 def due_stores(
@@ -318,6 +348,10 @@ async def verify_offers(
         status, product = await _fetch_one(client, row, limiter)
         if status == "skipped":
             continue
+        # Asked, whatever the answer: this is what moves a card that never
+        # answers to the back of the queue instead of the front.
+        with dbm.transaction(conn):
+            dbm.note_attempt(conn, row["product_id"], dbm.utcnow())
 
         if status == "unreachable":
             report["unreachable"] += 1
@@ -344,6 +378,75 @@ async def verify_offers(
         report["changed"] += changed
         report["checked"] += 1
     return report
+
+
+# When a full read is not taken at its word. A shop does lose a few products
+# between two reads — measured on ordinary days, a handful to a few dozen —
+# but a read claiming that a fifth of it went at once is far likelier to be a
+# read that stopped early, and believing one wrongly deletes a shop's history
+# two weeks later. That is not hypothetical: a short page on 22.09.2026 marked
+# 76,062 of shop.simon.com's 77,329 products as withdrawn, and every one
+# sampled was still for sale.
+WITHDRAWAL_ALARM_SHARE = 0.2
+WITHDRAWAL_ALARM_FLOOR = 25
+# How many of the supposedly withdrawn products are opened to check. All of
+# them must answer "gone": one still for sale means the read was wrong.
+WITHDRAWAL_SAMPLE = 3
+
+
+def _spread(rows: list, count: int) -> list:
+    """`count` rows taken evenly across the list, first included."""
+    if len(rows) <= count:
+        return list(rows)
+    step = len(rows) / count
+    return [rows[int(i * step)] for i in range(count)]
+
+
+async def withdraw_missing(
+    conn: sqlite3.Connection,
+    client: httpx.AsyncClient,
+    store: sqlite3.Row,
+    seen: list[int],
+    limiter: RateLimiter | None,
+) -> tuple[int, str | None]:
+    """Mark what a full read of this shop did not list. Returns (marked, held).
+
+    `held` is None normally. When the read would withdraw more than
+    WITHDRAWAL_ALARM_SHARE of the shop, a few of those products are opened
+    first, the way the memory of this project says to check any such claim:
+    open some of what was marked and see. If any of them is still for sale,
+    nothing is marked, the shop row says why, and the daily summary shows it.
+    A genuine clearance still goes through — its sampled products answer 404.
+    """
+    candidates = dbm.withdrawal_candidates(conn, store["id"], seen)
+    if not candidates:
+        return 0, None
+    live = dbm.live_products(conn, store["id"])
+    if len(candidates) > max(WITHDRAWAL_ALARM_FLOOR, WITHDRAWAL_ALARM_SHARE * live):
+        answers = []
+        for row in _spread(candidates, WITHDRAWAL_SAMPLE):
+            status, _ = await _fetch_one(
+                client,
+                {"platform": store["platform"], "domain": store["domain"], "url": row["url"]},
+                limiter,
+            )
+            answers.append(status)
+        if any(answer != "gone" for answer in answers):
+            held = f"{dbm.utcnow()} · {len(candidates)} из {live}"
+            with dbm.transaction(conn):
+                dbm.upsert_store(conn, store["domain"], withdrawal_held=held)
+            log.warning(
+                "%-38s a full read left out %d of %d products, but %s — "
+                "not marking any of them as withdrawn",
+                store["domain"], len(candidates), live,
+                ", ".join(answers),
+            )
+            return 0, held
+    with dbm.transaction(conn):
+        marked = dbm.mark_missing(conn, store["id"], seen, dbm.utcnow())
+        if _col(store, "withdrawal_held"):
+            dbm.upsert_store(conn, store["domain"], withdrawal_held=None)
+    return marked, None
 
 
 # A figure this far above everything else the same shop quotes is not a price.
@@ -765,6 +868,7 @@ def arrange_for(
     skip_alerted: bool = True,
     kids: bool = False,
     watched: set[int] | None = None,
+    per_product: bool = True,
 ) -> list[tuple[dealm.Deal, sqlite3.Row]]:
     """One reader's list, out of deals already scored. The cheap half.
 
@@ -784,8 +888,17 @@ def arrange_for(
     shared half; which of them belongs to *this* reader is decided here, and the
     deal carries the answer so the notification does not tell somebody they are
     following a thing they never heard of.
+
+    `per_product` keeps one variant per product, which is right for a message —
+    the same hoodie in six sizes is one thing to hear about — and wrong for the
+    shelf. The shelf is filtered by size against the variant on offer, so a
+    shelf holding only each product's best-scoring size answered "nothing in
+    EU44" for a shoe discounted in EU44 whenever EU42 had scored a point higher.
+    It writes every qualifying size and folds them into one card when it draws
+    the page (pi.db.offers_for).
     """
     best_per_product: dict[int, tuple[dealm.Deal, sqlite3.Row]] = {}
+    every_variant: list[tuple[dealm.Deal, sqlite3.Row]] = []
     for deal, row in scored:
         follows = bool(watched and deal.product_id in watched)
         if skip_alerted and dealm.already_alerted(
@@ -802,13 +915,16 @@ def arrange_for(
 
         if deal.watched != follows:
             deal = replace(deal, watched=follows)
+        if not per_product:
+            every_variant.append((deal, row))
+            continue
         # One notification per product: the same hoodie discounted in six sizes
         # is one thing worth knowing, so keep only its best-scoring variant.
         previous = best_per_product.get(deal.product_id)
         if previous is None or deal.score > previous[0].score:
             best_per_product[deal.product_id] = (deal, row)
 
-    found = list(best_per_product.values())
+    found = list(best_per_product.values()) if per_product else every_variant
     if rank is None:
         found.sort(key=lambda pair: pair[0].score, reverse=True)
     else:
@@ -924,12 +1040,21 @@ def caption_for(
     )
 
 
-def all_scorable_variants(conn: sqlite3.Connection) -> list[int]:
-    """Every in-stock variant with a recorded price — the --rescan candidate set."""
+def all_scorable_variants(
+    conn: sqlite3.Connection, domains: tuple[str, ...] = ()
+) -> list[int]:
+    """Every in-stock variant with a recorded price — the --rescan candidate set.
+
+    `domains` narrows it to those shops, for rebuilding one shop's part of the
+    shelf without scoring everybody else's.
+    """
+    shops = ""
+    if domains:
+        shops = f" AND s.domain IN ({','.join('?' * len(domains))})"
     return [
         row[0]
         for row in conn.execute(
-            """
+            f"""
             SELECT v.id FROM variants v
             JOIN products p ON p.id = v.product_id
             JOIN stores   s ON s.id = p.store_id
@@ -937,10 +1062,76 @@ def all_scorable_variants(conn: sqlite3.Connection) -> list[int]:
             WHERE pp.ts = (SELECT MAX(ts) FROM price_points WHERE variant_id = v.id)
               AND pp.in_stock = 1
               AND s.last_ok IS NOT NULL
-              AND p.missing_since IS NULL
-            """
+              AND p.missing_since IS NULL{shops}
+            """,
+            list(domains),
         ).fetchall()
     ]
+
+
+# How many variants one pass of `reshelve` scores at a time. Scoring keeps a row
+# per candidate in memory, and the whole catalogue is 2.7 million of them on a
+# machine with 8 GB; a slice keeps the peak to what an hourly run already uses.
+RESHELVE_CHUNK = 100_000
+
+
+def reshelve(
+    conn: sqlite3.Connection, config: Config, domains: tuple[str, ...] = ()
+) -> tuple[int, int]:
+    """Score every priced variant again and rewrite the shelf from it.
+
+    Reads no shop and sends nothing. The shelf is normally kept by the hourly
+    run, which only rescores what moved; this is for when the shelf itself is
+    wrong — after products a bad read had withdrawn were given back (schema
+    16), or after a change to how a discount is judged. Anything on the shelf
+    that no longer qualifies, is out of stock, or belongs to a product marked
+    as withdrawn is taken off. Returns (written, withdrawn).
+    """
+    variants = all_scorable_variants(conn, domains)
+    shops = ""
+    if domains:
+        shops = (
+            " WHERE product_id IN (SELECT p.id FROM products p JOIN stores s"
+            f" ON s.id = p.store_id WHERE s.domain IN ({','.join('?' * len(domains))}))"
+        )
+    on_shelf = {
+        row[0] for row in conn.execute(f"SELECT variant_id FROM offers{shops}", list(domains))
+    }
+    market = reference.build_market_index(conn)
+    trust = reference.store_trust(conn)
+    watching = watched_products(conn, read_watchlist(config.watchlist_file))
+    followed = dbm.following(conn)
+    anyones = watching.union(*followed.values()) if followed else watching
+    shelf = shelf_config(config)
+
+    written = withdrawn = 0
+    for start in range(0, len(variants), RESHELVE_CHUNK):
+        chunk = variants[start : start + RESHELVE_CHUNK]
+        scored = score_variants(
+            conn, chunk, shelf, market=market, trust=trust, watched=anyones
+        )
+        on_offer = arrange_for(
+            conn, scored, shelf, market, cap_per_store=False, fold_duplicates=False,
+            skip_alerted=False, kids=True, per_product=False,
+        )
+        with dbm.transaction(conn):
+            kept, dropped = dbm.record_offers(
+                conn, chunk, [deal for deal, _ in on_offer], dbm.utcnow()
+            )
+        written += kept
+        withdrawn += dropped
+        log.info("rescored %d of %d variants", min(start + RESHELVE_CHUNK, len(variants)),
+                 len(variants))
+    # Whatever is on the shelf and was not even a candidate: sold out, or its
+    # product marked as withdrawn, or its shop never read. None of it can stand.
+    leftover = sorted(on_shelf.difference(variants))
+    if leftover:
+        with dbm.transaction(conn):
+            conn.executemany(
+                "DELETE FROM offers WHERE variant_id = ?", ((v,) for v in leftover)
+            )
+        withdrawn += len(leftover)
+    return written, withdrawn
 
 
 async def run(
@@ -1054,70 +1245,95 @@ async def run(
         async def one(store: sqlite3.Row):
             pool = pools.get(store["platform"], pools["jsonld"])
             async with pool:
-                # A handful of shops answer only a browser's TLS fingerprint.
-                # They get their own client; everyone else shares the pooled one.
-                if store["impersonate"] and impersonate.available():
-                    async with impersonate.ImpersonatingClient(timeout=30.0) as browser:
-                        return store, await collect_store(
-                            browser, store, jsonld_budget, limiter
-                        )
-                return store, await collect_store(client, store, jsonld_budget, limiter)
+                try:
+                    # A handful of shops answer only a browser's TLS fingerprint.
+                    # They get their own client; everyone else shares the pooled one.
+                    if store["impersonate"] and impersonate.available():
+                        async with impersonate.ImpersonatingClient(timeout=30.0) as browser:
+                            return store, await collect_store(
+                                browser, store, jsonld_budget, limiter
+                            )
+                    return store, await collect_store(client, store, jsonld_budget, limiter)
+                except Exception as exc:
+                    # One shop's surprise is that shop's failure, not the hour's.
+                    # Raised out of here it ended the whole run and threw away
+                    # every other shop's catalogue with it.
+                    log.exception("%s: reading it failed unexpectedly", store["domain"])
+                    return store, FetchResult(
+                        domain=store["domain"],
+                        error=f"crashed: {type(exc).__name__}: {exc}"[:200],
+                    )
 
-        for coro in asyncio.as_completed([one(s) for s in stores]):
-            store, result = await coro
-            if not result.ok:
-                stats.stores_failed += 1
-                stats.failures.append((store["domain"], result.error or "unknown"))
-                dbm.upsert_store(
-                    conn, store["domain"], status="error",
-                    last_error=result.error, last_checked=dbm.utcnow(),
-                )
-                log.warning("%-38s FAILED: %s", store["domain"], result.error)
-                continue
+        # Tasks rather than bare coroutines, so they can be cancelled: when the
+        # database refused a write on 20.09, the run died with every other
+        # shop's read still in flight, and each of them then failed on a closed
+        # client and filled the journal with "Task exception was never retrieved".
+        tasks = [asyncio.ensure_future(one(s)) for s in stores]
+        try:
+            for coro in asyncio.as_completed(tasks):
+                store, result = await coro
+                if not result.ok:
+                    stats.stores_failed += 1
+                    stats.failures.append((store["domain"], result.error or "unknown"))
+                    dbm.upsert_store(
+                        conn, store["domain"], status="error",
+                        last_error=result.error, last_checked=dbm.utcnow(),
+                    )
+                    log.warning("%-38s FAILED: %s", store["domain"], result.error)
+                    continue
 
-            with dbm.transaction(conn):
-                written, ids, products = store_result(conn, store["id"], result, rates)
-                # Free, because the crawl already happened. One full read of
-                # shop.simon.com confirms all 7,423 of its products at once,
-                # and there is no other affordable way: the per-IP quota holds
-                # a dozen catalogue reads an hour, not 33,000 product checks.
-                withdrawn = (
-                    dbm.mark_missing(conn, store["id"], products, dbm.utcnow())
-                    if result.enumerated else 0
-                )
-            if withdrawn:
+                with dbm.transaction(conn):
+                    written, ids, products = store_result(conn, store["id"], result, rates)
+                # Free, because the crawl already happened: the per-IP quota holds a
+                # dozen catalogue reads an hour, not 33,000 product checks. But only
+                # after a sanity check when the read claims much of the shop has
+                # gone — see withdraw_missing.
+                withdrawn = 0
+                if result.enumerated:
+                    withdrawn, held = await withdraw_missing(
+                        conn, client, store, products, limiter
+                    )
+                    if held:
+                        stats.held.append((store["domain"], held))
+                if withdrawn:
+                    log.info(
+                        "%-38s %d product(s) no longer listed", store["domain"], withdrawn
+                    )
+                    stats.withdrawn += withdrawn
+                classified.extend(products)
+                if store["id"] not in first_sight:
+                    changed.extend(ids)
+                stats.stores_ok += 1
+                stats.products_seen += len(result.products)
+                stats.points_written += written
+
+                fields = {
+                    "status": "ok",
+                    "last_checked": dbm.utcnow(),
+                    "last_ok": dbm.utcnow(),
+                    "last_error": None,
+                    "product_count": len(result.products),
+                }
+                if result.currency and result.currency in rates:
+                    fields["currency"] = result.currency
+                elif result.currency:
+                    # Every price was already dropped for want of a rate; keeping
+                    # the shop's last known currency lets the next pass recover.
+                    log.warning("%s: priced in %s, which has no exchange rate",
+                                store["domain"], result.currency)
+                fields["sitemap_cursor"] = result.next_cursor
+                dbm.upsert_store(conn, store["domain"], **fields)
                 log.info(
-                    "%-38s %d product(s) no longer listed", store["domain"], withdrawn
+                    "%-38s %4d products, %3d price changes%s",
+                    store["domain"], len(result.products), written,
+                    "" if result.complete else f" (partial, resuming at {result.next_cursor})",
                 )
-                stats.withdrawn += withdrawn
-            classified.extend(products)
-            if store["id"] not in first_sight:
-                changed.extend(ids)
-            stats.stores_ok += 1
-            stats.products_seen += len(result.products)
-            stats.points_written += written
-
-            fields = {
-                "status": "ok",
-                "last_checked": dbm.utcnow(),
-                "last_ok": dbm.utcnow(),
-                "last_error": None,
-                "product_count": len(result.products),
-            }
-            if result.currency and result.currency in rates:
-                fields["currency"] = result.currency
-            elif result.currency:
-                # Every price was already dropped for want of a rate; keeping
-                # the shop's last known currency lets the next pass recover.
-                log.warning("%s: priced in %s, which has no exchange rate",
-                            store["domain"], result.currency)
-            fields["sitemap_cursor"] = result.next_cursor
-            dbm.upsert_store(conn, store["domain"], **fields)
-            log.info(
-                "%-38s %4d products, %3d price changes%s",
-                store["domain"], len(result.products), written,
-                "" if result.complete else f" (partial, resuming at {result.next_cursor})",
-            )
+        finally:
+            pending = [task for task in tasks if not task.done()]
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
 
         # Before scoring, so a deal is judged with the product already known to
         # be a women's shoe rather than an unclassified row.
@@ -1138,8 +1354,10 @@ async def run(
             stats.verified += checks["checked"]
             stats.withdrawn += checks["gone"]
             log.info(
-                "checked %d card(s) one by one: %d gone, %d unreachable",
-                checks["checked"] + checks["gone"], checks["gone"], checks["unreachable"],
+                "opened %d card(s) one by one: %d still for sale, %d gone, "
+                "%d did not answer",
+                checks["checked"] + checks["gone"] + checks["unreachable"],
+                checks["checked"], checks["gone"], checks["unreachable"],
             )
 
         scorable = all_scorable_variants(conn) if rescan else changed
@@ -1177,7 +1395,7 @@ async def run(
         on_offer = arrange_for(
             conn, scored, shelf_config(config), market,
             cap_per_store=False, fold_duplicates=False, skip_alerted=False,
-            kids=True,
+            kids=True, per_product=False,
         )
         written, withdrawn = dbm.record_offers(
             conn, scorable, [deal for deal, _ in on_offer], dbm.utcnow()
@@ -1635,6 +1853,30 @@ def health_report(conn: sqlite3.Connection) -> str:
             lines.append("⚠️ Обход прерван: Shopify заблокировал IP. Остальные магазины — в следующий раз.")
         if last["capped"]:
             lines.append("ℹ️ Уведомлений было больше лимита; следующий обход пришлёт остальные.")
+    # Runs that started and never finished: a traceback or a timeout. The
+    # summary is where the owner looks, and until this nothing in it said so.
+    # Only runs older than an hour, so the one going right now is not counted.
+    an_hour_ago = (datetime.now(UTC) - timedelta(hours=1)).isoformat(timespec="seconds")
+    died, why = conn.execute(
+        """
+        SELECT COUNT(*), MAX(note) FROM runs
+         WHERE finished_at IS NULL AND started_at > ? AND started_at < ?
+        """,
+        (a_day_ago, an_hour_ago),
+    ).fetchone()
+    if died:
+        lines.append(
+            f"⚠️ Прогонов, не дошедших до конца, за сутки: {died}"
+            + (f" — {escape(why[:120])}" if why else "")
+        )
+    held = conn.execute(
+        "SELECT domain, withdrawal_held FROM stores WHERE withdrawal_held IS NOT NULL"
+        " ORDER BY domain LIMIT 5"
+    ).fetchall()
+    if held:
+        lines.append("⚠️ Не поверил полному чтению (магазин будто потерял большую часть "
+                     "каталога, но проверка нашла товары в продаже):")
+        lines += [f"  • {d}: {escape(note)}" for d, note in held]
     lines += [
         f"Уведомлений за сутки: {day}",
         "",

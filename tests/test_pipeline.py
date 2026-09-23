@@ -18,7 +18,7 @@ from pi.fx import Rates
 from pi.sources import jsonld
 from pi.sources.base import FetchResult, ScrapedProduct, ScrapedVariant
 
-from .conftest import ts
+from .conftest import end_of_catalogue, numbered_products, ts
 
 TOKEN, CHAT = "123:AA", "42"
 
@@ -125,6 +125,7 @@ def no_pacing(monkeypatch):
 async def test_a_discounted_shopify_catalogue_produces_a_photo_alert(config, shopify_payload):
     _mock_rates()
     photo, _ = _mock_telegram()
+    end_of_catalogue()
     respx.get("https://shop.example/products.json?limit=250").mock(
         return_value=httpx.Response(200, json=shopify_payload)
     )
@@ -155,6 +156,7 @@ async def test_a_run_classifies_what_it_collected(config, shopify_payload):
     """Brand, gender and kind must be filled by the run, not wait for a command."""
     _mock_rates()
     _mock_telegram()
+    end_of_catalogue()
     respx.get("https://shop.example/products.json?limit=250").mock(
         return_value=httpx.Response(200, json=shopify_payload)
     )
@@ -179,6 +181,7 @@ async def test_a_sold_out_discount_is_never_announced(config, shopify_payload):
     """The fixture holds a whole product discounted 29% but out of stock in every size."""
     _mock_rates()
     photo, _ = _mock_telegram()
+    end_of_catalogue()
     respx.get("https://shop.example/products.json?limit=250").mock(
         return_value=httpx.Response(200, json=shopify_payload)
     )
@@ -206,6 +209,7 @@ async def test_the_first_pass_over_a_new_store_is_a_baseline_not_news(config, sh
     """
     _mock_rates()
     photo, text = _mock_telegram()
+    end_of_catalogue()
     respx.get("https://shop.example/products.json?limit=250").mock(
         return_value=httpx.Response(200, json=shopify_payload)
     )
@@ -227,6 +231,7 @@ async def test_the_first_pass_over_a_new_store_is_a_baseline_not_news(config, sh
         for variant in product["variants"]:
             variant["available"] = True
             variant["price"] = f"{float(variant['price']) / 2:.2f}"
+    end_of_catalogue()
     respx.get("https://shop.example/products.json?limit=250").mock(
         return_value=httpx.Response(200, json=cheaper)
     )
@@ -244,6 +249,7 @@ async def test_the_first_pass_over_a_new_store_is_a_baseline_not_news(config, sh
 async def test_prices_are_converted_from_the_shops_currency(config, shopify_payload):
     _mock_rates()
     _mock_telegram()
+    end_of_catalogue()
     respx.get("https://shop.example/products.json?limit=250").mock(
         return_value=httpx.Response(200, json=shopify_payload)
     )
@@ -269,6 +275,7 @@ async def test_the_currency_a_shop_serves_in_is_what_the_store_remembers(config,
     and the shop is remembered in the currency its prices were written in."""
     _mock_rates()
     _mock_telegram()
+    end_of_catalogue()
     respx.get("https://shop.example/products.json?limit=250").mock(
         return_value=httpx.Response(
             200, json=shopify_payload, headers={"set-cookie": "cart_currency=USD; path=/"}
@@ -288,6 +295,7 @@ async def test_the_currency_a_shop_serves_in_is_what_the_store_remembers(config,
 async def test_a_currency_without_a_rate_is_not_written_onto_the_shop(config, shopify_payload):
     _mock_rates()
     _mock_telegram()
+    end_of_catalogue()
     respx.get("https://shop.example/products.json?limit=250").mock(
         return_value=httpx.Response(
             200, json=shopify_payload, headers={"set-cookie": "cart_currency=XTS; path=/"}
@@ -308,6 +316,7 @@ async def test_the_same_deal_is_not_sent_twice(config, shopify_payload):
     _mock_rates()
     _mock_product_pages(shopify_payload)
     photo, _ = _mock_telegram()
+    end_of_catalogue()
     respx.get("https://shop.example/products.json?limit=250").mock(
         return_value=httpx.Response(200, json=shopify_payload)
     )
@@ -339,6 +348,7 @@ async def test_one_product_discounted_in_many_sizes_is_announced_once(config, sh
         variant["id"] = 900_000 + index
         variant["available"] = True
         variant["option1"] = f"{4 + index}"
+    end_of_catalogue()
     respx.get("https://shop.example/products.json?limit=250").mock(
         return_value=httpx.Response(200, json={"products": [product]})
     )
@@ -363,6 +373,7 @@ async def test_a_failed_send_is_not_recorded_as_sent(config, shopify_payload):
     respx.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage").mock(
         return_value=httpx.Response(403, json={"ok": False, "description": "blocked"})
     )
+    end_of_catalogue()
     respx.get("https://shop.example/products.json?limit=250").mock(
         return_value=httpx.Response(200, json=shopify_payload)
     )
@@ -400,6 +411,7 @@ async def test_a_store_failure_is_reported_not_hidden(config):
 async def test_dry_run_sends_nothing(config, shopify_payload, capsys):
     _mock_rates()
     photo, text = _mock_telegram()
+    end_of_catalogue()
     respx.get("https://shop.example/products.json?limit=250").mock(
         return_value=httpx.Response(200, json=shopify_payload)
     )
@@ -427,6 +439,7 @@ async def test_a_brand_you_did_not_name_still_reaches_you(config, shopify_payloa
     """
     _mock_rates()
     photo, text = _mock_telegram()
+    end_of_catalogue()
     respx.get("https://shop.example/products.json?limit=250").mock(
         return_value=httpx.Response(200, json=shopify_payload)
     )
@@ -469,6 +482,74 @@ def test_health_report_names_what_is_wrong(config):
     assert "HTTP 500" in report
     assert "закрыты анти-ботом" in report
     assert "1,234" in report
+    assert "не дошедших до конца" not in report
+    assert "Не поверил" not in report
+
+
+def test_health_report_says_a_run_died_and_a_read_was_not_believed(config):
+    """Two runs ended in a traceback on 20.09 and the summary said nothing."""
+    conn = dbm.connect(config.db_path)
+    conn.execute(
+        "INSERT INTO runs (started_at, note) VALUES (?, 'failed: OperationalError: "
+        "database is locked')",
+        (ts(2 / 24),),
+    )
+    conn.execute("INSERT INTO runs (started_at) VALUES (?)", (ts(0),))  # the one going now
+    dbm.upsert_store(
+        conn, "simon.example", platform="shopify", status="ok",
+        withdrawal_held="2026-09-22T18:20:50+00:00 · 76062 из 77329",
+    )
+
+    report = pipeline.health_report(conn)
+
+    assert "не дошедших до конца, за сутки: 1" in report, "the run in progress is not counted"
+    assert "database is locked" in report
+    assert "simon.example" in report and "76062 из 77329" in report
+
+
+@respx.mock
+async def test_one_shop_that_breaks_its_reader_does_not_end_the_run(
+    config, shopify_payload, monkeypatch
+):
+    """Raised out of the collector, one adapter's surprise threw away every
+    other shop's catalogue for the hour."""
+    _mock_rates()
+    _mock_telegram()
+    _mock_product_pages(shopify_payload)
+    end_of_catalogue()
+    respx.get("https://shop.example/products.json?limit=250").mock(
+        return_value=httpx.Response(200, json=shopify_payload)
+    )
+    conn = dbm.connect(config.db_path)
+    known_store(conn)
+    known_store(conn, "odd.example")
+    real = pipeline.shopify.fetch
+
+    async def fetch(client, domain, *args, **kwargs):
+        if domain == "odd.example":
+            raise KeyError("variants")
+        return await real(client, domain, *args, **kwargs)
+
+    monkeypatch.setattr(pipeline.shopify, "fetch", fetch)
+
+    stats = await pipeline.run(config, conn)
+
+    assert stats.stores_ok == 1 and stats.stores_failed == 1
+    status, error = conn.execute(
+        "SELECT status, last_error FROM stores WHERE domain = 'odd.example'"
+    ).fetchone()
+    assert status == "error" and error.startswith("crashed: KeyError")
+
+
+def test_one_heavy_writer_at_a_time(tmp_path):
+    """The prune and the hourly run met on 20.09 and the run died twice."""
+    path = tmp_path / "pi.db"
+    with dbm.collector_lock(path, wait_seconds=0) as first:
+        assert first
+        with dbm.collector_lock(path, wait_seconds=0.2) as second:
+            assert not second, "the second one stands aside instead of colliding"
+    with dbm.collector_lock(path, wait_seconds=0) as again:
+        assert again, "and the lock is free once the first is done"
 
 
 @respx.mock
@@ -496,6 +577,7 @@ async def test_a_store_that_has_worked_before_is_always_retried(config, shopify_
     """One bad sweep must not retire a shop that is merely having a bad day."""
     _mock_rates()
     _mock_telegram()
+    end_of_catalogue()
     respx.get("https://shop.example/products.json?limit=250").mock(
         return_value=httpx.Response(200, json=shopify_payload)
     )
@@ -513,6 +595,7 @@ async def test_a_store_that_has_worked_before_is_always_retried(config, shopify_
 async def test_naming_a_store_explicitly_overrides_the_skip(config, shopify_payload):
     _mock_rates()
     _mock_telegram()
+    end_of_catalogue()
     respx.get("https://shop.example/products.json?limit=250").mock(
         return_value=httpx.Response(200, json=shopify_payload)
     )
@@ -550,6 +633,7 @@ async def test_deals_past_the_cap_are_reconsidered_not_lost(config, shopify_payl
         copy["variants"][0]["id"] = 800_000 + n
         copy["variants"][0]["available"] = True
         catalogue.append(copy)
+    end_of_catalogue()
     respx.get("https://shop.example/products.json?limit=250").mock(
         return_value=httpx.Response(200, json={"products": catalogue})
     )
@@ -589,6 +673,7 @@ async def test_seeding_silences_the_backlog_of_standing_sales(config, shopify_pa
     """
     _mock_rates()
     photo, text = _mock_telegram()
+    end_of_catalogue()
     respx.get("https://shop.example/products.json?limit=250").mock(
         return_value=httpx.Response(200, json=shopify_payload)
     )
@@ -619,6 +704,7 @@ async def test_a_price_drop_after_seeding_is_still_announced(config, shopify_pay
     """Seeding must silence the backlog without deafening the bot."""
     _mock_rates()
     _mock_telegram()
+    end_of_catalogue()
     respx.get("https://shop.example/products.json?limit=250").mock(
         return_value=httpx.Response(200, json=shopify_payload)
     )
@@ -633,6 +719,7 @@ async def test_a_price_drop_after_seeding_is_still_announced(config, shopify_pay
         for variant in product["variants"]:
             variant["available"] = True
             variant["price"] = f"{float(variant['price']) / 3:.2f}"
+    end_of_catalogue()
     respx.get("https://shop.example/products.json?limit=250").mock(
         return_value=httpx.Response(200, json=cheaper)
     )
@@ -1035,6 +1122,44 @@ class TestUnevenQueue:
         assert due[0]["domain"] == "new.example"
 
 
+class TestAShopThatKeepsFailing:
+    """A failing shop used to be the most overdue shop there was — its last
+    success only ever got older — so www.kickz.com and six others went first in
+    every run for weeks, each one a crawl or a Shopify slot spent on a certain
+    failure. Now it waits longer the longer it has been failing."""
+
+    @staticmethod
+    def _failing(conn, domain, failing_hours, tried_hours_ago, productive=True):
+        return known_store(
+            conn, domain, status="error",
+            last_ok=ts(failing_hours / 24), last_checked=ts(tried_hours_ago / 24),
+        )
+
+    def test_a_shop_that_just_failed_once_is_tried_again_next_hour(self, conn):
+        store = self._failing(conn, "blip.example", failing_hours=1.5, tried_hours_ago=1.1)
+        due, _ = pipeline.due_stores(dbm.get_stores(conn), productive={store})
+        assert [s["domain"] for s in due] == ["blip.example"]
+
+    def test_a_shop_failing_for_a_week_waits_a_day(self, conn):
+        store = self._failing(conn, "dead.example", failing_hours=24 * 7, tried_hours_ago=2)
+        due, waiting = pipeline.due_stores(dbm.get_stores(conn), productive={store})
+        assert due == [] and waiting == 1
+
+        self._failing(conn, "dead.example", failing_hours=24 * 7, tried_hours_ago=25)
+        due, _ = pipeline.due_stores(dbm.get_stores(conn), productive={store})
+        assert [s["domain"] for s in due] == ["dead.example"], "and then it is tried again"
+
+    def test_a_failing_shop_no_longer_goes_ahead_of_working_ones(self, conn):
+        good = self._store(conn, "good.example", hours_ago=2)
+        dead = self._failing(conn, "dead.example", failing_hours=24 * 20, tried_hours_ago=26)
+        due, _ = pipeline.due_stores(dbm.get_stores(conn), productive={good, dead})
+        assert [s["domain"] for s in due] == ["good.example", "dead.example"]
+
+    @staticmethod
+    def _store(conn, domain, hours_ago):
+        return known_store(conn, domain, last_ok=ts(hours_ago / 24))
+
+
 class TestAdaptiveBudget:
     """The slice fits a quota that changes through the day, so it changes too."""
 
@@ -1142,6 +1267,7 @@ async def test_a_run_leaves_what_is_on_offer_on_the_shelf(config, shopify_payloa
     """The bot reads this table; searching the database instead takes minutes."""
     _mock_rates()
     _mock_telegram()
+    end_of_catalogue()
     respx.get("https://shop.example/products.json?limit=250").mock(
         return_value=httpx.Response(200, json=shopify_payload)
     )
@@ -1163,6 +1289,7 @@ async def test_an_offer_is_withdrawn_when_the_sale_ends(config, shopify_payload)
     _mock_rates()
     _mock_product_pages(shopify_payload)
     _mock_telegram()
+    end_of_catalogue()
     respx.get("https://shop.example/products.json?limit=250").mock(
         return_value=httpx.Response(200, json=shopify_payload)
     )
@@ -1180,6 +1307,7 @@ async def test_an_offer_is_withdrawn_when_the_sale_ends(config, shopify_payload)
         for variant in product["variants"]:
             variant["compare_at_price"] = None
             variant["price"] = f"{float(variant['price']) * 4:.2f}"
+    end_of_catalogue()
     respx.get("https://shop.example/products.json?limit=250").mock(
         return_value=httpx.Response(200, json=full_price)
     )
@@ -1218,6 +1346,7 @@ class TestRecordingABlock:
         self, config, shopify_payload, monkeypatch
     ):
         _mock_rates()
+        end_of_catalogue()
         respx.get("https://shop.example/products.json?limit=250").mock(
             return_value=httpx.Response(200, json=shopify_payload)
         )
@@ -1234,6 +1363,7 @@ class TestRecordingABlock:
     async def test_a_full_run_records_it_too(self, config, shopify_payload, monkeypatch):
         _mock_rates()
         _mock_telegram()
+        end_of_catalogue()
         respx.get("https://shop.example/products.json?limit=250").mock(
             return_value=httpx.Response(200, json=shopify_payload)
         )
@@ -1249,6 +1379,7 @@ class TestRecordingABlock:
     @respx.mock
     async def test_an_untroubled_run_records_nothing(self, config, shopify_payload):
         _mock_rates()
+        end_of_catalogue()
         respx.get("https://shop.example/products.json?limit=250").mock(
             return_value=httpx.Response(200, json=shopify_payload)
         )
@@ -1394,6 +1525,7 @@ class TestAProductThatStoppedBeingSold:
         _mock_rates()
         _mock_telegram()
         _mock_product_pages(shopify_payload)
+        end_of_catalogue()
         respx.get("https://shop.example/products.json?limit=250").mock(
             return_value=httpx.Response(200, json=shopify_payload)
         )
@@ -1406,6 +1538,7 @@ class TestAProductThatStoppedBeingSold:
         ).fetchone()
 
         short = self._without(shopify_payload, 0)
+        end_of_catalogue()
         respx.get("https://shop.example/products.json?limit=250").mock(
             return_value=httpx.Response(200, json=short)
         )
@@ -1433,6 +1566,7 @@ class TestAProductThatStoppedBeingSold:
         _mock_rates()
         _mock_telegram()
         _mock_product_pages(shopify_payload)
+        end_of_catalogue()
         respx.get("https://shop.example/products.json?limit=250").mock(
             return_value=httpx.Response(200, json=shopify_payload)
         )
@@ -1441,12 +1575,13 @@ class TestAProductThatStoppedBeingSold:
         await pipeline.run(config, conn)
 
         # The next run resumes part-way in, and the shop answers with one
-        # product — a short page, so the pass ends "complete" without ever
-        # having been an enumeration.
+        # product and then an empty page, so the pass ends "complete" without
+        # ever having been an enumeration.
         one = {"products": shopify_payload["products"][1:2]}
         respx.get("https://shop.example/products.json?limit=250&page=3").mock(
             return_value=httpx.Response(200, json=one)
         )
+        end_of_catalogue(page=4)
         _mock_product_pages(one)
         dbm.upsert_store(conn, "shop.example", sitemap_cursor=3, last_ok=ts(1))
         stats = await pipeline.run(config, conn)
@@ -1465,6 +1600,7 @@ class TestAProductThatStoppedBeingSold:
         _mock_rates()
         _mock_telegram()
         short = self._without(shopify_payload, 0)
+        end_of_catalogue()
         respx.get("https://shop.example/products.json?limit=250").mock(
             return_value=httpx.Response(200, json=short)
         )
@@ -1481,6 +1617,7 @@ class TestAProductThatStoppedBeingSold:
         with dbm.transaction(conn):
             assert dbm.mark_product_missing(conn, product_id, dbm.utcnow())
 
+        end_of_catalogue()
         respx.get("https://shop.example/products.json?limit=250").mock(
             return_value=httpx.Response(200, json=shopify_payload)
         )
@@ -1491,6 +1628,7 @@ class TestAProductThatStoppedBeingSold:
         assert conn.execute(
             "SELECT missing_since FROM products WHERE id = ?", (product_id,)
         ).fetchone()[0] is None, "a restocked product is on sale again, not half deleted"
+
 
     def test_the_grace_period_is_honoured(self, conn):
         """Deleted after the grace period, kept before it. This one is final."""
@@ -1511,6 +1649,102 @@ class TestAProductThatStoppedBeingSold:
         assert left == {kept}
 
 
+
+class TestAReadThatLosesMostOfAShop:
+    """A full read claiming much of a shop has gone is checked before it counts.
+
+    22.09.2026: a short first page made shop.simon.com look like a 245-product
+    shop, and 76,062 products still for sale were marked as withdrawn — two
+    weeks from deletion with their whole price history. The walk is fixed; this
+    is the second line, for whatever next makes a read stop early.
+    """
+
+    async def _collect(self, config, conn, catalogue):
+        respx.get("https://shop.example/products.json?limit=250").mock(
+            return_value=httpx.Response(200, json=catalogue)
+        )
+        end_of_catalogue()
+        return await pipeline.run(config, conn)
+
+    async def _first_read(self, config, shopify_payload):
+        _mock_rates()
+        _mock_telegram()
+        whole = numbered_products(shopify_payload, 1, count=60)
+        # What a product's own page answers, refilled below to change the shop.
+        pages = _mock_product_pages(whole)
+        conn = dbm.connect(config.db_path)
+        known_store(conn)
+        await self._collect(config, conn, whole)
+        make_due(conn)
+        return conn, whole, pages
+
+    @respx.mock
+    async def test_a_shop_that_still_sells_it_all_loses_nothing(self, config, shopify_payload):
+        conn, whole, _ = await self._first_read(config, shopify_payload)
+
+        # The next read lists ten — and the other fifty still open as products.
+        stats = await self._collect(config, conn, {"products": whole["products"][:10]})
+
+        assert stats.withdrawn == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM products WHERE missing_since IS NOT NULL"
+        ).fetchone()[0] == 0, "not one product marked on a read that was wrong"
+        held = conn.execute(
+            "SELECT withdrawal_held FROM stores WHERE domain = 'shop.example'"
+        ).fetchone()[0]
+        assert held and "50 из 60" in held, "and the shop row says what was not believed"
+        assert stats.held and stats.held[0][0] == "shop.example"
+
+    @respx.mock
+    async def test_a_real_clearance_still_goes_through(self, config, shopify_payload):
+        conn, whole, pages = await self._first_read(config, shopify_payload)
+        left = {"products": whole["products"][:10]}
+        pages["payload"] = left  # the other fifty now answer 404
+
+        stats = await self._collect(config, conn, left)
+
+        assert stats.withdrawn == 50
+        assert not stats.held
+        assert conn.execute(
+            "SELECT withdrawal_held FROM stores WHERE domain = 'shop.example'"
+        ).fetchone()[0] is None
+
+    @respx.mock
+    async def test_a_held_read_is_forgotten_once_a_read_is_believed(
+        self, config, shopify_payload
+    ):
+        conn, whole, _ = await self._first_read(config, shopify_payload)
+        await self._collect(config, conn, {"products": whole["products"][:10]})
+        assert conn.execute(
+            "SELECT withdrawal_held FROM stores WHERE domain = 'shop.example'"
+        ).fetchone()[0]
+
+        make_due(conn)
+        await self._collect(config, conn, {"products": whole["products"][:58]})
+
+        assert conn.execute(
+            "SELECT withdrawal_held FROM stores WHERE domain = 'shop.example'"
+        ).fetchone()[0] is None
+
+    @respx.mock
+    async def test_a_few_missing_products_are_not_worth_asking_about(
+        self, config, shopify_payload, monkeypatch
+    ):
+        """Ordinary churn is marked from the read alone: no product page opened."""
+        conn, _, _ = await self._first_read(config, shopify_payload)
+        store = dbm.get_stores(conn, domains=("shop.example",))[0]
+        ids = [row[0] for row in conn.execute("SELECT id FROM products ORDER BY id")]
+
+        async def must_not_ask(*args):
+            raise AssertionError("a product page was opened for ordinary churn")
+
+        monkeypatch.setattr(pipeline, "_fetch_one", must_not_ask)
+        marked, held = await pipeline.withdraw_missing(conn, None, store, ids[:55], None)
+
+        assert marked == 5, "five of sixty is a shop selling things, not a bad read"
+        assert held is None
+
+
 class TestOpeningACardToSeeIfItIsStillThere:
     """What the free signal cannot cover, `pi verify` asks about directly.
 
@@ -1524,6 +1758,7 @@ class TestOpeningACardToSeeIfItIsStillThere:
         _mock_rates()
         _mock_telegram()
         _mock_product_pages(shopify_payload)
+        end_of_catalogue()
         respx.get("https://shop.example/products.json?limit=250").mock(
             return_value=httpx.Response(200, json=shopify_payload)
         )
@@ -1615,6 +1850,7 @@ class TestAFindIsConfirmedWithTheShopBeforeItIsSent:
     ):
         _mock_rates()
         photo, text = _mock_telegram()
+        end_of_catalogue()
         respx.get("https://shop.example/products.json?limit=250").mock(
             return_value=httpx.Response(200, json=shopify_payload)
         )
@@ -1628,6 +1864,7 @@ class TestAFindIsConfirmedWithTheShopBeforeItIsSent:
             for variant in product["variants"]:
                 variant["available"] = True
                 variant["price"] = f"{float(variant['price']) / 3:.2f}"
+        end_of_catalogue()
         respx.get("https://shop.example/products.json?limit=250").mock(
             return_value=httpx.Response(200, json=cheaper)
         )
@@ -1645,6 +1882,7 @@ class TestAFindIsConfirmedWithTheShopBeforeItIsSent:
         run already decided."""
         _mock_rates()
         _mock_telegram()
+        end_of_catalogue()
         respx.get("https://shop.example/products.json?limit=250").mock(
             return_value=httpx.Response(200, json=shopify_payload)
         )
@@ -1658,6 +1896,7 @@ class TestAFindIsConfirmedWithTheShopBeforeItIsSent:
             for variant in product["variants"]:
                 variant["available"] = True
                 variant["price"] = f"{float(variant['price']) / 3:.2f}"
+        end_of_catalogue()
         respx.get("https://shop.example/products.json?limit=250").mock(
             return_value=httpx.Response(200, json=cheaper)
         )
@@ -1683,6 +1922,7 @@ class TestSeenIsNotTheSameAsChanged:
     ):
         _mock_rates()
         _mock_telegram()
+        end_of_catalogue()
         respx.get("https://shop.example/products.json?limit=250").mock(
             return_value=httpx.Response(200, json=shopify_payload)
         )

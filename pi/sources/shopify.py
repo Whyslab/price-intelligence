@@ -265,16 +265,27 @@ def _option_slots(raw: dict) -> tuple[int, int]:
     return size, colour
 
 
+def _listed_id(raw) -> str:
+    """How a page names one of its products, whether or not it parses."""
+    if isinstance(raw, dict):
+        return str(raw.get("id") or raw.get("handle") or "")
+    return ""
+
+
 def parse_products(payload: dict, base: str) -> list[ScrapedProduct]:
     """Turn one /products.json body into our own shapes. Pure — no I/O, easy to test."""
     out: list[ScrapedProduct] = []
     for raw in payload.get("products") or []:
+        if not isinstance(raw, dict):
+            continue
         handle = raw.get("handle") or ""
         variants: list[ScrapedVariant] = []
         image = None
         size_slot, colour_slot = _option_slots(raw)
         options = ("option1", "option2", "option3")
         for rv in raw.get("variants") or []:
+            if not isinstance(rv, dict):
+                continue
             price = _money(rv.get("price"))
             if price is None:
                 continue
@@ -412,6 +423,9 @@ async def fetch(
 
     products: list[ScrapedProduct] = []
     seen_ids: set[str] = set()
+    # Ids as the pages listed them, before parsing drops the unpriced: a page
+    # of products that all fail to parse is still a page of the catalogue.
+    listed_ids: set[str] = set()
     page_number = max(1, cursor)
     # Shopify refuses `page * limit` beyond 25,000 — the 101st page of 250
     # answers HTTP 400 "Page * Limit exceeds the 25000 limit" — and a cursor
@@ -440,6 +454,8 @@ async def fetch(
         except ValueError:
             break
         if not isinstance(payload, dict) or "products" not in payload:
+            if products:
+                break  # pages already read are still a result; resume from here
             return FetchResult(domain=domain, currency=currency, error="not a Shopify catalogue")
 
         raw = payload.get("products") or []
@@ -470,10 +486,29 @@ async def fetch(
             page_number += 1
             url = link.group(1)
             continue
-        if len(raw) < PAGE_SIZE:
+        # Only an empty page ends the catalogue. A short one does not: Shopify
+        # cuts the page first and removes what this visitor may not buy
+        # afterwards, so a page comes back short in the middle of the list.
+        # Measured on 23.09.2026: shop.simon.com answered 245 products on page
+        # one and 250 on page two, www.sneakersnstuff.com 221 and then 227.
+        # Reading the short page as the last one told the run it had seen the
+        # whole shop, and 76,062 of shop.simon.com's products — and 23,955 of
+        # italist's, 4,182 of Sneakersnstuff's — were marked as withdrawn while
+        # every one of them was still for sale. The price of knowing is one
+        # empty page per finished pass.
+        #
+        # A page listing nothing new ends the walk too: a storefront that
+        # ignored ?page= would otherwise serve its first page sixty times.
+        fresh = {_listed_id(item) for item in raw} - listed_ids
+        listed_ids |= fresh
+        if not raw or not fresh:
             exhausted = True
-            break  # a short page is the last page
+            break
         page_number += 1
+        if page_number > LAST_PAGE:
+            # Past the window Shopify answers at all. Asking anyway costs a
+            # request and returns HTTP 400; the next pass starts again at one.
+            break
         url = f"{base}/products.json?limit={PAGE_SIZE}&page={page_number}"
 
     if exhausted:
