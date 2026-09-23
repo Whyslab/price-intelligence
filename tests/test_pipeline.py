@@ -2054,3 +2054,46 @@ class TestTheWatchlistTakesNamesAsWellAsNumbers:
 
         watch = pipeline.Watchlist(frozenset({"CW2288-111"}), ("Salomon XT-6",))
         assert pipeline.watched_products(conn, watch) == {by_name, by_number}
+
+
+@respx.mock
+async def test_a_followed_size_back_in_stock_is_told_to_its_follower(config, shopify_payload):
+    """A restock at the old price is not a discount, so the discount side never
+    spoke of it — and it is what somebody following a sold-out shoe waits for."""
+    _mock_rates()
+    photo, _ = _mock_telegram()
+    sold_out = json.loads(json.dumps(shopify_payload))
+    target = sold_out["products"][0]
+    for variant in target["variants"]:
+        variant["available"] = False
+    pages = _mock_product_pages(sold_out)
+    end_of_catalogue()
+    respx.get("https://shop.example/products.json?limit=250").mock(
+        return_value=httpx.Response(200, json=sold_out)
+    )
+    conn = dbm.connect(config.db_path)
+    known_store(conn)
+    await pipeline.run(config, conn)
+
+    dbm.upsert_bot_user(conn, 42, "42", "owner")
+    (product_id,) = conn.execute(
+        "SELECT id FROM products WHERE external_id = ?", (str(target["id"]),)
+    ).fetchone()
+    dbm.add_favorite(conn, 42, product_id)
+
+    back = json.loads(json.dumps(shopify_payload))
+    back["products"][0]["variants"][0]["available"] = True
+    pages["payload"] = back
+    respx.get("https://shop.example/products.json?limit=250").mock(
+        return_value=httpx.Response(200, json=back)
+    )
+    make_due(conn)
+    photo.reset()
+    stats = await pipeline.run(config, conn)
+
+    assert stats.notices_sent == 1
+    captions = [json.loads(call.request.content)["caption"] for call in photo.calls]
+    assert any("Снова в наличии" in caption for caption in captions)
+    assert conn.execute(
+        "SELECT restock_notified_at FROM favorites WHERE user_id = 42"
+    ).fetchone()[0], "and it is written down, so the next run does not repeat it"

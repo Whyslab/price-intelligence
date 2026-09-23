@@ -747,6 +747,7 @@ def record_price(
     fx_rate: float,
     ts: str | None = None,
     compare_at_native: float | None = None,
+    restocked: list[int] | None = None,
 ) -> bool:
     """Append a price point, but only if the shop actually changed something.
 
@@ -755,6 +756,10 @@ def record_price(
     at rates 1.2705 and 1.2713 became $123.97 and $123.89, and the second one was
     written down as news. That noise was most of the database, and it turned a
     currency wobble into an all-time low.
+
+    A variant that was sold out and is not any more is appended to `restocked`
+    when one is given: somebody following it wants to hear exactly that, and it
+    is the one moment the previous point is already in hand.
 
     Returns True when a row was written.
     """
@@ -766,6 +771,8 @@ def record_price(
         and bool(prev["in_stock"]) is bool(in_stock)
     ):
         return False
+    if restocked is not None and prev is not None and not prev["in_stock"] and in_stock:
+        restocked.append(variant_id)
     conn.execute(
         """
         INSERT OR REPLACE INTO price_points
@@ -2022,6 +2029,17 @@ def _sibling_product_ids(conn: sqlite3.Connection, product_id: int) -> list[int]
             {"pid": product_id, "fanout": MAX_KEY_FANOUT},
         ).fetchall()
     ]
+
+
+def article_products(conn: sqlite3.Connection, product_id: int) -> list[int]:
+    """This product and every other one carrying its article number, any shop.
+
+    What "follow this article everywhere" follows. In stock or not — a sold-out
+    listing is exactly the one worth following — and never more than
+    MAX_KEY_FANOUT, the size past which a key stops being an article number.
+    """
+    others = [pid for pid in _sibling_product_ids(conn, product_id) if pid != product_id]
+    return [product_id, *others[: MAX_KEY_FANOUT - 1]]
 
 
 def same_article(conn: sqlite3.Connection, product_id: int) -> list[sqlite3.Row]:

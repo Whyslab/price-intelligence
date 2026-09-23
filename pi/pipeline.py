@@ -17,7 +17,7 @@ import httpx
 
 from . import db as dbm
 from . import deals as dealm
-from . import landed, personal, reference, taxonomy, tls
+from . import landed, personal, reference, taxonomy, tls, watch
 from .config import Config
 from .domains import same_shop, shop_link
 from .fx import Rates, load_rates
@@ -59,6 +59,8 @@ class RunStats:
     # Shops whose full read claimed much of the catalogue had gone and was not
     # believed: (domain, "when · how many of how many").
     held: list[tuple[str, str]] = field(default_factory=list)
+    # "Back in stock" and "no longer sold" messages to readers following a product.
+    notices_sent: int = 0
 
 
 def make_client(timeout: float = 30.0, ca_cache: Path | None = None) -> httpx.AsyncClient:
@@ -481,14 +483,19 @@ def price_ceilings(products: list) -> dict[str, float]:
 
 
 def store_result(
-    conn: sqlite3.Connection, store_id: int, result: FetchResult, rates: Rates
+    conn: sqlite3.Connection,
+    store_id: int,
+    result: FetchResult,
+    rates: Rates,
+    restocked: list[int] | None = None,
 ) -> tuple[int, list[int], list[int]]:
     """Persist one store's catalogue.
 
     Returns (points_written, changed_variant_ids, product_ids). The product ids
     are what the run classifies afterwards: brand, gender and kind are derived
     from the title, the category and the sizes, so they can only be worked out
-    once all three are in the database.
+    once all three are in the database. Variants back in stock are appended to
+    `restocked`, for pi.watch.
     """
     written = 0
     changed: list[int] = []
@@ -542,7 +549,7 @@ def store_result(
             if dbm.record_price(
                 conn, variant_id, price_usd, compare_usd, variant.in_stock,
                 currency, variant.price, rate, ts=ts,
-                compare_at_native=variant.compare_at,
+                compare_at_native=variant.compare_at, restocked=restocked,
             ):
                 written += 1
                 changed.append(variant_id)
@@ -1232,6 +1239,8 @@ async def run(
     limiter = RateLimiter(rate=config.shopify_rate, per_host_rate=config.shopify_host_rate)
     changed: list[int] = []
     classified: list[int] = []
+    # Sizes that were sold out and are not any more, for whoever follows them.
+    restocked: list[int] = []
     # A store being read for the first time has every standing sale look brand
     # new. That first pass is a baseline, not news: record the prices, announce
     # nothing, and let the next run report what actually moved.
@@ -1283,7 +1292,9 @@ async def run(
                     continue
 
                 with dbm.transaction(conn):
-                    written, ids, products = store_result(conn, store["id"], result, rates)
+                    written, ids, products = store_result(
+                        conn, store["id"], result, rates, restocked
+                    )
                 # Free, because the crawl already happened: the per-IP quota holds a
                 # dozen catalogue reads an hour, not 33,000 product checks. But only
                 # after a sanity check when the read claims much of the shop has
@@ -1465,7 +1476,17 @@ async def run(
         if capped_anyone:
             conn.execute("UPDATE runs SET capped = 1 WHERE id = ?", (run_id,))
 
+        # What a price never shows: a followed size back in stock, and a
+        # followed product the shop took down. See pi.watch.
+        notices = watch.restock_notices(conn, restocked, readers) + watch.gone_notices(
+            conn, readers, config.filters.delisted_grace_days
+        )
+
         if dry_run:
+            for notice in notices:
+                print("-" * 60)
+                print(f"[{notice.kind} → {notice.chat_id}]")
+                print(notice.text)
             for reader, selected in queues:
                 if len(queues) > 1:
                     print("=" * 60)
@@ -1504,6 +1525,7 @@ async def run(
                 conn, config, client, reader, selected, shipping, eur_usd,
                 since.get(reader.user_id, {}),
             )
+        stats.notices_sent += await _send_notices(conn, config, client, notices)
 
     _record_block(conn, run_id, limiter)
     _finish_run(conn, run_id, stats)
@@ -1659,6 +1681,32 @@ async def _send_to(
                     personal.deactivate(conn, reader.chat_id)
                     break
             await asyncio.sleep(1.0)  # Telegram allows ~30 messages/second; be calm
+    return sent
+
+
+async def _send_notices(
+    conn: sqlite3.Connection,
+    config: Config,
+    client: httpx.AsyncClient,
+    notices: list[watch.Notice],
+) -> int:
+    """Deliver what pi.watch found, marking each once it has arrived."""
+    sent = 0
+    for notice in notices:
+        async with Telegram(config.bot_token, notice.chat_id, client) as telegram:
+            if notice.kind == "restock":
+                ok = await telegram.send_deal(notice.text, notice.image_url)
+            else:
+                ok = await telegram.send_text(notice.text)
+            if ok:
+                sent += 1
+                with dbm.transaction(conn):
+                    watch.mark_told(conn, notice, dbm.utcnow())
+            elif telegram.chat_is_gone:
+                personal.deactivate(conn, notice.chat_id)
+        await asyncio.sleep(1.0)
+    if sent:
+        log.info("told %d reader(s) about a followed product coming back or going", sent)
     return sent
 
 

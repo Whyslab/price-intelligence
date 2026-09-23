@@ -257,6 +257,12 @@ CREATE TABLE IF NOT EXISTS favorites (
     added_at       TEXT    NOT NULL,
     notify         INTEGER NOT NULL DEFAULT 1,
     last_price_usd REAL,
+    -- When this reader was last told it came back in stock, and when they were
+    -- told the shop stopped selling it. The first keeps a size that flickers in
+    -- and out of stock from arriving hourly; the second is compared with the
+    -- product's missing_since, so each disappearance is reported once.
+    restock_notified_at TEXT,
+    gone_notified_at    TEXT,
     PRIMARY KEY (user_id, product_id)
 );
 -- Read once per run, to collect everything anybody follows.

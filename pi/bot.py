@@ -427,15 +427,19 @@ def format_lookup(found: dict) -> str:
         lines.append("<i>это разные вещи, а не одна в разных магазинах</i>")
     lines.append("")
 
-    for row in found["shops"][:BOT_LOOKUP_LIMIT]:
+    for number, row in enumerate(found["shops"][:BOT_LOOKUP_LIMIT], 1):
         shop = escape(row["store_name"] or row["domain"])
         country = f" · {escape(row['country'])}" if row["country"] else ""
         cut = f" · −{row['discount_pct']:.0f}%" if row["discount_pct"] else ""
         title = escape(row["title"])[:60]
         link = shop_link(row["url"], row["domain"])
         price = _money(row["price_usd"])
+        # A name finds different things, and the ⭐ buttons under the answer
+        # refer to them by number; an article is one thing and needs none.
+        mark = "" if found["same_thing"] else f"{number}. "
         lines.append(
-            (f'<a href="{escape(link)}">{price}</a>' if link else price)
+            mark
+            + (f'<a href="{escape(link)}">{price}</a>' if link else price)
             + f" — {shop}{country}{cut}"
         )
         if not found["same_thing"]:
@@ -443,6 +447,82 @@ def format_lookup(found: dict) -> str:
     if found["found"] > BOT_LOOKUP_LIMIT:
         lines.append(f"\n<i>показано {BOT_LOOKUP_LIMIT} из {found['found']}</i>")
     return "\n".join(lines)
+
+
+def lookup_keyboard(found: dict) -> dict | None:
+    """What can be done with an answer: follow it.
+
+    An article is one thing in several shops, so one button follows it in all
+    of them. A name is several different things, so each gets its own button,
+    numbered like the lines above it.
+    """
+    shops = found["shops"][:BOT_LOOKUP_LIMIT]
+    if not shops:
+        return None
+    if found["same_thing"]:
+        return {"inline_keyboard": [[{
+            "text": "⭐ Следить во всех магазинах",
+            "callback_data": f"fwa:{shops[0]['product_id']}",
+        }]]}
+    buttons = [
+        {"text": f"⭐ {number}", "callback_data": f"fw:{row['product_id']}"}
+        for number, row in enumerate(shops, 1)
+    ]
+    return {"inline_keyboard": [buttons[i : i + 4] for i in range(0, len(buttons), 4)]}
+
+
+# How many followed things one message lists, and so how many ✖ buttons it
+# carries. Past this the list is a page nobody reads on a phone.
+FOLLOWING_SHOWN = 20
+
+FOLLOWING_EMPTY = (
+    "⭐ Вы пока ни за чем не следите.\n\n"
+    "Пришлите артикул с коробки (<code>CW2288-111</code>) или название — под "
+    "ответом будет кнопка «⭐ Следить». Я напишу, когда вещь подешевеет, снова "
+    "появится в наличии или пропадёт из продажи."
+)
+
+
+def format_following(items: list[dict]) -> str:
+    """The reader's own list: what each thing costs now, or that it is sold out."""
+    if not items:
+        return FOLLOWING_EMPTY
+    lines = [
+        "⭐ <b>Вы следите за "
+        + plural(len(items), "вещью", "вещами", "вещами")
+        + "</b>",
+        "",
+    ]
+    for number, item in enumerate(items[:FOLLOWING_SHOWN], 1):
+        brand = f"<b>{escape(item['brand'])}</b> " if item["brand"] else ""
+        title = escape(item["title"])[:60]
+        shop = escape(item["store_name"] or item["domain"])
+        link = shop_link(item["url"], item["domain"])
+        if item["price_usd"] is None:
+            price = "нет в наличии"
+        else:
+            price = _money(item["price_usd"])
+            if link:
+                price = f'<a href="{escape(link)}">{price}</a>'
+            since = item["since_usd"]
+            if since and since - item["price_usd"] >= 0.01:
+                price += f" (было {_money(since)})"
+        lines.append(f"{number}. {brand}{title}")
+        lines.append(f"   {price} · {shop}")
+    if len(items) > FOLLOWING_SHOWN:
+        lines.append(f"\n<i>показано {FOLLOWING_SHOWN} из {len(items)}</i>")
+    lines.append("\n✖ — перестать следить.")
+    return "\n".join(lines)
+
+
+def following_keyboard(items: list[dict]) -> dict | None:
+    buttons = [
+        {"text": f"✖ {number}", "callback_data": f"uf:{item['product_id']}"}
+        for number, item in enumerate(items[:FOLLOWING_SHOWN], 1)
+    ]
+    if not buttons:
+        return None
+    return {"inline_keyboard": [buttons[i : i + 5] for i in range(0, len(buttons), 5)]}
 
 
 def _shop_button(text: str, row: sqlite3.Row) -> list[dict]:
@@ -501,7 +581,8 @@ def shelf_button(web_url: str | None) -> list[dict] | None:
 
 def menu_keyboard(user: sqlite3.Row, web_url: str | None = None,
                   subscribed: bool = False, owner: bool = False) -> dict:
-    rows = [[{"text": "💰 Смотреть скидки", "callback_data": "p:0"}]]
+    rows = [[{"text": "💰 Смотреть скидки", "callback_data": "p:0"},
+             {"text": "⭐ Избранное", "callback_data": "following"}]]
     shelf = shelf_button(web_url)
     if shelf:
         rows.append(shelf)
@@ -775,6 +856,63 @@ class Bot:
         ):
             return
         await self.send(chat_id, caption, keyboard)
+
+    # -- following --
+
+    def _may_follow(self, user: sqlite3.Row) -> bool:
+        """Following is what the shelf's hearts do, and it is sold with the shelf."""
+        if not self.config.subscription or self.is_owner(user):
+            return True
+        return dbm.subscription_state(self.conn, user["id"]) != "free"
+
+    async def follow(
+        self, chat_id: str, user: sqlite3.Row, product_id: int, everywhere: bool = False
+    ) -> None:
+        """Start following one product, or one article in every shop that has it."""
+        if not self._may_follow(user):
+            await self.show_subscription(chat_id, user)
+            return
+        row = self.conn.execute(
+            "SELECT p.title, s.domain, s.name FROM products p"
+            " JOIN stores s ON s.id = p.store_id WHERE p.id = ?",
+            (product_id,),
+        ).fetchone()
+        if row is None:
+            await self.send(chat_id, "Этой вещи уже нет в базе — пришлите запрос ещё раз.")
+            return
+        ids = dbm.article_products(self.conn, product_id) if everywhere else [product_id]
+        added = sum(dbm.add_favorite(self.conn, user["id"], pid) for pid in ids)
+        where = (
+            "в " + plural(len(ids), "магазине", "магазинах", "магазинах")
+            if everywhere else f"в {escape(row['name'] or row['domain'])}"
+        )
+        news = "" if added else " (уже следил)"
+        await self.send(
+            chat_id,
+            f"⭐ Слежу: {escape(row['title'])} — {where}{news}.\n\n"
+            "Напишу, когда подешевеет хотя бы на 2%, снова появится в наличии "
+            "или пропадёт из продажи. Список — /following.",
+        )
+
+    async def show_following(self, chat_id: str, user: sqlite3.Row) -> None:
+        if not self._may_follow(user):
+            await self.show_subscription(chat_id, user)
+            return
+        items = dbm.favorites_for(self.conn, user["id"])
+        await self.send(chat_id, format_following(items), following_keyboard(items))
+
+    async def unfollow(
+        self, chat_id: str, user: sqlite3.Row, product_id: int, message_id: int | None
+    ) -> None:
+        dbm.remove_favorite(self.conn, user["id"], product_id)
+        items = dbm.favorites_for(self.conn, user["id"])
+        text, keyboard = format_following(items), following_keyboard(items)
+        # The list the button was pressed on is redrawn, so the numbers under it
+        # keep meaning what they say.
+        if message_id:
+            await self.edit(chat_id, message_id, text, keyboard or {"inline_keyboard": []})
+        else:
+            await self.send(chat_id, text, keyboard)
 
     # -- paying --
 
@@ -1272,6 +1410,9 @@ class Bot:
         if text.startswith(("/deals", "/list")):
             await self.show_list(chat_id, user, page=0, message_id=None)
             return
+        if text.startswith(("/following", "/favorites", "/watch")):
+            await self.show_following(chat_id, user)
+            return
 
         step = user["wizard_step"]
         if step in ("admin_grant", "admin_revoke"):
@@ -1287,7 +1428,7 @@ class Bot:
         # question the shelf could never answer: it starts from a product id
         # and the page only has ids for what is already discounted.
         found = dbm.lookup_article(self.conn, text, limit=BOT_LOOKUP_LIMIT)
-        await self.send(chat_id, format_lookup(found))
+        await self.send(chat_id, format_lookup(found), lookup_keyboard(found))
 
     @staticmethod
     def _clean(step: str, text: str) -> str | None:
@@ -1333,6 +1474,13 @@ class Bot:
             )
         elif data == "menu":
             await self.show_menu(chat_id, user)
+        elif data == "following":
+            await self.show_following(chat_id, user)
+        elif data.startswith(("fw:", "fwa:")):
+            kind, _, raw = data.partition(":")
+            await self.follow(chat_id, user, int(raw), everywhere=kind == "fwa")
+        elif data.startswith("uf:"):
+            await self.unfollow(chat_id, user, int(data[3:]), message_id)
         elif data.startswith("p:"):
             await self.show_list(chat_id, user, int(data[2:]), None)
         elif data.startswith("o:"):

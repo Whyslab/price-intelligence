@@ -588,3 +588,109 @@ class TestStartingBeforeTheNetwork:
         assert asked[:4] == ["getMe", "getMe", "getMe", "getUpdates"]
         assert "@pi_bot is listening" in caplog.text
         assert "@?" not in caplog.text
+
+
+class TestFollowingFromTheChat:
+    """The shelf's hearts need the mini-app, which only the owner can open (it is
+    reached through Tailscale). Following from the chat itself gives every
+    reader the thing the second customer segment pays for: a watch on one item."""
+
+    @staticmethod
+    def _stock(conn, domain, title, price, style=None):
+        store = dbm.upsert_store(conn, domain, platform="shopify", currency="USD",
+                                 name=domain.split(".")[0])
+        product = dbm.upsert_product(conn, store, f"p-{domain}-{title}", title,
+                                     f"https://{domain}/products/x")
+        if style:
+            dbm.set_product_keys(conn, product, {("style", style)})
+        variant = dbm.upsert_variant(conn, product, f"v-{domain}")
+        dbm.record_price(conn, variant, price, None, True, "USD", price, 1.0)
+        return product
+
+    @staticmethod
+    def _buttons(call) -> list[dict]:
+        return [b for row in call[1]["reply_markup"]["inline_keyboard"] for b in row]
+
+    @pytest.fixture
+    def robot(self, conn, tmp_path, calls, monkeypatch):
+        instance = bot.Bot(TestRouting._config(tmp_path), conn)
+
+        async def record(method, payload):
+            calls.append((method, payload))
+            return {"username": "test"}
+
+        monkeypatch.setattr(instance, "_call", record)
+        return instance
+
+    @pytest.fixture
+    def calls(self):
+        return []
+
+    @pytest.mark.asyncio
+    async def test_a_name_search_numbers_its_lines_and_offers_a_star_for_each(
+        self, robot, calls, conn
+    ):
+        first = self._stock(conn, "a.example", "Salomon XT-6 black", 150.0)
+        second = self._stock(conn, "b.example", "Salomon XT-6 white", 160.0)
+
+        await robot.handle(TestRouting._message("salomon xt-6"))
+
+        method, payload = calls[-1]
+        assert method == "sendMessage"
+        assert "1. " in payload["text"] and "2. " in payload["text"]
+        stars = [b["callback_data"] for b in self._buttons(calls[-1])]
+        assert stars == [f"fw:{first}", f"fw:{second}"]
+
+    @pytest.mark.asyncio
+    async def test_an_article_is_followed_in_every_shop_with_one_press(self, robot, calls, conn):
+        cheap = self._stock(conn, "a.example", "AF1", 90.0, style="CW2288-111")
+        dear = self._stock(conn, "b.example", "Air Force 1", 120.0, style="CW2288-111")
+
+        await robot.handle(TestRouting._message("CW2288-111"))
+        [star] = self._buttons(calls[-1])
+        assert star["callback_data"] == f"fwa:{cheap}"
+
+        await robot.handle(TestRouting._press(star["callback_data"]))
+
+        assert dbm.favorite_ids(conn, 7) == {cheap, dear}
+        assert "в 2 магазинах" in calls[-1][1]["text"]
+
+    @pytest.mark.asyncio
+    async def test_the_list_shows_what_is_followed_and_a_cross_takes_it_off(
+        self, robot, calls, conn
+    ):
+        product = self._stock(conn, "a.example", "Salomon XT-6", 150.0)
+        await robot.handle(TestRouting._press(f"fw:{product}"))
+
+        await robot.handle(TestRouting._message("/following"))
+        method, payload = calls[-1]
+        assert "Salomon XT-6" in payload["text"]
+        [cross] = self._buttons(calls[-1])
+        assert cross["callback_data"] == f"uf:{product}"
+
+        await robot.handle(TestRouting._press(cross["callback_data"]))
+
+        assert dbm.favorite_ids(conn, 7) == set()
+        method, payload = calls[-1]
+        assert method == "editMessageText", "the list is redrawn in place"
+        assert "ни за чем не следите" in payload["text"]
+
+    @pytest.mark.asyncio
+    async def test_while_it_is_sold_a_free_reader_is_offered_the_subscription(
+        self, conn, tmp_path, calls, monkeypatch
+    ):
+        from dataclasses import replace
+
+        instance = bot.Bot(replace(TestRouting._config(tmp_path), subscription=True), conn)
+
+        async def record(method, payload):
+            calls.append((method, payload))
+            return {"username": "test"}
+
+        monkeypatch.setattr(instance, "_call", record)
+        product = self._stock(conn, "a.example", "Salomon XT-6", 150.0)
+
+        await instance.handle(TestRouting._press(f"fw:{product}"))
+
+        assert dbm.favorite_ids(conn, 7) == set()
+        assert any("подписк" in (p.get("text") or "").lower() for _, p in calls)

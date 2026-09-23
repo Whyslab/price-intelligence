@@ -128,7 +128,9 @@ main{display:grid;gap:10px;padding:12px 12px 8px;max-width:1400px;margin:0 auto;
        color:var(--ink);border-radius:8px;padding:3px 8px;font-size:12px;
        font-weight:700;backdrop-filter:blur(4px);font-variant-numeric:tabular-nums}
 @media (prefers-color-scheme: dark){ .badge{background:rgba(28,25,23,.9);color:var(--ink)} }
-.low{position:absolute;top:8px;right:8px;background:var(--accent);color:#fff;
+/* Внизу слева на картинке: верхний правый угол занят сердечком, и там они
+   перекрывали друг друга (замечено 18.09). */
+.low{position:absolute;bottom:8px;left:8px;background:var(--accent);color:#fff;
      border-radius:8px;padding:3px 8px;font-size:11px;font-weight:700;
      letter-spacing:.02em}
 /* Сама плитка — ссылка, и вкладывать в неё кнопку нельзя. Поэтому обёртка:
@@ -136,7 +138,7 @@ main{display:grid;gap:10px;padding:12px 12px 8px;max-width:1400px;margin:0 auto;
 .wrap{position:relative;display:flex}
 .wrap > .card{flex:1;min-width:0}
 /* Сердечко — единственная кнопка на витрине, которая что-то записывает.
-   Внизу справа, чтобы не спорить с «минимумом» в верхнем углу. */
+   Вверху справа; «минимум» для этого живёт внизу слева. */
 .heart{position:absolute;top:6px;right:6px;width:30px;height:30px;border:none;
   border-radius:50%;background:rgba(255,255,255,.82);color:#57534e;font-size:15px;
   line-height:30px;padding:0;cursor:pointer;backdrop-filter:blur(3px)}
