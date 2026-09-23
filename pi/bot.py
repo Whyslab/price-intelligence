@@ -35,6 +35,7 @@ import httpx
 from . import db as dbm
 from . import landed
 from .config import Config
+from .domains import shop_link
 from .fx import load_rates
 from .notify import _money
 
@@ -431,9 +432,11 @@ def format_lookup(found: dict) -> str:
         country = f" · {escape(row['country'])}" if row["country"] else ""
         cut = f" · −{row['discount_pct']:.0f}%" if row["discount_pct"] else ""
         title = escape(row["title"])[:60]
+        link = shop_link(row["url"], row["domain"])
+        price = _money(row["price_usd"])
         lines.append(
-            f'<a href="{escape(row["url"])}">{_money(row["price_usd"])}</a>'
-            f" — {shop}{country}{cut}"
+            (f'<a href="{escape(link)}">{price}</a>' if link else price)
+            + f" — {shop}{country}{cut}"
         )
         if not found["same_thing"]:
             lines.append(f"   {title}")
@@ -442,11 +445,21 @@ def format_lookup(found: dict) -> str:
     return "\n".join(lines)
 
 
+def _shop_button(text: str, row: sqlite3.Row) -> list[dict]:
+    """A button to the shop, or none at all when there is no address to open.
+
+    Telegram refuses the whole message over one bad button URL, so a relative
+    or otherwise unusable link used to cost the reader the offer itself.
+    """
+    link = shop_link(row["url"], row["domain"])
+    return [{"text": text, "url": link}] if link else []
+
+
 def entry_keyboard(row: sqlite3.Row, page: int) -> dict:
     """Under each photo: buy it, or see the whole account of why it is a deal."""
     return {
         "inline_keyboard": [[
-            {"text": "🛒 В магазин", "url": row["url"]},
+            *_shop_button("🛒 В магазин", row),
             {"text": "ℹ️ Подробно", "callback_data": f"o:{row['variant_id']}:{page}"},
         ]]
     }
@@ -464,12 +477,9 @@ def nav_keyboard(page: int, total: int) -> dict:
 
 
 def card_keyboard(row: sqlite3.Row, page: int) -> dict:
-    return {
-        "inline_keyboard": [
-            [{"text": "🛒 Открыть в магазине", "url": row["url"]}],
-            [{"text": "⬅️ К списку", "callback_data": f"p:{page}"}],
-        ]
-    }
+    rows = [[{"text": "⬅️ К списку", "callback_data": f"p:{page}"}]]
+    button = _shop_button("🛒 Открыть в магазине", row)
+    return {"inline_keyboard": [button, *rows] if button else rows}
 
 
 def shelf_button(web_url: str | None) -> list[dict] | None:

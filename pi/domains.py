@@ -26,6 +26,7 @@ one of them is genuinely one retailer, so nothing is lost by it.
 from __future__ import annotations
 
 from pathlib import Path
+from urllib.parse import urljoin, urlparse
 
 # Stripped when asking "same server?" — unambiguous.
 _WWW = "www."
@@ -103,3 +104,21 @@ def load_excluded(path: Path | None = None) -> frozenset[str]:
         if line:
             out.add(same_host(line))
     return frozenset(out)
+
+
+def shop_link(url: str | None, domain: str | None) -> str | None:
+    """The address a card opens, or None when it is not a web page at all.
+
+    Shops write the link themselves, and 2,993 products carried one relative to
+    the shop (`/nl/p/…`): opened from the shelf it resolved against the shelf's
+    own address and gave a 404, and as a Telegram button it made the whole
+    message fail. Resolved against the shop instead. Anything that is not
+    http(s) afterwards — `javascript:` above all — is refused: the shelf runs
+    inside Telegram with the reader's signature to hand.
+    """
+    raw = (url or "").strip()
+    if not raw:
+        return None
+    if domain:
+        raw = urljoin(f"https://{domain}/", raw)
+    return raw if urlparse(raw).scheme in ("http", "https") else None

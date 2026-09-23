@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+from datetime import UTC, datetime, timedelta
 
 from . import db as dbm
 
@@ -46,6 +47,11 @@ CANDIDATE_DEPTH = 200
 
 # How stale a price may be and still be worth advertising with. See the query.
 MAX_AGE_HOURS = 48
+
+
+def _cutoff(hours: float) -> str:
+    """A moment `hours` ago, in the format every timestamp here is stored in."""
+    return (datetime.now(UTC) - timedelta(hours=hours)).isoformat(timespec="seconds")
 
 
 def pick(conn: sqlite3.Connection, count: int = 2) -> list[sqlite3.Row]:
@@ -93,12 +99,21 @@ def pick(conn: sqlite3.Connection, count: int = 2) -> list[sqlite3.Row]:
            -- within a day and 4,049 within two. Two days leaves room to pick
            -- two finds from different shops and different brands, and matches
            -- the ceiling the shelf itself is held to.
-           AND o.checked_at >= datetime('now', ?)
+           --
+           -- Compared with a cutoff written the way the column is: against
+           -- datetime('now'), whose space sorts below the column's 'T', every
+           -- price from the cutoff's own day passed, up to 72 hours old.
+           AND o.checked_at >= ?
+           -- Only what somebody other than the seller vouches for, the rule
+           -- the bot and the shelf both keep. An advertisement for the product
+           -- that led with the shop's own struck-through price would be
+           -- advertising exactly what free channels already repeat.
+           AND (o.all_time_low = 1 OR o.reference_source IN ('history', 'market'))
          ORDER BY (o.reference_source = 'market') DESC, o.score DESC,
                   o.discount_pct DESC
          LIMIT {CANDIDATE_DEPTH}
         """,
-        (FREE_READER, f"-{MAX_AGE_HOURS} hours"),
+        (FREE_READER, _cutoff(MAX_AGE_HOURS)),
     ).fetchall()
 
     chosen: list[sqlite3.Row] = []

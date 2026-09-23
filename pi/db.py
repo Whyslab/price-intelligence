@@ -344,6 +344,19 @@ def _migrate_15_to_16(conn: sqlite3.Connection) -> None:
             "restored %d product(s) a short catalogue page had marked as withdrawn "
             "— run `pi reshelve` to put their offers back on the shelf", restored,
         )
+    # And the links two shops' markup gave relative (`/nl/p/…`), which the
+    # crawler now resolves as it reads. Written out once so every surface — the
+    # bot's buttons above all, where one broke the whole message — gets an
+    # address it can open.
+    resolved = conn.execute(
+        """
+        UPDATE products
+           SET url = 'https://' || (SELECT domain FROM stores WHERE stores.id = products.store_id) || url
+         WHERE url LIKE '/%' AND url NOT LIKE '//%'
+        """
+    ).rowcount
+    if resolved:
+        log.info("resolved %d relative product link(s) against their shop", resolved)
 
 
 def _rebuild_alerts(conn: sqlite3.Connection) -> None:

@@ -15,7 +15,7 @@ def _offer(
     brand: str,
     score: int,
     *,
-    source: str = "tag",
+    source: str = "history",
     in_stock: bool = True,
     audience: str | None = None,
     price: float = 100.0,
@@ -176,3 +176,26 @@ class TestTheDigestDoesNotAdvertiseAStalePrice:
         _offer(conn, "b.example", "Adidas", score=99, checked_at=ts(3))
         picked = digest.pick(conn, count=2)
         assert [row["domain"] for row in picked] == ["a.example"]
+
+    def test_the_line_is_forty_eight_hours_to_the_hour(self, conn):
+        """Compared against datetime('now'), whose space sorts below the
+        column's 'T', every price from the cutoff's own day passed: a price 60
+        hours old was advertised whenever it fell on that calendar day."""
+        _offer(conn, "a.example", "Nike", score=90, checked_at=ts(47 / 24))
+        _offer(conn, "b.example", "Adidas", score=99, checked_at=ts(49 / 24))
+        assert [row["domain"] for row in digest.pick(conn, count=2)] == ["a.example"]
+
+
+class TestTheDigestAdvertisesOnlyWhatSomebodyElseVouchesFor:
+    """The bot and the shelf both hold back a discount that rests on nothing but
+    the shop's own struck-through price. The free digest is the product's
+    advertisement, and it led with exactly that."""
+
+    def test_a_find_resting_on_the_shops_own_tag_is_not_advertised(self, conn):
+        _offer(conn, "a.example", "Nike", score=99, source="tag")
+        assert digest.pick(conn, count=2) == []
+
+    def test_an_all_time_low_counts_even_on_a_tag(self, conn):
+        product = _offer(conn, "a.example", "Nike", score=99, source="tag")
+        conn.execute("UPDATE offers SET all_time_low = 1 WHERE product_id = ?", (product,))
+        assert [row["product_id"] for row in digest.pick(conn, count=2)] == [product]

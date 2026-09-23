@@ -19,7 +19,7 @@ from . import db as dbm
 from . import deals as dealm
 from . import landed, personal, reference, taxonomy, tls
 from .config import Config
-from .domains import same_shop
+from .domains import same_shop, shop_link
 from .fx import Rates, load_rates
 from .notify import Telegram, format_caption
 from .sources import asos, impersonate, jsonld, shopify
@@ -1024,7 +1024,7 @@ def caption_for(
     return format_caption(
         deal,
         title=row["title"],
-        url=row["url"],
+        url=shop_link(row["url"], row["domain"]) or row["url"],
         brand=row["brand"],
         size=row["size"],
         sku=row["sku"],

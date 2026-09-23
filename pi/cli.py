@@ -7,6 +7,7 @@ import logging
 import os
 import sys
 from dataclasses import replace
+from html import escape
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -15,7 +16,7 @@ import httpx
 from . import bot, digest, landed, personal, pipeline, reference, taxonomy, tls, web
 from . import db as dbm
 from .config import Config, load_config
-from .domains import same_host
+from .domains import same_host, shop_link
 from .fx import load_rates
 from .notify import Telegram
 from .sources import detect, jsonld
@@ -590,12 +591,19 @@ def cmd_digest(args, config: Config) -> int:
             row["country"], eur_usd,
         )
         sizes = dbm.sizes_in_stock(conn, row["product_id"])
-        cards.append((row, format_card(row, sizes, now, delivered)))
+        caption = format_card(row, sizes, now, delivered)
+        # The card shown in the bot has a button to the shop; this one travels as
+        # a bare photo, and without the link in its text a free reader was shown
+        # a find with no way to open it.
+        link = shop_link(row["url"], row["domain"])
+        if link:
+            caption += f'\n🔗 <a href="{escape(link)}">Открыть в магазине</a>'
+        cards.append((row, caption))
 
     if args.dry_run:
-        for row, caption in cards:
+        for _, caption in cards:
             print(caption.replace("<b>", "").replace("</b>", ""))
-            print(f"🔗 {row['url']}\n{'-' * 60}")
+            print("-" * 60)
         print(f"({len(cards)} шт, ничего не отправлено и не записано)")
         return 0
 

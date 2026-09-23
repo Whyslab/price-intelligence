@@ -33,31 +33,16 @@ import sqlite3
 from contextlib import closing
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urljoin, urlparse
+from urllib.parse import parse_qs, urlparse
 
 import httpx
 
 from . import db as dbm
 from . import webauth
+from .domains import shop_link
 
 log = logging.getLogger(__name__)
 
-
-def shop_link(url: str | None, domain: str | None) -> str | None:
-    """The address a card opens, or None when it is not a web page at all.
-
-    Shops write the link themselves, and 2,769 products carry one relative to
-    the shop (`/products/…`): opened from the shelf it resolved against the
-    shelf's own address and gave a 404. Resolved against the shop instead.
-    Anything that is not http(s) afterwards — `javascript:` above all — is
-    refused: the page runs inside Telegram with the reader's signature to hand.
-    """
-    raw = (url or "").strip()
-    if not raw:
-        return None
-    if domain:
-        raw = urljoin(f"https://{domain}/", raw)
-    return raw if urlparse(raw).scheme in ("http", "https") else None
 
 PAGE = Path(__file__).with_name("shelf.html")
 PAGE_SIZE = 60

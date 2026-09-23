@@ -376,7 +376,7 @@ def parse_product(page: str, url: str) -> tuple[ScrapedProduct, str] | None:
         product = ScrapedProduct(
             external_id=_text(node.get("productGroupID")) or sku or url,
             title=title,
-            url=_text(node.get("url")) or url,
+            url=_page_url(_text(node.get("url")), url),
             brand=_text(node.get("brand")),
             image_url=_image_of(node, url),
             category=_text(node.get("category")),
@@ -384,6 +384,20 @@ def parse_product(page: str, url: str) -> tuple[ScrapedProduct, str] | None:
         )
         return product, currency
     return None
+
+
+def _page_url(stated: str | None, page: str) -> str:
+    """The product's own address, resolved against the page it was read from.
+
+    Markup may give it relative — www.toddsnyder.com and www.43einhalb.com write
+    `/nl/p/…` — and 2,993 products were stored that way: a dead link on every
+    surface that did not resolve it again, and a Telegram button that sank the
+    whole message. Anything that is not a web address falls back to the page.
+    """
+    if not stated:
+        return page
+    resolved = urljoin(page, stated)
+    return resolved if urlparse(resolved).scheme in ("http", "https") else page
 
 
 def _looks_like_a_page(url: str) -> bool:
