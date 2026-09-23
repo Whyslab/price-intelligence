@@ -63,6 +63,12 @@ CREATE TABLE IF NOT EXISTS products (
     -- Cleared the moment the product turns up again: catalogues hiccup, and one
     -- absence is not a verdict.
     missing_since TEXT,
+    -- When a catalogue read or a product's own page last listed it. What a card
+    -- means by «проверено»: the shop's last read is not it, because a large shop
+    -- is read a slice at a time and a product outside the slice was not looked
+    -- at. Kept per product so the shelf can leave out what nobody has seen for a
+    -- week (db.STALE_PRODUCT_DAYS) instead of calling it confirmed today.
+    last_seen     TEXT,
     UNIQUE (store_id, external_id)
 );
 CREATE INDEX IF NOT EXISTS ix_products_brand ON products(brand);

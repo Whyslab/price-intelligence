@@ -553,6 +553,9 @@ def store_result(
             ):
                 written += 1
                 changed.append(variant_id)
+    if touched:
+        # Listed just now, which is what a card's «проверено» claims.
+        dbm.mark_products_seen(conn, touched, ts)
     if seen:
         dbm.mark_offers_seen(conn, seen, ts or dbm.utcnow())
     if impossible:

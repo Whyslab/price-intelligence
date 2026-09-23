@@ -979,6 +979,17 @@ class TestStoreResult:
         assert changed == []
         assert len(products) == 1  # still touched, still worth classifying
 
+    def test_every_product_read_is_stamped_as_seen_even_when_nothing_moved(self, conn):
+        """What a card's «проверено» means: listed by the shop, not merely priced."""
+        store_id = dbm.upsert_store(conn, "shop.com")
+        rates = Rates({"USD": 1.0}, fetched_at=datetime.now(UTC), source="test")
+        pipeline.store_result(conn, store_id, self._result(), rates)
+        conn.execute("UPDATE products SET last_seen = '2000-01-01T00:00:00+00:00'")
+
+        pipeline.store_result(conn, store_id, self._result(), rates)
+
+        assert conn.execute("SELECT last_seen FROM products").fetchone()[0] > "2026"
+
 
 class TestAProductInItsOwnCurrency:
     """A shop need not price its whole catalogue in one currency."""

@@ -344,6 +344,26 @@ def _migrate_15_to_16(conn: sqlite3.Connection) -> None:
             "restored %d product(s) a short catalogue page had marked as withdrawn "
             "— run `pi reshelve` to put their offers back on the shelf", restored,
         )
+    # Nothing recorded when a product was last seen before this column, so it
+    # starts from the last time its price was written — a moment it certainly
+    # was seen. Earlier than the truth for anything whose price has not moved;
+    # the next read of its shop brings it up to date.
+    conn.execute(
+        """
+        CREATE TEMP TABLE pi_last_point AS
+        SELECT v.product_id AS id, MAX(pp.ts) AS ts
+          FROM variants v JOIN price_points pp ON pp.variant_id = v.id
+         GROUP BY v.product_id
+        """
+    )
+    conn.execute(
+        """
+        UPDATE products SET last_seen = pi_last_point.ts
+          FROM pi_last_point
+         WHERE pi_last_point.id = products.id AND products.last_seen IS NULL
+        """
+    )
+    conn.execute("DROP TABLE temp.pi_last_point")
     # And the links two shops' markup gave relative (`/nl/p/…`), which the
     # crawler now resolves as it reads. Written out once so every surface — the
     # bot's buttons above all, where one broke the whole message — gets an
@@ -642,6 +662,7 @@ def record_offers(
                 ?
             ),
             COALESCE(
+                (SELECT last_seen FROM products WHERE id = ?),
                 (SELECT s.last_ok FROM stores s
                    JOIN products p ON p.store_id = s.id
                   WHERE p.id = ?),
@@ -667,7 +688,7 @@ def record_offers(
             (
                 deal.variant_id, deal.product_id,
                 dropped_at(deal), deal.variant_id, ts,   # found_at's COALESCE
-                deal.product_id, ts,                     # checked_at's COALESCE
+                deal.product_id, deal.product_id, ts,    # checked_at's COALESCE
                 deal.price_usd,
                 deal.reference_usd, deal.reference_source, deal.discount_pct,
                 deal.saving_usd, deal.score, int(deal.all_time_low),
@@ -1061,6 +1082,14 @@ def mark_offers_seen(
     return total
 
 
+def mark_products_seen(conn: sqlite3.Connection, product_ids: Sequence[int], ts: str) -> None:
+    """Record that a read of the shop just listed these products."""
+    for start in range(0, len(product_ids), 900):
+        chunk = product_ids[start : start + 900]
+        marks = ",".join("?" * len(chunk))
+        conn.execute(f"UPDATE products SET last_seen = ? WHERE id IN ({marks})", [ts, *chunk])
+
+
 def latest_price_usd(conn: sqlite3.Connection, variant_id: int) -> float | None:
     """The newest price recorded for one variant, or None if it has none."""
     row = conn.execute(
@@ -1162,19 +1191,34 @@ def note_attempt(conn: sqlite3.Connection, product_id: int, ts: str) -> None:
 STALE_SHOP_HOURS = 72
 
 
-def fresh_shop_clause(alias: str = "s") -> tuple[str, list[str]]:
-    """SQL and its parameter for "this shop has been read recently enough".
+# How long a product may go unseen before its card leaves the page. A large
+# shop is read a slice at a time, so a product can sit outside the slices it
+# reaches — shop.simon.com holds 77,000 products in the database and lists
+# 25,000 that its catalogue will page through. A week is several full cycles of
+# every shop that is being read at all.
+STALE_PRODUCT_DAYS = 7
+
+
+def fresh_shop_clause(alias: str = "s", product: str | None = None) -> tuple[str, list[str]]:
+    """SQL and its parameters for "this shop — and this product — seen recently".
 
     Hidden, not deleted: the moment the shop reads again its cards are back,
     exactly as they were, and nothing has to be rescored for it.
     """
-    cutoff = (
-        datetime.now(UTC) - timedelta(hours=STALE_SHOP_HOURS)
-    ).isoformat(timespec="seconds")
+    now = datetime.now(UTC)
+    shop_cutoff = (now - timedelta(hours=STALE_SHOP_HOURS)).isoformat(timespec="seconds")
     # A shop never read at all has no cards to hide, so NULL is let through
     # rather than treated as ancient: it keeps a shelf built by hand — a test,
     # an import — from coming up blank for no reason anyone could see.
-    return f"({alias}.last_ok IS NULL OR {alias}.last_ok >= ?)", [cutoff]
+    sql = f"({alias}.last_ok IS NULL OR {alias}.last_ok >= ?)"
+    params = [shop_cutoff]
+    if product:
+        product_cutoff = (now - timedelta(days=STALE_PRODUCT_DAYS)).isoformat(
+            timespec="seconds"
+        )
+        sql += f" AND ({product}.last_seen IS NULL OR {product}.last_seen >= ?)"
+        params.append(product_cutoff)
+    return sql, params
 
 
 def drop_orphans(conn: sqlite3.Connection) -> dict[str, int]:
@@ -1638,7 +1682,7 @@ def offers_for(
     where = ["1 = 1"]
     params: list = []
     # A shop nobody could read for days is not vouching for its prices today.
-    fresh, fresh_params = fresh_shop_clause("s")
+    fresh, fresh_params = fresh_shop_clause("s", "p")
     where.append(fresh)
     params += fresh_params
     if not kids:
@@ -1815,7 +1859,7 @@ def shelf_freshness(conn: sqlite3.Connection, hours: int = 48) -> tuple[int, int
     the daily summary nobody could see whether it held.
     """
     cutoff = (datetime.now(UTC) - timedelta(hours=hours)).isoformat(timespec="seconds")
-    fresh, fresh_params = fresh_shop_clause("s")
+    fresh, fresh_params = fresh_shop_clause("s", "p")
     row = conn.execute(
         f"""
         SELECT COALESCE(SUM(o.checked_at >= ?), 0), COUNT(*)
@@ -1861,7 +1905,7 @@ def shelf_facets(conn: sqlite3.Connection, kids: bool = False,
         hide += " AND (o.all_time_low = 1 OR o.reference_source IN ('history', 'market'))"
     # The same rule offers_for draws by, or a count would promise cards from a
     # shop whose cards the page then leaves out.
-    fresh, fresh_params = fresh_shop_clause("s")
+    fresh, fresh_params = fresh_shop_clause("s", "p")
     rows = conn.execute(
         f"""
         SELECT o.product_id, o.price_usd, p.kind, p.gender, p.brand_family, v.size_norm

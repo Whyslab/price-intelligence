@@ -840,3 +840,63 @@ class TestHowFreshTheShelfIs:
         _a_card(conn, store, "tagged", checked=ts(0), source="tag")  # not on the default shelf
 
         assert dbm.shelf_freshness(conn) == (1, 2)
+
+
+class TestWhenAProductWasLastSeen:
+    """A large shop is read a slice at a time, so its last read says nothing
+    about a product outside the slice. shop.simon.com holds 77,000 products in
+    the database and pages through 25,000; a rebuilt shelf put back cards for
+    products it no longer lists, each saying «проверено сегодня»."""
+
+    def _card(self, conn, seen_days_ago):
+        store = dbm.upsert_store(conn, "shop.example", platform="shopify", status="ok",
+                                 last_ok=ts(0))
+        card = _a_card(conn, store, "card", checked=ts(0))
+        conn.execute("UPDATE products SET last_seen = ? WHERE id = ?", (ts(seen_days_ago), card))
+        return card
+
+    def test_a_product_nobody_has_seen_for_a_week_is_off_the_page(self, conn):
+        self._card(conn, seen_days_ago=8)
+        assert dbm.offers_for(conn) == ([], 0)
+        assert dbm.shelf_facets(conn)["total"] == 0
+        assert dbm.shelf_freshness(conn) == (0, 0)
+
+    def test_one_seen_this_week_is_on_it(self, conn):
+        card = self._card(conn, seen_days_ago=6)
+        rows, total = dbm.offers_for(conn)
+        assert [row["product_id"] for row in rows] == [card] and total == 1
+
+    def test_a_card_written_now_says_when_its_product_was_seen(self, conn):
+        store = dbm.upsert_store(conn, "shop.example", platform="shopify", last_ok=ts(0))
+        product = dbm.upsert_product(conn, store, "p", "Shoe", "https://shop.example/p")
+        variant = dbm.upsert_variant(conn, product, "v")
+        seen = ts(5)
+        conn.execute("UPDATE products SET last_seen = ? WHERE id = ?", (seen, product))
+        deal = dealm.Deal(
+            variant_id=variant, product_id=product, price_usd=50.0, reference_usd=100.0,
+            reference_source="history", discount_pct=50.0, saving_usd=50.0, score=80,
+            all_time_low=False, fake_sale=False, dropped_hours_ago=None, history_points=2,
+        )
+
+        dbm.record_offers(conn, [variant], [deal], ts(0))
+
+        assert conn.execute("SELECT checked_at FROM offers").fetchone()[0] == seen, (
+            "not the shop's last read, which never looked at this product"
+        )
+
+    def test_the_migration_starts_it_from_the_last_recorded_price(self, tmp_path):
+        path = tmp_path / "old.db"
+        conn = dbm.connect(path)
+        store = dbm.upsert_store(conn, "shop.example", platform="shopify")
+        product = dbm.upsert_product(conn, store, "p", "Shoe", "https://shop.example/p")
+        variant = dbm.upsert_variant(conn, product, "v")
+        dbm.record_price(conn, variant, 50.0, None, True, "USD", 50.0, 1.0, ts=ts(9))
+        latest = ts(3)
+        dbm.record_price(conn, variant, 45.0, None, True, "USD", 45.0, 1.0, ts=latest)
+        conn.execute("UPDATE products SET last_seen = NULL")
+        conn.execute("PRAGMA user_version = 15")
+        conn.close()
+
+        migrated = dbm.connect(path)
+
+        assert migrated.execute("SELECT last_seen FROM products").fetchone()[0] == latest
