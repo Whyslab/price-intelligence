@@ -34,7 +34,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 from .config import Filters
-from .reference import MAX_DROP, Market, Trust, prior_floor
+from .reference import MAX_DROP, MAX_SPREAD, Market, Trust, prior_floor
 
 # How much of the reference window has to be covered by observations before the
 # floor it produces is worth believing. A "30-day low" drawn from two days of
@@ -202,6 +202,15 @@ def evaluate(
     market_native = to_native(market.median_usd) if market.priced(filters.market_min_shops) else None
     msrp_native = to_native(market.msrp_usd) if market.has_msrp(filters.msrp_min_shops) else None
     low_native = to_native(market.low_usd) if market.priced(filters.market_min_shops) else None
+
+    # The rule agreeing_prices keeps between other shops, kept against this one
+    # too: prices more than MAX_SPREAD apart describe different things. Before
+    # it, the top of the shelf was allikestore.com's "Sean Wotherspoon" at
+    # $55.98 — 95% below the $1,100 resale shops ask — and a run of the same:
+    # a placeholder price, a child's size, a different item under one SKU. A
+    # real clearance does not undercut every other seller four times over.
+    if market_native is not None and market_native > price_native * MAX_SPREAD:
+        market_native = low_native = None
 
     # Veto: whatever it is marked down from, a price above what other shops are
     # asking for the same article is not a discount.

@@ -251,6 +251,22 @@ class TestAnInflatedReferencePrice:
         assert deal.reference_usd == pytest.approx(200.0)
         assert deal.beats_market, "cheaper than every shop we can see"
 
+    def test_a_price_four_times_below_every_other_shop_is_not_the_same_thing(self, filters):
+        """allikestore.com's "Sean Wotherspoon" at $55.98 against the $1,100
+        resale shops ask topped the shelf at −95%. Prices that far apart are the
+        rule agreeing_prices keeps between other shops: different things."""
+        history = make_history([(55.98, None, 0)])
+        market = Market(median_usd=1099.88, low_usd=700.0, shops=5)
+        deal = deals.evaluate(1, 1, 55.98, None, True, history, filters, market=market)
+        assert deal is None
+
+    def test_a_deep_but_believable_cut_against_the_market_still_counts(self, filters):
+        history = make_history([(80.0, None, 0)])
+        market = Market(median_usd=300.0, low_usd=260.0, shops=5)
+        deal = deals.evaluate(1, 1, 80.0, None, True, history, filters, market=market)
+        assert deal is not None and deal.reference_source == "market"
+        assert deal.discount_pct == pytest.approx(73.3, abs=0.1)
+
     def test_a_tag_far_above_the_recommended_price_is_not_used(self, filters):
         """Six shops strike through 200; this one strikes through 300. The 300 is
         this shop's invention, so it is not a reference for anything."""
