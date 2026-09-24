@@ -219,9 +219,10 @@ def subscription_pitch(conn: sqlite3.Connection) -> str:
     thing a reader can check in the next thirty seconds, and a stale one is
     worse than no number at all.
     """
-    shelf = conn.execute("SELECT COUNT(*) FROM offers").fetchone()[0]
+    # Products, not rows: the shelf keeps a row per discounted size.
+    shelf = conn.execute("SELECT COUNT(DISTINCT product_id) FROM offers").fetchone()[0]
     compared = conn.execute(
-        "SELECT COUNT(*) FROM offers WHERE reference_source = 'market'"
+        "SELECT COUNT(DISTINCT product_id) FROM offers WHERE reference_source = 'market'"
     ).fetchone()[0]
     shops = conn.execute(
         "SELECT COUNT(*) FROM stores WHERE platform IN ('shopify', 'jsonld', 'asos')"

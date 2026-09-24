@@ -815,8 +815,11 @@ def _cmd_reshelve(args, config: Config) -> int:
     conn = dbm.connect(config.db_path)
     domains = tuple(d.strip() for d in args.stores.split(",")) if args.stores else ()
     written, withdrawn = pipeline.reshelve(conn, config, domains)
-    total = conn.execute("SELECT COUNT(*) FROM offers").fetchone()[0]
-    print(f"на полке: {written:,} записано, {withdrawn:,} снято; всего предложений {total:,}")
+    rows, products = conn.execute(
+        "SELECT COUNT(*), COUNT(DISTINCT product_id) FROM offers"
+    ).fetchone()
+    print(f"на полке: {written:,} записано, {withdrawn:,} снято; "
+          f"всего {products:,} товаров ({rows:,} размеров со скидкой)")
     return 0
 
 

@@ -312,15 +312,24 @@ VERIFIABLE = ("shopify", "jsonld")
 async def _fetch_one(client, row, limiter):
     """Ask one shop about one product, the way its platform allows.
 
-    Split out because two callers need it: `verify_offers`, which walks the
-    oldest cards, and the check that runs on a find before it is announced.
+    Split out because three callers need it: `verify_offers`, which walks the
+    oldest cards, the check that runs on a find before it is announced, and the
+    sample `withdraw_missing` opens before believing a full read.
+
+    Anything unexpected is "unreachable": these run inside the collection loop,
+    where one shop's odd answer used to end the whole run — and, since that
+    shop was then due again, the next one too.
     """
-    if row["platform"] == "shopify":
-        handle = (row["url"] or "").rstrip("/").rsplit("/", 1)[-1]
-        if not handle:
-            return "skipped", None
-        return await shopify.fetch_product(client, row["domain"], handle, limiter)
-    return await jsonld.fetch_product(client, row["url"])
+    try:
+        if row["platform"] == "shopify":
+            handle = (row["url"] or "").rstrip("/").rsplit("/", 1)[-1]
+            if not handle:
+                return "skipped", None
+            return await shopify.fetch_product(client, row["domain"], handle, limiter)
+        return await jsonld.fetch_product(client, row["url"])
+    except Exception:
+        log.exception("%s: asking about one product failed unexpectedly", row["domain"])
+        return "unreachable", None
 
 
 async def verify_offers(
@@ -384,12 +393,13 @@ async def verify_offers(
 
 # When a full read is not taken at its word. A shop does lose a few products
 # between two reads — measured on ordinary days, a handful to a few dozen —
-# but a read claiming that a fifth of it went at once is far likelier to be a
-# read that stopped early, and believing one wrongly deletes a shop's history
-# two weeks later. That is not hypothetical: a short page on 22.09.2026 marked
-# 76,062 of shop.simon.com's 77,329 products as withdrawn, and every one
-# sampled was still for sale.
-WITHDRAWAL_ALARM_SHARE = 0.2
+# but a read claiming more than that is as likely to be a read that stopped
+# early, and believing one wrongly deletes a shop's history two weeks later.
+# That is not hypothetical: a short page on 22.09.2026 marked 76,062 of
+# shop.simon.com's 77,329 products as withdrawn, and every one sampled was
+# still for sale. Asked in absolute numbers rather than as a share of the shop:
+# a fifth of a 15,000-product shop is 3,000 products, and letting that many
+# through unchecked is exactly the damage the check exists to stop.
 WITHDRAWAL_ALARM_FLOOR = 25
 # How many of the supposedly withdrawn products are opened to check. All of
 # them must answer "gone": one still for sale means the read was wrong.
@@ -414,17 +424,21 @@ async def withdraw_missing(
     """Mark what a full read of this shop did not list. Returns (marked, held).
 
     `held` is None normally. When the read would withdraw more than
-    WITHDRAWAL_ALARM_SHARE of the shop, a few of those products are opened
-    first, the way the memory of this project says to check any such claim:
-    open some of what was marked and see. If any of them is still for sale,
-    nothing is marked, the shop row says why, and the daily summary shows it.
-    A genuine clearance still goes through — its sampled products answer 404.
+    WITHDRAWAL_ALARM_FLOOR products, a few of them are opened first, the way
+    any such claim should be checked: open some of what was marked and see. If
+    any of them is still for sale, nothing is marked, the shop row says why,
+    and the daily summary shows it. A genuine clearance still goes through —
+    its sampled products answer 404.
     """
     candidates = dbm.withdrawal_candidates(conn, store["id"], seen)
     if not candidates:
+        if _col(store, "withdrawal_held"):
+            # A read that misses nothing is the clearest all-clear there is.
+            with dbm.transaction(conn):
+                dbm.upsert_store(conn, store["domain"], withdrawal_held=None)
         return 0, None
     live = dbm.live_products(conn, store["id"])
-    if len(candidates) > max(WITHDRAWAL_ALARM_FLOOR, WITHDRAWAL_ALARM_SHARE * live):
+    if len(candidates) > WITHDRAWAL_ALARM_FLOOR:
         answers = []
         for row in _spread(candidates, WITHDRAWAL_SAMPLE):
             status, _ = await _fetch_one(
@@ -1287,6 +1301,14 @@ async def run(
                 if not result.ok:
                     stats.stores_failed += 1
                     stats.failures.append((store["domain"], result.error or "unknown"))
+                    if (result.error or "").startswith("skipped:"):
+                        # Not asked at all — the platform had shut this IP out.
+                        # Recorded as the shop's failure it would be backed off
+                        # like a broken shop and its cards left out of the
+                        # checking queue, for something the shop never did.
+                        dbm.upsert_store(conn, store["domain"], last_error=result.error)
+                        log.info("%-38s skipped: %s", store["domain"], result.error)
+                        continue
                     dbm.upsert_store(
                         conn, store["domain"], status="error",
                         last_error=result.error, last_checked=dbm.utcnow(),
@@ -1348,12 +1370,6 @@ async def run(
                 task.cancel()
             if pending:
                 await asyncio.gather(*pending, return_exceptions=True)
-
-        if rates.dropped:
-            log.warning(
-                "prices dropped for want of an exchange rate: %s",
-                ", ".join(f"{code} ×{n}" for code, n in rates.dropped.most_common()),
-            )
 
         # Before scoring, so a deal is judged with the product already known to
         # be a women's shoe rather than an unclassified row.
@@ -1530,6 +1546,12 @@ async def run(
             )
         stats.notices_sent += await _send_notices(conn, config, client, notices)
 
+    if rates.dropped:
+        # Once, at the end, so it covers the cards opened one by one as well.
+        log.warning(
+            "prices dropped for want of an exchange rate: %s",
+            ", ".join(f"{code} ×{n}" for code, n in rates.dropped.most_common()),
+        )
     _record_block(conn, run_id, limiter)
     _finish_run(conn, run_id, stats)
     # Last, because the notice is about the run just recorded — including

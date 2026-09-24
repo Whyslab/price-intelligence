@@ -6,6 +6,7 @@ import logging
 import re
 import sqlite3
 import time
+from collections import Counter
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
@@ -345,15 +346,25 @@ def _migrate_15_to_16(conn: sqlite3.Connection) -> None:
             "— run `pi reshelve` to put their offers back on the shelf", restored,
         )
     # Nothing recorded when a product was last seen before this column, so it
-    # starts from the last time its price was written — a moment it certainly
-    # was seen. Earlier than the truth for anything whose price has not moved;
-    # the next read of its shop brings it up to date.
+    # starts from the best evidence there is: the last time its price was
+    # written, or — for what is on the shelf — the last read that listed it,
+    # which mark_offers_seen has been writing onto the offer since 12.09. Both
+    # are moments it certainly was seen; the next read of its shop brings it up
+    # to date.
     conn.execute(
         """
         CREATE TEMP TABLE pi_last_point AS
         SELECT v.product_id AS id, MAX(pp.ts) AS ts
           FROM variants v JOIN price_points pp ON pp.variant_id = v.id
          GROUP BY v.product_id
+        """
+    )
+    conn.execute(
+        """
+        UPDATE pi_last_point SET ts = shelf.seen
+          FROM (SELECT product_id, MAX(checked_at) AS seen FROM offers GROUP BY product_id)
+               AS shelf
+         WHERE shelf.product_id = pi_last_point.id AND shelf.seen > pi_last_point.ts
         """
     )
     conn.execute(
@@ -1918,24 +1929,40 @@ def shelf_facets(conn: sqlite3.Connection, kids: bool = False,
         fresh_params,
     ).fetchall()
 
-    kinds: dict[str, set[int]] = {}
-    genders: dict[str, set[int]] = {}
-    brands: dict[str, set[int]] = {}
-    sizes: dict[str, set[int]] = {}
+    # Everything is counted in cards, by the rule offers_for folds by: a
+    # product whose offers all cost the same is one card, one whose offers
+    # differ is a card each. A chip promising products while the click draws
+    # cards said "Nike 1,813" and then showed 1,990.
+    def cards(prices: list[float]) -> int:
+        return 1 if min(prices) == max(prices) else len(prices)
+
     prices: dict[int, list[float]] = {}
+    about: dict[int, tuple] = {}
+    by_size: dict[tuple[str, int], list[float]] = {}
     for product_id, price, kind, gender, brand, size in rows:
         prices.setdefault(product_id, []).append(price)
-        for bucket, value in ((kinds, kind), (genders, gender), (brands, brand), (sizes, size)):
+        about[product_id] = (kind, gender, brand)
+        if size:
+            # Choosing a size narrows to that size first and folds afterwards.
+            by_size.setdefault((size, product_id), []).append(price)
+
+    kinds: Counter[str] = Counter()
+    genders: Counter[str] = Counter()
+    brands: Counter[str] = Counter()
+    for product_id, listed in prices.items():
+        kind, gender, brand = about[product_id]
+        for bucket, value in ((kinds, kind), (genders, gender), (brands, brand)):
             if value:
-                bucket.setdefault(value, set()).add(product_id)
+                bucket[value] += cards(listed)
+    sizes: Counter[str] = Counter()
+    for (size, _), listed in by_size.items():
+        sizes[size] += cards(listed)
 
-    def tally(bucket: dict[str, set[int]], limit: int | None = None) -> list[dict]:
-        ranked = sorted(bucket.items(), key=lambda item: (-len(item[1]), item[0]))
-        return [{"value": value, "count": len(ids)} for value, ids in ranked[:limit]]
+    def tally(bucket: Counter[str], limit: int | None = None) -> list[dict]:
+        ranked = sorted(bucket.items(), key=lambda item: (-item[1], item[0]))
+        return [{"value": value, "count": count} for value, count in ranked[:limit]]
 
-    # Cards, by the rule offers_for folds by: a product whose sizes all cost the
-    # same is one card, one whose sizes differ is a card per size.
-    total = sum(1 if min(p) == max(p) else len(p) for p in prices.values())
+    total = sum(cards(listed) for listed in prices.values())
     every_price = [price for listed in prices.values() for price in listed]
     return {
         "kinds": tally(kinds),

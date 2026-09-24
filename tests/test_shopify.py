@@ -103,6 +103,7 @@ async def test_a_short_page_is_not_the_end_of_the_catalogue(shopify_payload):
         return_value=httpx.Response(200, json=numbered_products(shopify_payload, 2))
     )
     end_of_catalogue(base, page=3)
+    end_of_catalogue(base, page=4)  # empty after a full page is asked about once more
 
     async with httpx.AsyncClient() as client:
         result = await shopify.fetch(client, "shop.example", currency="USD")
@@ -110,6 +111,44 @@ async def test_a_short_page_is_not_the_end_of_the_catalogue(shopify_payload):
     assert page2.called, "the short first page did not end the walk"
     assert len(result.products) == 245 + 250
     assert result.enumerated, "reaching the empty page from page one is the whole shop"
+
+
+@respx.mock
+async def test_an_empty_page_after_a_full_one_is_asked_about_again(shopify_payload):
+    """250 products in a row this visitor may not buy make an empty page in the
+    middle of a catalogue. Taken as the end, every pass would stop at the same
+    gap and the tail — here 30 products — would be marked withdrawn."""
+    base = "https://shop.example"
+    respx.get(f"{base}/products.json?limit=250").mock(
+        return_value=httpx.Response(200, json=numbered_products(shopify_payload, 1))
+    )
+    end_of_catalogue(base, page=2)
+    respx.get(f"{base}/products.json?limit=250&page=3").mock(
+        return_value=httpx.Response(200, json=numbered_products(shopify_payload, 3, count=30))
+    )
+    end_of_catalogue(base, page=4)
+
+    async with httpx.AsyncClient() as client:
+        result = await shopify.fetch(client, "shop.example", currency="USD")
+
+    assert len(result.products) == 250 + 30, "the tail past the gap was read"
+    assert result.enumerated
+
+
+@respx.mock
+async def test_an_empty_page_after_a_short_one_is_the_end(shopify_payload):
+    base = "https://shop.example"
+    respx.get(f"{base}/products.json?limit=250").mock(
+        return_value=httpx.Response(200, json=numbered_products(shopify_payload, 1, count=40))
+    )
+    end_of_catalogue(base, page=2)
+    page3 = respx.get(f"{base}/products.json?limit=250&page=3")
+
+    async with httpx.AsyncClient() as client:
+        result = await shopify.fetch(client, "shop.example", currency="USD")
+
+    assert not page3.called, "one empty page is enough after a short one"
+    assert result.enumerated
 
 
 @respx.mock
@@ -130,6 +169,7 @@ async def test_a_page_that_repeats_what_was_read_ends_the_walk(shopify_payload):
 
     assert page2.called and not page3.called
     assert len(result.products) == 40
+    assert not result.enumerated, "a repeat says nothing about where the catalogue ends"
 
 
 @respx.mock
@@ -191,6 +231,8 @@ async def test_a_link_header_is_still_honoured_if_present(shopify_payload):
     assert page1.called and page2.called
     assert result.ok
     assert len(result.products) == len(shopify_payload["products"])
+    # Nothing asked by number after the links ran out.
+    assert not any("page=" in str(call.request.url) for call in respx.calls)
 
 
 @respx.mock
@@ -839,3 +881,14 @@ class TestTheWallAtPageOneHundred:
             await shopify.fetch(client, "shop.example", "USD", cursor=7)
 
         assert asked.called
+
+
+@respx.mock
+async def test_a_product_page_answering_something_that_is_not_an_object_is_unreachable():
+    """`[]` with a 200 used to raise out of the spot-check and end the run."""
+    respx.get("https://shop.example/products/thing.json").mock(
+        return_value=httpx.Response(200, json=[])
+    )
+    async with httpx.AsyncClient() as client:
+        status, product = await shopify.fetch_product(client, "shop.example", "thing")
+    assert (status, product) == ("unreachable", None)

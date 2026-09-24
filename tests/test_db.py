@@ -337,9 +337,21 @@ class TestGivingBackWhatAShortPageWithdrew:
             "https://img.ssensemedia.com/images/b_white,g_center,f_auto,q_auto:best/1_1/skirt.jpg"
         )
 
-    def test_a_fresh_database_is_not_touched(self, tmp_path):
-        conn = dbm.connect(tmp_path / "new.db")
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == dbm.SCHEMA_VERSION
+    def test_a_database_already_at_16_is_not_touched_again(self, tmp_path):
+        """Batch marks made after the upgrade are the fixed walk's verdict."""
+        path = tmp_path / "new.db"
+        conn = dbm.connect(path)
+        shopify = dbm.upsert_store(conn, "shop.example", platform="shopify")
+        batch = [self._product(conn, shopify, f"b{n}", "2026-09-30T10:00:00+00:00")
+                 for n in range(3)]
+        conn.close()
+
+        again = dbm.connect(path)
+
+        assert all(
+            again.execute("SELECT missing_since FROM products WHERE id = ?", (p,)).fetchone()[0]
+            for p in batch
+        )
 
 
 def _a_card(conn, store_id, name, checked, tried=None, score=50, source="market"):

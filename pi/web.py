@@ -439,9 +439,10 @@ def locked_page(conn: sqlite3.Connection) -> bytes:
     counted here and now for the same reason: the size of the catalogue is the
     one claim a reader can check in the next thirty seconds.
     """
-    shelf = conn.execute("SELECT COUNT(*) FROM offers").fetchone()[0]
+    # Products, not rows: the shelf keeps a row per discounted size.
+    shelf = conn.execute("SELECT COUNT(DISTINCT product_id) FROM offers").fetchone()[0]
     compared = conn.execute(
-        "SELECT COUNT(*) FROM offers WHERE reference_source = 'market'"
+        "SELECT COUNT(DISTINCT product_id) FROM offers WHERE reference_source = 'market'"
     ).fetchone()[0]
     body = f"""<!doctype html>
 <html lang="ru"><head>

@@ -9,6 +9,7 @@ refuses to fetch the one it has, the same text is sent as a normal message.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import logging
 from html import escape
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -26,6 +27,19 @@ CAPTION_LIMIT = 1024
 PHOTO_WIDTH = 1000
 # Telegram takes an uploaded photo up to 10 MB; past that it is not worth a try.
 UPLOAD_LIMIT = 10 * 1024 * 1024
+
+
+async def _is_public(url: str) -> bool:
+    """Whether every address the URL's host resolves to is a public one."""
+    host = urlsplit(url).hostname
+    if not host:
+        return False
+    try:
+        infos = await asyncio.get_running_loop().getaddrinfo(host, None)
+    except OSError:
+        return False
+    addresses = {info[4][0] for info in infos}
+    return bool(addresses) and all(ipaddress.ip_address(a).is_global for a in addresses)
 
 
 def telegram_photo(url: str | None) -> str | None:
@@ -320,7 +334,11 @@ class Telegram:
                 return True
             if self.chat_is_gone:
                 return False
-            picture = await self._download(photo)
+            # Uploaded ourselves only when Telegram said it could not fetch the
+            # picture. After any other refusal — a bad caption, the network —
+            # fetching it here would change nothing but the time it takes.
+            could_not_fetch = any(phrase in why.lower() for phrase in self.UNFETCHABLE)
+            picture = await self._download(photo) if could_not_fetch else None
             if picture is not None:
                 ok, upload_why = await self._call(
                     "sendPhoto", fields, files={"photo": ("photo.jpg", picture)}
@@ -332,17 +350,41 @@ class Telegram:
             log.warning("sendPhoto failed (%s), falling back to text", why)
         return await self.send_text(caption, disable_preview=False)
 
+    # What Telegram says when it could not get the picture from the address.
+    UNFETCHABLE = (
+        "failed to get http url content",
+        "wrong file identifier/http url specified",
+        "wrong type of the web page content",
+        "webpage_curl_failed",
+        "webpage_media_empty",
+    )
+
     async def _download(self, url: str) -> bytes | None:
-        """The picture's bytes, or None if it is not a picture we can upload."""
+        """The picture's bytes, or None if it is not a picture we can upload.
+
+        The address was written by a shop, so it is fetched as something a
+        stranger chose: only from a public address, with no redirects to follow
+        somewhere else, and never more than Telegram would take — anything the
+        collector can reach on this machine or this network would otherwise go
+        to a reader's chat as a "picture".
+        """
         assert self._client is not None
+        if not await _is_public(url):
+            log.info("not fetching a picture from a private address: %s", url)
+            return None
         try:
-            resp = await self._client.get(url, follow_redirects=True, timeout=20)
+            async with self._client.stream(
+                "GET", url, follow_redirects=False, timeout=20
+            ) as resp:
+                kind = resp.headers.get("content-type", "")
+                if resp.status_code != 200 or not kind.startswith("image/"):
+                    return None
+                body = bytearray()
+                async for chunk in resp.aiter_bytes():
+                    body += chunk
+                    if len(body) > UPLOAD_LIMIT:
+                        return None
+                return bytes(body)
         except httpx.HTTPError as exc:
             log.info("could not fetch the picture myself either: %s", type(exc).__name__)
             return None
-        kind = resp.headers.get("content-type", "")
-        if resp.status_code != 200 or not kind.startswith("image/"):
-            return None
-        if len(resp.content) > UPLOAD_LIMIT:
-            return None
-        return resp.content

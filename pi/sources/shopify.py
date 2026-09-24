@@ -365,6 +365,9 @@ async def fetch_product(
         payload = resp.json()
     except ValueError:
         return "unreachable", None
+    if not isinstance(payload, dict):
+        # `[]` or `null` with a 200: not an answer about this product either way.
+        return "unreachable", None
     raw = payload.get("product")
     if not isinstance(raw, dict):
         return "unreachable", None
@@ -426,6 +429,7 @@ async def fetch(
     # Ids as the pages listed them, before parsing drops the unpriced: a page
     # of products that all fail to parse is still a page of the catalogue.
     listed_ids: set[str] = set()
+    followed_link = previous_full = probed = False
     page_number = max(1, cursor)
     # Shopify refuses `page * limit` beyond 25,000 — the 101st page of 250
     # answers HTTP 400 "Page * Limit exceeds the 25000 limit" — and a cursor
@@ -483,9 +487,16 @@ async def fetch(
         # so it is consulted before the short-page rule.
         link = _LINK_NEXT.search(resp.headers.get("Link", ""))
         if link:
+            followed_link = True
             page_number += 1
             url = link.group(1)
             continue
+        if followed_link:
+            # A walk the shop led by Link headers ends where the links end; its
+            # page numbers mean nothing to ?page=, and asking one anyway could
+            # leave a cursor pointing at a page that will never answer.
+            exhausted = True
+            break
         # Only an empty page ends the catalogue. A short one does not: Shopify
         # cuts the page first and removes what this visitor may not buy
         # afterwards, so a page comes back short in the middle of the list.
@@ -496,14 +507,27 @@ async def fetch(
         # italist's, 4,182 of Sneakersnstuff's — were marked as withdrawn while
         # every one of them was still for sale. The price of knowing is one
         # empty page per finished pass.
-        #
-        # A page listing nothing new ends the walk too: a storefront that
-        # ignored ?page= would otherwise serve its first page sixty times.
         fresh = {_listed_id(item) for item in raw} - listed_ids
         listed_ids |= fresh
-        if not raw or not fresh:
+        if raw and not fresh:
+            # A page of nothing new: a storefront ignoring ?page=, or the list
+            # shifting under the walk. Neither says the catalogue ended, so the
+            # pass stops without claiming it read everything.
+            break
+        if not raw:
+            if previous_full and not probed:
+                # Empty after a full page is either the end of a catalogue that
+                # happens to be a multiple of 250 long, or a page whose every
+                # product this visitor may not buy. One more page tells which.
+                probed = True
+                page_number += 1
+                if page_number > LAST_PAGE:
+                    break
+                url = f"{base}/products.json?limit={PAGE_SIZE}&page={page_number}"
+                continue
             exhausted = True
             break
+        previous_full, probed = len(raw) >= PAGE_SIZE, False
         page_number += 1
         if page_number > LAST_PAGE:
             # Past the window Shopify answers at all. Asking anyway costs a

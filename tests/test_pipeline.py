@@ -1760,6 +1760,99 @@ class TestAReadThatLosesMostOfAShop:
         assert held is None
 
 
+class TestReviewFindings:
+    """What the adversarial review of the audit found, pinned down."""
+
+    @respx.mock
+    async def test_a_read_that_misses_nothing_clears_a_held_note(self, config, shopify_payload):
+        _mock_rates()
+        _mock_telegram()
+        whole = numbered_products(shopify_payload, 1, count=60)
+        _mock_product_pages(whole)
+        conn = dbm.connect(config.db_path)
+        known_store(conn, withdrawal_held="2026-09-22T18:20:50+00:00 · 50 из 60")
+        respx.get("https://shop.example/products.json?limit=250").mock(
+            return_value=httpx.Response(200, json=whole)
+        )
+        end_of_catalogue()
+
+        await pipeline.run(config, conn)
+
+        assert conn.execute(
+            "SELECT withdrawal_held FROM stores WHERE domain = 'shop.example'"
+        ).fetchone()[0] is None
+
+    @respx.mock
+    async def test_a_shop_skipped_for_an_ip_block_is_not_treated_as_broken(
+        self, config, monkeypatch
+    ):
+        _mock_rates()
+        _mock_telegram()
+        conn = dbm.connect(config.db_path)
+        known_store(conn, last_ok=ts(1), status="ok")
+
+        async def blocked(client, domain, *args, **kwargs):
+            return FetchResult(domain=domain, error="skipped: Shopify blocked this IP")
+
+        monkeypatch.setattr(pipeline.shopify, "fetch", blocked)
+        await pipeline.run(config, conn)
+
+        status, checked = conn.execute(
+            "SELECT status, last_checked FROM stores WHERE domain = 'shop.example'"
+        ).fetchone()
+        assert status == "ok", "the shop did nothing wrong"
+        assert checked is None, "and it waits no longer for it"
+
+    async def test_an_odd_answer_about_one_product_is_not_a_crash(self, monkeypatch):
+        async def odd(*args, **kwargs):
+            raise AttributeError("'list' object has no attribute 'get'")
+
+        monkeypatch.setattr(pipeline.shopify, "fetch_product", odd)
+        status, product = await pipeline._fetch_one(
+            None, {"platform": "shopify", "domain": "shop.example",
+                   "url": "https://shop.example/products/x"}, None,
+        )
+        assert (status, product) == ("unreachable", None)
+
+    @respx.mock
+    async def test_reshelve_puts_back_what_qualifies_and_takes_off_what_does_not(
+        self, config, shopify_payload
+    ):
+        _mock_rates()
+        _mock_telegram()
+        _mock_product_pages(shopify_payload)
+        respx.get("https://shop.example/products.json?limit=250").mock(
+            return_value=httpx.Response(200, json=shopify_payload)
+        )
+        end_of_catalogue()
+        conn = dbm.connect(config.db_path)
+        known_store(conn)
+        await pipeline.run(config, conn)
+        before = conn.execute("SELECT variant_id FROM offers ORDER BY 1").fetchall()
+        assert before, "the fixture puts something on the shelf"
+
+        conn.execute("DELETE FROM offers")
+        # A card for a variant now out of stock, which reshelve must take off.
+        sold_out = conn.execute(
+            "SELECT id FROM variants WHERE id NOT IN (SELECT variant_id FROM offers) LIMIT 1"
+        ).fetchone()[0]
+        dbm.record_price(conn, sold_out, 10.0, 99.0, False, "GBP", 7.3, 0.73)
+        conn.execute(
+            "INSERT INTO offers (variant_id, product_id, found_at, checked_at, price_usd,"
+            " reference_usd, reference_source, discount_pct, saving_usd, score, all_time_low)"
+            " SELECT id, product_id, ?, ?, 10, 99, 'tag', 90, 89, 99, 0 FROM variants"
+            " WHERE id = ?",
+            (ts(0), ts(0), sold_out),
+        )
+
+        written, withdrawn = pipeline.reshelve(conn, config)
+
+        after = conn.execute("SELECT variant_id FROM offers ORDER BY 1").fetchall()
+        assert {row[0] for row in before} <= {row[0] for row in after}
+        assert sold_out not in {row[0] for row in after}
+        assert written >= len(before) and withdrawn >= 1
+
+
 class TestOpeningACardToSeeIfItIsStillThere:
     """What the free signal cannot cover, `pi verify` asks about directly.
 

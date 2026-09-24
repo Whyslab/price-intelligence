@@ -154,8 +154,12 @@ class TestDelivery:
         assert text.called
 
     @respx.mock
-    async def test_a_picture_telegram_would_not_fetch_is_uploaded_instead(self):
+    async def test_a_picture_telegram_would_not_fetch_is_uploaded_instead(self, monkeypatch):
         """Some hosts turn Telegram's fetcher away and not ours."""
+        async def public(url):
+            return True
+
+        monkeypatch.setattr(notify, "_is_public", public)
         photo = respx.post(f"https://api.telegram.org/bot{TOKEN}/sendPhoto").mock(
             side_effect=[
                 httpx.Response(
@@ -177,7 +181,48 @@ class TestDelivery:
         assert not text.called
 
     @respx.mock
-    async def test_a_page_that_is_not_a_picture_is_not_uploaded(self):
+    async def test_a_picture_on_a_private_address_is_never_fetched(self):
+        """The address is a shop's to write. One pointing into this machine or
+        this network would otherwise go to a reader's chat as a "picture"."""
+        respx.post(f"https://api.telegram.org/bot{TOKEN}/sendPhoto").mock(
+            return_value=httpx.Response(
+                400, json={"ok": False, "description": "failed to get HTTP URL content"}
+            )
+        )
+        text = respx.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage").mock(
+            return_value=httpx.Response(200, json={"ok": True})
+        )
+        inside = respx.get("http://127.0.0.1:8000/api/offers")
+        async with notify.Telegram(TOKEN, CHAT) as tg:
+            assert await tg.send_deal("caption", "http://127.0.0.1:8000/api/offers") is True
+        assert not inside.called
+        assert text.called
+
+    @respx.mock
+    async def test_a_refusal_that_is_not_about_the_picture_uploads_nothing(self, monkeypatch):
+        async def public(url):
+            return True
+
+        monkeypatch.setattr(notify, "_is_public", public)
+        respx.post(f"https://api.telegram.org/bot{TOKEN}/sendPhoto").mock(
+            return_value=httpx.Response(
+                400, json={"ok": False, "description": "can't parse entities"}
+            )
+        )
+        respx.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage").mock(
+            return_value=httpx.Response(200, json={"ok": True})
+        )
+        picture = respx.get("https://img.example/shoe.jpg")
+        async with notify.Telegram(TOKEN, CHAT) as tg:
+            await tg.send_deal("caption", "https://img.example/shoe.jpg")
+        assert not picture.called
+
+    @respx.mock
+    async def test_a_page_that_is_not_a_picture_is_not_uploaded(self, monkeypatch):
+        async def public(url):
+            return True
+
+        monkeypatch.setattr(notify, "_is_public", public)
         respx.post(f"https://api.telegram.org/bot{TOKEN}/sendPhoto").mock(
             return_value=httpx.Response(
                 400, json={"ok": False, "description": "failed to get HTTP URL content"}
