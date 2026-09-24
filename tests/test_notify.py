@@ -198,6 +198,81 @@ class TestDelivery:
         assert not inside.called
         assert text.called
 
+    @staticmethod
+    def _refused_by_telegram():
+        """Telegram cannot fetch the address, and would take an upload."""
+        photo = respx.post(f"https://api.telegram.org/bot{TOKEN}/sendPhoto").mock(
+            side_effect=[
+                httpx.Response(
+                    400, json={"ok": False, "description": "failed to get HTTP URL content"}
+                ),
+                httpx.Response(200, json={"ok": True}),
+            ]
+        )
+        text = respx.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage").mock(
+            return_value=httpx.Response(200, json={"ok": True})
+        )
+        return photo, text
+
+    @respx.mock
+    async def test_a_name_that_resolves_inside_the_second_time_is_not_read(self, monkeypatch):
+        """Review 24.09: the name is resolved once to check it and again to
+        connect, so a host can pass the check and then answer from 127.0.0.1."""
+
+        async def public(url):
+            return True
+
+        class Inside:
+            def get_extra_info(self, name):
+                return ("127.0.0.1", 80) if name == "server_addr" else None
+
+        monkeypatch.setattr(notify, "_is_public", public)
+        photo, text = self._refused_by_telegram()
+        respx.get("https://img.example/shoe.jpg").mock(
+            return_value=httpx.Response(
+                200, content=b"secret", headers={"content-type": "image/jpeg"},
+                extensions={"network_stream": Inside()},
+            )
+        )
+        async with notify.Telegram(TOKEN, CHAT) as tg:
+            assert await tg.send_deal("caption", "https://img.example/shoe.jpg") is True
+        assert photo.call_count == 1, "nothing from inside was uploaded"
+        assert text.called
+
+    @respx.mock
+    async def test_a_host_that_drips_its_picture_is_given_up_on(self, monkeypatch):
+        """Review 24.09: a byte a second held the download for as long as the
+        host liked — the per-read timeout never fired."""
+        import asyncio
+
+        async def public(url):
+            return True
+
+        class Drip(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                for _ in range(100):
+                    await asyncio.sleep(0.05)
+                    yield b"x"
+
+        monkeypatch.setattr(notify, "_is_public", public)
+        monkeypatch.setattr(notify, "DOWNLOAD_SECONDS", 0.3)
+        photo, text = self._refused_by_telegram()
+        respx.get("https://img.example/shoe.jpg").mock(
+            return_value=httpx.Response(
+                200, headers={"content-type": "image/jpeg"}, stream=Drip()
+            )
+        )
+        async with notify.Telegram(TOKEN, CHAT) as tg:
+            assert await tg.send_deal("caption", "https://img.example/shoe.jpg") is True
+        assert photo.call_count == 1 and text.called
+
+    def test_an_address_is_public_only_if_it_really_is(self):
+        assert notify._global("8.8.8.8")
+        assert not notify._global("127.0.0.1")
+        assert not notify._global("::ffff:127.0.0.1"), "IPv4 inside IPv6 is still IPv4"
+        assert not notify._global("fe80::1%eth0")
+        assert not notify._global("not an address")
+
     @respx.mock
     async def test_a_refusal_that_is_not_about_the_picture_uploads_nothing(self, monkeypatch):
         async def public(url):

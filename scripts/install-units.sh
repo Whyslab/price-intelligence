@@ -29,26 +29,33 @@ for unit in "$here"/systemd/price-intelligence*.service "$here"/systemd/price-in
     fi
 done
 
-if [[ ${#changed[@]} -eq 0 ]]; then
-    echo "all units are already up to date"
-    exit 0
-fi
 if [[ $apply -eq 0 ]]; then
-    echo
-    echo "${#changed[@]} unit(s) differ: ${changed[*]}"
-    echo "run again with --yes to install them"
+    if [[ ${#changed[@]} -eq 0 ]]; then
+        echo "all units are already up to date"
+    else
+        echo
+        echo "${#changed[@]} unit(s) differ: ${changed[*]}"
+        echo "run again with --yes to install them"
+    fi
     exit 0
 fi
 
 for name in "${changed[@]}"; do
     cp "$here/systemd/$name" "$dest/$name"
 done
+# Reloaded and enabled even when every file was already in place: a run that
+# copied them and then failed here (no user bus, say) would otherwise leave a
+# second run saying "up to date" and enabling nothing.
 systemctl --user daemon-reload
 systemctl --user enable \
     price-intelligence.timer price-intelligence-health.timer \
     price-intelligence-prune.timer price-intelligence-backup.timer \
     price-intelligence-digest.timer price-intelligence-subscriptions.timer \
     price-intelligence-bot.service price-intelligence-web.service
-echo "installed: ${changed[*]}"
-echo "restart what changed and is running, e.g.:"
-echo "  systemctl --user restart price-intelligence-bot price-intelligence-web"
+if [[ ${#changed[@]} -eq 0 ]]; then
+    echo "all units were already up to date; reloaded and enabled"
+else
+    echo "installed: ${changed[*]}"
+    echo "restart what changed and is running, e.g.:"
+    echo "  systemctl --user restart price-intelligence-bot price-intelligence-web"
+fi

@@ -29,6 +29,22 @@ PHOTO_WIDTH = 1000
 UPLOAD_LIMIT = 10 * 1024 * 1024
 
 
+# However slowly a host sends it. The request's timeout is per read, and a
+# server dripping a byte a second held a download for as long as it liked —
+# the notification loop waiting behind it.
+DOWNLOAD_SECONDS = 30
+
+
+def _global(address: str) -> bool:
+    """Whether one address is on the public internet, IPv4 inside IPv6 included."""
+    try:
+        ip = ipaddress.ip_address(address.split("%", 1)[0])
+    except ValueError:
+        return False
+    mapped = getattr(ip, "ipv4_mapped", None)
+    return (mapped or ip).is_global
+
+
 async def _is_public(url: str) -> bool:
     """Whether every address the URL's host resolves to is a public one."""
     host = urlsplit(url).hostname
@@ -39,7 +55,25 @@ async def _is_public(url: str) -> bool:
     except OSError:
         return False
     addresses = {info[4][0] for info in infos}
-    return bool(addresses) and all(ipaddress.ip_address(a).is_global for a in addresses)
+    return bool(addresses) and all(_global(a) for a in addresses)
+
+
+def _peer_is_public(resp: httpx.Response) -> bool:
+    """Whether the address actually connected to is a public one.
+
+    Asked again once connected, because the name is resolved twice — by
+    `_is_public` and then by the connection — and a host answering the second
+    time with 127.0.0.1 passes the first check. A transport that does not say
+    where it connected (tests do not) leaves it to that first check.
+    """
+    stream = resp.extensions.get("network_stream")
+    if stream is None:
+        return True
+    try:
+        peer = stream.get_extra_info("server_addr")
+    except Exception:
+        return True
+    return True if not peer else _global(str(peer[0]))
 
 
 def telegram_photo(url: str | None) -> str | None:
@@ -373,9 +407,12 @@ class Telegram:
             log.info("not fetching a picture from a private address: %s", url)
             return None
         try:
-            async with self._client.stream(
+            async with asyncio.timeout(DOWNLOAD_SECONDS), self._client.stream(
                 "GET", url, follow_redirects=False, timeout=20
             ) as resp:
+                if not _peer_is_public(resp):
+                    log.info("not fetching a picture: %s answered from a private address", url)
+                    return None
                 kind = resp.headers.get("content-type", "")
                 if resp.status_code != 200 or not kind.startswith("image/"):
                     return None
@@ -385,6 +422,6 @@ class Telegram:
                     if len(body) > UPLOAD_LIMIT:
                         return None
                 return bytes(body)
-        except httpx.HTTPError as exc:
+        except (httpx.HTTPError, TimeoutError) as exc:
             log.info("could not fetch the picture myself either: %s", type(exc).__name__)
             return None
