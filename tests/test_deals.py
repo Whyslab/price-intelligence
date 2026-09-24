@@ -376,3 +376,24 @@ def _evaluate(price, compare_at):
         in_stock=True, history=history,
         filters=Filters(min_discount_pct=30.0, min_saving_usd=10.0),
     )
+
+
+class TestAFindOnlyAStarLetThrough:
+    """A followed product skips the bars so its follower hears small moves; the
+    deal says whether it would have cleared them anyway (review 24.09)."""
+
+    def test_a_small_move_on_a_followed_product_is_not_on_merit(self, filters):
+        history = make_history([(100.0, None, 10), (97.0, None, 0)])
+        assert deals.evaluate(1, 1, 97.0, None, True, history, filters) is None
+        deal = deals.evaluate(1, 1, 97.0, None, True, history, filters, watched=True)
+
+        assert deal is not None and deal.watched
+        assert not deal.on_merit
+
+    def test_a_real_discount_is_on_merit_followed_or_not(self, filters):
+        history = make_history([(200.0, None, 10), (100.0, None, 0)])
+        plain = deals.evaluate(1, 1, 100.0, None, True, history, filters)
+        followed = deals.evaluate(1, 1, 100.0, None, True, history, filters, watched=True)
+
+        assert plain is not None and plain.on_merit
+        assert followed is not None and followed.on_merit

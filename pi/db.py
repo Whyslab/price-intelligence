@@ -2425,13 +2425,24 @@ def following(conn: sqlite3.Connection) -> dict[int, set[int]]:
     a followed product must be judged before anyone can be told about it, and
     scoring is the half that is shared — while the per-reader sets decide who
     actually hears.
+
+    Nobody who blocked the bot: they cannot be told, so there is nothing to
+    judge on their behalf.
     """
     out: dict[int, set[int]] = {}
     for row in conn.execute(
         "SELECT user_id, product_id FROM favorites WHERE notify = 1"
+        " AND user_id NOT IN (SELECT id FROM bot_users WHERE active = 0)"
     ):
         out.setdefault(row[0], set()).add(row[1])
     return out
+
+
+# How many products one reader may follow. Far above what a person watches —
+# the owner follows eight — and low enough that nobody pressing ⭐ under
+# article after article (forty shops a press) can make every run score
+# thousands of products on their behalf.
+MAX_FOLLOWED = 200
 
 
 def favorite_prices(conn: sqlite3.Connection, user_id: int) -> dict[int, float | None]:

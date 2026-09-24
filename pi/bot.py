@@ -904,7 +904,16 @@ class Bot:
             await self.send(chat_id, "Этой вещи уже нет в базе — пришлите запрос ещё раз.")
             return
         ids = dbm.article_products(self.conn, product_id) if everywhere else [product_id]
-        added = sum(dbm.add_favorite(self.conn, user["id"], pid) for pid in ids)
+        followed = dbm.favorite_ids(self.conn, user["id"])
+        fresh = [pid for pid in ids if pid not in followed]
+        if len(followed) + len(fresh) > dbm.MAX_FOLLOWED:
+            await self.send(
+                chat_id,
+                f"⭐ Следить можно самое большее за {dbm.MAX_FOLLOWED} вещами, "
+                f"сейчас — {len(followed)}. Уберите лишнее в /following.",
+            )
+            return
+        added = sum(dbm.add_favorite(self.conn, user["id"], pid) for pid in fresh)
         where = (
             "в " + plural(len(ids), "магазине", "магазинах", "магазинах")
             if everywhere else f"в {escape(row['name'] or row['domain'])}"

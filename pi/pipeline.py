@@ -960,6 +960,10 @@ def arrange_for(
     every_variant: list[tuple[dealm.Deal, sqlite3.Row]] = []
     for deal, row in scored:
         follows = bool(watched and deal.product_id in watched)
+        if not follows and not deal.on_merit:
+            # Scored only because somebody follows it. One reader's star is not
+            # a discount for the shelf everybody reads, nor for anyone else.
+            continue
         if skip_alerted and dealm.already_alerted(
             conn,
             deal,

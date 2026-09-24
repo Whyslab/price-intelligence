@@ -93,6 +93,10 @@ class Deal:
     # say, because the point of watching one is not to be told only about the
     # big drops.
     watched: bool = False
+    # Whether it clears the thresholds without that. A find scored only because
+    # somebody follows it is theirs: it must not reach the shared shelf or
+    # anybody else's feed (pipeline.arrange_for).
+    on_merit: bool = True
 
     @property
     def bucket(self) -> int:
@@ -182,7 +186,8 @@ def evaluate(
     """
     if not in_stock or price_usd <= 0 or not history:
         return None
-    if not watched and not (filters.min_price_usd <= price_usd <= filters.max_price_usd):
+    in_range = filters.min_price_usd <= price_usd <= filters.max_price_usd
+    if not watched and not in_range:
         return None
     market = market or Market()
     trust = trust or Trust()
@@ -259,9 +264,10 @@ def evaluate(
 
     discount_pct = (reference_native - price_native) / reference_native * 100
     saving_usd = round((reference_native - price_native) / fx_rate, 2)
-    if not watched and (
-        discount_pct < filters.min_discount_pct or saving_usd < filters.min_saving_usd
-    ):
+    big_enough = (
+        discount_pct >= filters.min_discount_pct and saving_usd >= filters.min_saving_usd
+    )
+    if not watched and not big_enough:
         return None
 
     past = [r["price_native"] for r in history[:-1] if r["currency"] == current["currency"]]
@@ -285,7 +291,8 @@ def evaluate(
     if rule_priced:
         score -= 20         # so is every other "was" price in this shop
     score = int(max(0, min(100, round(score))))
-    if not watched and score < filters.min_score:
+    good_enough = score >= filters.min_score
+    if not watched and not good_enough:
         return None
 
     return Deal(
@@ -310,6 +317,7 @@ def evaluate(
         blanket_pct=trust.blanket_pct if rule_priced else None,
         rule_priced=rule_priced,
         watched=watched,
+        on_merit=in_range and big_enough and good_enough,
     )
 
 

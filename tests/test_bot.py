@@ -692,6 +692,24 @@ class TestFollowingFromTheChat:
         assert "нет в наличии" not in text and "$120" in text and "$90" not in text
 
     @pytest.mark.asyncio
+    async def test_following_has_a_ceiling(self, robot, calls, conn, monkeypatch):
+        """A crafted `fwa:` press adds a whole article's shops; nobody gets to
+        make every run score thousands of products on their behalf."""
+        monkeypatch.setattr(dbm, "MAX_FOLLOWED", 2)
+        first = self._stock(conn, "a.example", "One", 90.0)
+        second = self._stock(conn, "b.example", "Two", 90.0)
+        third = self._stock(conn, "c.example", "Three", 90.0)
+        for product in (first, second):
+            await robot.handle(TestRouting._press(f"fw:{product}"))
+
+        await robot.handle(TestRouting._press(f"fw:{third}"))
+
+        assert dbm.favorite_ids(conn, 7) == {first, second}
+        assert "/following" in calls[-1][1]["text"]
+        await robot.handle(TestRouting._press(f"fw:{first}"))
+        assert "уже следил" in calls[-1][1]["text"], "following one already followed is fine"
+
+    @pytest.mark.asyncio
     async def test_the_list_shows_what_is_followed_and_a_cross_takes_it_off(
         self, robot, calls, conn
     ):

@@ -442,6 +442,51 @@ class TestFollowingAProduct:
             watched={product},
         ) == [], "1% is not news even about a thing somebody is waiting for"
 
+    def test_a_find_only_a_star_let_through_is_nobody_elses(self, config, conn):
+        """Review 24.09: one reader's star put a −3% price on the shelf everybody
+        reads. Scoring skips the bars for a followed product; the shelf and the
+        other readers' lists must not inherit that."""
+        scored = self._scored(conn, score=20)
+        scored[0][0].on_merit = False
+        product = scored[0][0].product_id
+
+        shelf = pipeline.arrange_for(
+            conn, scored, config, market=None, cap_per_store=False,
+            fold_duplicates=False, skip_alerted=False, kids=True, per_product=False,
+        )
+        mine = pipeline.arrange_for(
+            conn, scored, config, market=None, user_id=7, fold_duplicates=False,
+            watched={product},
+        )
+        theirs = pipeline.arrange_for(
+            conn, scored, config, market=None, user_id=9, fold_duplicates=False,
+            watched={12345},
+        )
+
+        assert shelf == [], "not on the shared shelf"
+        assert len(mine) == 1, "still the follower's"
+        assert theirs == []
+
+    def test_a_real_find_that_somebody_follows_is_still_everybodys(self, config, conn):
+        scored = self._scored(conn, score=90)
+        assert scored[0][0].on_merit
+
+        shelf = pipeline.arrange_for(
+            conn, scored, config, market=None, cap_per_store=False,
+            fold_duplicates=False, skip_alerted=False, kids=True, per_product=False,
+        )
+        assert len(shelf) == 1
+
+    def test_somebody_who_blocked_the_bot_follows_nothing(self, config, conn):
+        product = a_product(conn)
+        dbm.upsert_bot_user(conn, 7, "7", "reader")
+        dbm.upsert_bot_user(conn, 9, "9", "left")
+        dbm.add_favorite(conn, 7, product)
+        dbm.add_favorite(conn, 9, product)
+        personal.deactivate(conn, "9")
+
+        assert dbm.following(conn) == {7: {product}}
+
     def test_nobody_following_anything_changes_nothing(self, config, conn):
         scored = self._scored(conn, score=90)
 
