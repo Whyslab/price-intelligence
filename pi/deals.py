@@ -214,8 +214,12 @@ def evaluate(
     # $55.98 — 95% below the $1,100 resale shops ask — and a run of the same:
     # a placeholder price, a child's size, a different item under one SKU. A
     # real clearance does not undercut every other seller four times over.
-    if market_native is not None and market_native > price_native * MAX_SPREAD:
-        market_native = low_native = None
+    # Their struck-through prices go with them: the recommended price is read
+    # from the same shops' tags, so it is a claim about the same other thing
+    # (review 24.09: $180 across three of them made a $55.98 find −69%).
+    unrelated = market_native is not None and market_native > price_native * MAX_SPREAD
+    if unrelated:
+        market_native = low_native = msrp_native = None
 
     # Veto: whatever it is marked down from, a price above what other shops are
     # asking for the same article is not a discount.
@@ -308,11 +312,12 @@ def evaluate(
         fake_sale=fake_sale,
         dropped_hours_ago=_dropped_hours_ago(history, price_native),
         history_points=len(history),
-        market_shops=market.shops,
-        market_median_usd=market.median_usd,
+        # Not shown as the market's view either, when it was about something else.
+        market_shops=0 if unrelated else market.shops,
+        market_median_usd=None if unrelated else market.median_usd,
         beats_market=beats_market,
-        msrp_usd=market.msrp_usd if market.has_msrp(filters.msrp_min_shops) else None,
-        msrp_shops=market.msrp_shops if market.has_msrp(filters.msrp_min_shops) else 0,
+        msrp_usd=market.msrp_usd if msrp_native is not None else None,
+        msrp_shops=market.msrp_shops if msrp_native is not None else 0,
         inflated_tag=inflated_tag,
         blanket_pct=trust.blanket_pct if rule_priced else None,
         rule_priced=rule_priced,

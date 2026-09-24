@@ -260,6 +260,22 @@ class TestAnInflatedReferencePrice:
         deal = deals.evaluate(1, 1, 55.98, None, True, history, filters, market=market)
         assert deal is None
 
+    def test_their_recommended_price_goes_with_them(self, filters):
+        """Review 24.09: the same shops' struck-through $180 made the $55.98 find
+        −69% against msrp, score 100, an all-time low worth interrupting for."""
+        # A day of history: too short for the shop's own floor to decide.
+        history = make_history([(60.0, None, 1), (55.98, None, 0)])
+        market = Market(median_usd=1099.88, low_usd=700.0, shops=5, msrp_usd=180.0, msrp_shops=3)
+        assert deals.evaluate(1, 1, 55.98, None, True, history, filters, market=market) is None
+
+    def test_a_find_measured_otherwise_does_not_show_their_view(self, filters):
+        history = make_history([(200.0, None, 10), (55.98, None, 0)])
+        market = Market(median_usd=1099.88, low_usd=700.0, shops=5, msrp_usd=180.0, msrp_shops=3)
+        deal = deals.evaluate(1, 1, 55.98, None, True, history, filters, market=market)
+        assert deal is not None and deal.reference_source == "history"
+        assert deal.market_shops == 0 and deal.market_median_usd is None
+        assert deal.msrp_usd is None
+
     def test_a_deep_but_believable_cut_against_the_market_still_counts(self, filters):
         history = make_history([(80.0, None, 0)])
         market = Market(median_usd=300.0, low_usd=260.0, shops=5)
