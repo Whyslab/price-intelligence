@@ -394,3 +394,87 @@ class TestStoreTrust:
         almost entirely on sale."""
         store = self._catalogue(conn, "noise.example", 200, [0.4])
         assert reference.store_trust(conn)[store].tagged == 0
+
+
+class TestCarharttWritesItsArticleInTwoFields:
+    """`I036262 3AN0J` — the garment, then the colour, joined however the shop
+    pleases. Neither half alone is the article: the code without a colour would
+    merge every colourway of the same jacket, and comparing prices between those
+    is comparing different things."""
+
+    def test_both_halves_make_one_code(self):
+        assert reference.style_codes("I036262 3AN0J PALISANDER") == {"I0362623AN0J"}
+
+    def test_the_separator_does_not_matter(self):
+        """Shops write a space, a dot or a dash for the same article."""
+        assert (
+            reference.style_codes("I031454.1ONXX")
+            == reference.style_codes("I031454 1ONXX")
+            == reference.style_codes("I031454-1ONXX")
+        )
+
+    def test_a_bare_style_without_a_colour_is_not_a_code(self):
+        assert reference.style_codes("I036262") == set()
+
+    def test_the_shapes_already_recognised_are_untouched(self):
+        assert reference.style_codes("CW2288-111") == {"CW2288-111"}
+        assert reference.style_codes("IF4396") == {"IF4396"}
+        assert reference.style_codes("M990GL6") == {"M990GL6"}
+
+
+class TestAKeyThatNamesTwoBrandsIsNotAnArticleNumber:
+    """`\\d{6}-\\d{2}` was taken for Puma and also matches a shop's own id with a
+    European size on the end, so `103134-40` claimed a Hey Dude and a Nike are
+    the same shoe. Measured on the catalogue, 733 of the 18,617 style keys that
+    link two shops join products whose brands are both known and different."""
+
+    def _stock(self, conn, domain, brand, sku, price):
+        store = dbm.upsert_store(conn, domain, platform="shopify", currency="USD")
+        product = dbm.upsert_product(
+            conn, store, sku, f"{brand} thing", f"https://{domain}/p", brand=brand
+        )
+        conn.execute(
+            "UPDATE products SET brand_family = ? WHERE id = ?", (brand, product)
+        )
+        dbm.set_product_keys(conn, product, {(reference.STYLE, "103134-40")})
+        variant = dbm.upsert_variant(conn, product, "v1", sku=sku)
+        dbm.record_price(
+            conn, variant, price, None, True, "USD", price, 1.0, ts=ts(0)
+        )
+        return product
+
+    def test_the_market_price_ignores_the_whole_key(self, conn):
+        """Not just the odd row: a $30 cap among $200 sneakers moves the median
+        every other offer in the group is judged against."""
+        mine = self._stock(conn, "mine.example", "adidas", "a1", 200.0)
+        self._stock(conn, "other.example", "Nike", "n1", 30.0)
+
+        market = reference.build_market_index(conn).look_up(mine, "mine.example")
+        assert market.shops == 0, "a cap is not the cheaper version of a sneaker"
+
+    def test_brands_that_agree_still_count(self, conn):
+        mine = self._stock(conn, "mine.example", "adidas", "a1", 200.0)
+        self._stock(conn, "other.example", "adidas", "a2", 150.0)
+
+        market = reference.build_market_index(conn).look_up(mine, "mine.example")
+        assert market.shops == 1
+
+    def test_silence_is_not_disagreement(self, conn):
+        """78% of the catalogue names no brand, and a missing name contradicts
+        nothing."""
+        mine = self._stock(conn, "mine.example", "adidas", "a1", 200.0)
+        nameless = self._stock(conn, "other.example", "adidas", "a2", 150.0)
+        conn.execute(
+            "UPDATE products SET brand_family = NULL, brand_norm = NULL, brand = NULL"
+            " WHERE id = ?", (nameless,),
+        )
+
+        market = reference.build_market_index(conn).look_up(mine, "mine.example")
+        assert market.shops == 1
+
+    def test_the_product_card_does_not_offer_it_either(self, conn):
+        """`same_article` is what the card's "cheaper elsewhere" reads."""
+        mine = self._stock(conn, "mine.example", "adidas", "a1", 200.0)
+        self._stock(conn, "other.example", "Nike", "n1", 30.0)
+
+        assert dbm.same_article(conn, mine) == []

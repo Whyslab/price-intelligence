@@ -1,0 +1,13 @@
+[Unit]
+Description=Publish the free digest once a day
+
+[Timer]
+# Early evening: the finds have had the day's sweeps to accumulate, and a
+# message arriving then is read rather than slept through.
+OnCalendar=*-*-* 18:10:00
+RandomizedDelaySec=20min
+Persistent=yes
+Unit=price-intelligence-digest.service
+
+[Install]
+WantedBy=timers.target

@@ -1,6 +1,9 @@
 [Unit]
 Description=Price Intelligence — Telegram bot
 Documentation=https://github.com/Whyslab/price-intelligence
+# network-online.target is the system manager's and means nothing to a user
+# unit, so the bot may start before DNS works; it asks Telegram again with
+# back-off until it answers (pi.bot.Bot.poll).
 After=network-online.target
 Wants=network-online.target
 

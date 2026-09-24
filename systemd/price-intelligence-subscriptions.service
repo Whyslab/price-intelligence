@@ -1,0 +1,15 @@
+[Unit]
+Description=Price Intelligence — remind before a subscription ends, expire the lapsed
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/Projects/price-intelligence
+ExecStart=%h/Projects/price-intelligence/.venv/bin/python -m pi subscriptions
+TimeoutStartSec=10min
+Nice=10
+
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/Projects/price-intelligence/data
+NoNewPrivileges=yes

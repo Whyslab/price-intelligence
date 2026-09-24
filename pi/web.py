@@ -30,14 +30,19 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+from contextlib import closing
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+import httpx
+
 from . import db as dbm
 from . import webauth
+from .domains import shop_link
 
 log = logging.getLogger(__name__)
+
 
 PAGE = Path(__file__).with_name("shelf.html")
 PAGE_SIZE = 60
@@ -55,17 +60,33 @@ LOOKUP_LIMIT = 40
 # eight identical blazers is a worse answer than eight different shops even
 # when every one of the claims is true. The other sorts stay literal — "по
 # скидке" is asked precisely when the deepest cut is the whole question.
+#
+# Every ordering ends on `o.variant_id`, which is the offers table's primary
+# key, because none of the keys above is unique and OFFSET paging over a
+# non-unique ORDER BY is undefined: SQLite may return tied rows in a different
+# order for each page, so the same card appears twice and another is never
+# shown. Measured on the live database, 29,703 of 33,277 offers — 89% — sit in
+# a group tied on (shop, score, discount), so this is the common case and not
+# the corner one.
+#
+# The default needs it twice. Its first key is the window's rank, and a rank
+# assigned over a tied ORDER BY is itself arbitrary, so a tiebreaker only on
+# the outside would stabilise nothing: the rank would keep moving underneath it.
+# `o.store_id` and not `p.store_id`: offers_for folds to one row per product
+# in a subquery aliased `o`, and the products table is no longer in scope out
+# here. The column is carried through that subquery for exactly this.
 BY_SHOP_THEN_SCORE = (
-    "ROW_NUMBER() OVER (PARTITION BY p.store_id ORDER BY o.score DESC, o.discount_pct DESC), "
-    "o.score DESC, o.discount_pct DESC"
+    "ROW_NUMBER() OVER (PARTITION BY o.store_id"
+    " ORDER BY o.score DESC, o.discount_pct DESC, o.variant_id DESC), "
+    "o.score DESC, o.discount_pct DESC, o.variant_id DESC"
 )
 SORTS = {
     "score": BY_SHOP_THEN_SCORE,
-    "discount": "o.discount_pct DESC, o.score DESC",
-    "saving": "o.saving_usd DESC",
-    "cheapest": "o.price_usd ASC",
-    "newest": "o.found_at DESC",
-    "freshest": "o.checked_at DESC",
+    "discount": "o.discount_pct DESC, o.score DESC, o.variant_id DESC",
+    "saving": "o.saving_usd DESC, o.variant_id DESC",
+    "cheapest": "o.price_usd ASC, o.variant_id DESC",
+    "newest": "o.found_at DESC, o.variant_id DESC",
+    "freshest": "o.checked_at DESC, o.variant_id DESC",
 }
 DEFAULT_SORT = "score"
 
@@ -129,6 +150,13 @@ def read_query(raw: str) -> dict:
         # this shelf is for — but it stays reachable, because a hidden
         # misclassification is one nobody can report.
         "kids": (query.get("kids", ["0"])[0] or "0").lower() in ("1", "true", "yes"),
+        # The shelf shows only discounts somebody other than the seller vouches
+        # for. 20,908 of the 26,013 cards it could draw rest on nothing but the
+        # shop's own struck-through price, and a page of those is a jumble sale
+        # whatever it is dressed in. Reachable, though: somebody hunting one
+        # particular thing wants the weak evidence too, labelled as weak.
+        "all_discounts": (query.get("all_discounts", ["0"])[0] or "0").lower()
+        in ("1", "true", "yes"),
         # Not a filter on the shelf but a different list entirely — see
         # db.favorites_for. Read here so a link to it can be sent to somebody.
         "favorites": (query.get("favorites", ["0"])[0] or "0").lower() in ("1", "true", "yes"),
@@ -144,13 +172,18 @@ def offer_json(row: sqlite3.Row) -> dict:
     shelf and a graveyard, and it is the one thing a page like this normally
     hides: a listing that four days ago was 60% off may simply be gone.
     """
+    keys = row.keys()
     return {
         "id": row["product_id"],
         # Which size this card is, so opening it lands on the same row rather
         # than on whichever one the database happened to return first.
         "variant": row["variant_id"],
+        # How many of this product's sizes are on offer, so a folded card can
+        # say "3 sizes" instead of naming one and implying the rest are gone.
+        # Absent on the product page, which is already showing every size.
+        "sizes_on_offer": row["sizes_on_offer"] if "sizes_on_offer" in keys else 1,
         "title": row["title"],
-        "url": row["url"],
+        "url": shop_link(row["url"], row["domain"]),
         "image": row["image_url"],
         "brand": row["brand_family"] or row["brand"],
         "shop": row["store_name"] or row["domain"],
@@ -212,7 +245,7 @@ def product_page(
             "shop": other["store_name"] or other["domain"],
             "domain": other["domain"],
             "country": other["country"],
-            "url": other["url"],
+            "url": shop_link(other["url"], other["domain"]),
             "title": other["title"],
             "price": round(other["price_usd"], 2),
             "checked_at": other["last_ok"],
@@ -230,6 +263,35 @@ def product_page(
         # Said plainly, because a page that only ever flatters the offer it is
         # showing is an advertisement. Sometimes the answer is "not here".
         "cheapest_elsewhere": cheaper[0] if cheaper else None,
+        "history": price_history_json(conn, row["variant_id"]),
+    }
+
+
+# How much of a variant's history the card draws. Points are changes, not
+# readings, so this is months for most things and never a heavy answer.
+HISTORY_POINTS = 120
+
+
+def price_history_json(conn: sqlite3.Connection, variant_id: int) -> dict:
+    """This size's price as the shop quoted it, change by change.
+
+    The evidence behind "было": a discount judged against the shop's own lowest
+    price of the last thirty days is only as convincing as being able to see
+    those thirty days. In the shop's currency, because that is what the shop
+    charged — in dollars a moving exchange rate draws steps nobody took — and
+    only in its latest currency, so a shop that switched does not draw a cliff.
+    """
+    points = dbm.price_history(conn, variant_id)
+    if not points:
+        return {"currency": None, "points": []}
+    currency = points[-1]["currency"]
+    kept = [p for p in points if p["currency"] == currency][-HISTORY_POINTS:]
+    return {
+        "currency": currency,
+        "points": [
+            {"t": p["ts"], "p": round(p["price_native"], 2), "in_stock": bool(p["in_stock"])}
+            for p in kept
+        ],
     }
 
 
@@ -239,7 +301,7 @@ def lookup_json(row: sqlite3.Row) -> dict:
         "shop": row["store_name"] or row["domain"],
         "domain": row["domain"],
         "country": row["country"],
-        "url": row["url"],
+        "url": shop_link(row["url"], row["domain"]),
         "title": row["title"],
         "brand": row["brand_norm"],
         "price": round(row["price_usd"], 2),
@@ -283,7 +345,7 @@ def favorite_json(item: dict) -> dict:
         "id": item["product_id"],
         "variant": item["variant_id"],
         "title": item["title"],
-        "url": item["url"],
+        "url": shop_link(item["url"], item["domain"]),
         "image": item["image_url"],
         "brand": item["brand"],
         "shop": item["store_name"] or item["domain"],
@@ -316,6 +378,7 @@ def shelf_page(conn: sqlite3.Connection, args: dict) -> dict:
         max_price=args["max_price"],
         min_discount=args["min_discount"],
         kids=args["kids"],
+        all_discounts=args["all_discounts"],
     )
     return {
         "total": total,
@@ -325,8 +388,111 @@ def shelf_page(conn: sqlite3.Connection, args: dict) -> dict:
     }
 
 
+# What a read answers when the reader is not paying. 402 rather than 403: the
+# request is understood and well formed, and the only thing missing is payment.
+SUBSCRIPTION_REQUIRED = {
+    "error": "subscription required",
+    "detail": "Витрина открывается по подписке. Оформить её можно в боте.",
+}
+
+
+def nudge_in_chat(bot_token: str | None, chat_id: int) -> bool:
+    """Попросить бота положить в чат предложение подписки.
+
+    Кнопка на закрытой полке называется «Вернуться в бота и оформить», но
+    умела только закрыть окно: человек оказывался в чате, где ничего не
+    происходило. Оформить было негде.
+
+    Отправляем от имени бота одну строку с кнопкой `pitch` — тем же нажатием,
+    что и в меню. Бот сам решит, что показать: пока продажа выключена — из
+    чего она будет состоять, когда включат — счёт на оплату. Дублировать эту
+    развилку здесь нельзя, она живёт в одном месте и должна там остаться.
+    """
+    if not bot_token:
+        return False
+    try:
+        response = httpx.post(
+            f"https://api.telegram.org/bot{bot_token}/sendMessage",
+            json={
+                "chat_id": chat_id,
+                "text": "Полка открывается по подписке.",
+                "reply_markup": {"inline_keyboard": [[
+                    {"text": "💎 Что даёт подписка", "callback_data": "pitch"},
+                ]]},
+            },
+            timeout=8,
+        )
+        return response.is_success
+    except httpx.HTTPError as exc:
+        log.info("не смог позвать бота: %s", exc)
+        return False
+
+
+def locked_page(conn: sqlite3.Connection) -> bytes:
+    """What somebody without a subscription gets instead of the shelf.
+
+    A page rather than a status code. Whoever lands here followed a button out
+    of the bot, and the two things they need are what this is and how to open
+    it; an error tells them neither and reads as a broken link.
+
+    It carries the same three arguments the bot's pitch does, with the numbers
+    counted here and now for the same reason: the size of the catalogue is the
+    one claim a reader can check in the next thirty seconds.
+    """
+    # Products, not rows: the shelf keeps a row per discounted size.
+    shelf = conn.execute("SELECT COUNT(DISTINCT product_id) FROM offers").fetchone()[0]
+    compared = conn.execute(
+        "SELECT COUNT(DISTINCT product_id) FROM offers WHERE reference_source = 'market'"
+    ).fetchone()[0]
+    body = f"""<!doctype html>
+<html lang="ru"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Полка — нужна подписка</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root {{ color-scheme: light dark; }}
+  body {{ margin: 0 auto; padding: 2rem 1.25rem; max-width: 34rem;
+         font: 16px/1.55 system-ui, sans-serif; }}
+  h1 {{ font-size: 1.4rem; margin: 0 0 .25rem; }}
+  p.lead {{ opacity: .75; margin-top: 0; }}
+  ol {{ padding-left: 1.2rem; }}
+  li {{ margin-bottom: .9rem; }}
+  .price {{ margin-top: 1.75rem; padding: 1rem; border-radius: .75rem;
+            background: rgba(128, 128, 128, .14); text-align: center; }}
+  button {{ margin-top: 1rem; width: 100%; padding: .8rem; font: inherit;
+            font-weight: 600; border: 0; border-radius: .6rem;
+            background: #2481cc; color: #fff; cursor: pointer; }}
+</style></head><body>
+<h1>💎 Полка открывается по подписке</h1>
+<p class="lead">Здесь {_spaced(shelf)} предложений со скидкой, с поиском по
+артикулу, размеру и марке.</p>
+<ol>
+  <li><b>Дешевле, чем у соседей.</b> {_spaced(compared)} предложений сравнены
+      с ценой на ту же вещь в других магазинах по артикулу производителя.
+      Канал со скидками пересылает ярлык — сравнить ему не с чем.</li>
+  <li><b>Цена подтверждена, а не найдена когда-то.</b> На каждой карточке
+      написано, когда магазин в последний раз показал эту цену.</li>
+  <li><b>Цена на руках</b> — с доставкой и пошлиной в вашу страну, а не только
+      та, что на ярлыке.</li>
+</ol>
+<div class="price">⭐ <b>150 звёзд в месяц</b><br>или 1500 за год — два месяца в подарок</div>
+<button onclick="if (window.Telegram?.WebApp) Telegram.WebApp.close(); else history.back();">
+  Вернуться в бота и оформить
+</button>
+</body></html>
+"""
+    return body.encode("utf-8")
+
+
+def _spaced(n: int) -> str:
+    """Thousands separated the way Russian writes them."""
+    return f"{n:,}".replace(",", "\u00a0")
+
+
 def render_page(
-    conn: sqlite3.Connection, args: dict, user_id: int | None = None
+    conn: sqlite3.Connection, args: dict, user_id: int | None = None,
+    seeded: bool = True,
 ) -> bytes:
     """The page with its first screenful already in it.
 
@@ -341,9 +507,18 @@ def render_page(
     signature travels in the URL fragment, which browsers do not send — so the
     page asks for it and the seed says nobody.
     """
+    # `seeded=False` sends the shell and nothing else. It is what goes out when
+    # the request could not say who it is, and the shelf is the thing being
+    # sold: seeding it there would hand the first screenful to anybody who knows
+    # the address, which is the paywall with a hole in it rather than a paywall.
+    if not seeded:
+        return PAGE.read_text(encoding="utf-8").encode("utf-8")
+
     seed = json.dumps(
         {"seed": {
-            "facets": dbm.shelf_facets(conn, kids=args["kids"]),
+            "facets": dbm.shelf_facets(
+                conn, kids=args["kids"], all_discounts=args["all_discounts"]
+            ),
             "offers": shelf_page(conn, args),
             "me": user_id,
             "favorites": sorted(dbm.favorite_ids(conn, user_id)) if user_id else [],
@@ -371,6 +546,9 @@ MAX_BODY = 4096
 
 
 class Handler(BaseHTTPRequestHandler):
+    # A client that stops sending mid-request would otherwise hold its thread
+    # for good; the server now runs as a service rather than for an evening.
+    timeout = 15
     """One request. A connection per request, because the server is threaded."""
 
     db_path: Path = Path("data/pi.db")
@@ -379,22 +557,36 @@ class Handler(BaseHTTPRequestHandler):
     # the page then hides its hearts entirely rather than offering a button that
     # answers 401.
     owner_id: int | None = None
+    # Who never has to pay: the person who runs the collector. Unlike owner_id
+    # this grants no identity — the reader still proves who they are with
+    # Telegram's signature — so it is safe on an address other people reach.
+    exempt_id: int | None = None
+    # Whether the shelf is behind a paywall at all. Off by default: the
+    # subscription is built and switched off, not removed.
+    subscription: bool = False
     server_version = "price-intelligence"
 
     def log_message(self, fmt: str, *args) -> None:
         log.debug("%s - %s", self.address_string(), fmt % args)
 
     def _send(self, code: int, body: bytes, content_type: str) -> None:
-        self.send_response(code)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
-        # The page is the only thing allowed to script this origin, and it
-        # carries no third-party anything.
-        self.send_header("Content-Security-Policy", "default-src 'self' 'unsafe-inline' data: https:")
-        self.send_header("Referrer-Policy", "no-referrer")
-        self.end_headers()
-        if self.command != "HEAD":
-            self.wfile.write(body)
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            # The page is the only thing allowed to script this origin, and it
+            # carries no third-party anything.
+            self.send_header(
+                "Content-Security-Policy", "default-src 'self' 'unsafe-inline' data: https:"
+            )
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            # The reader closed the page before the answer arrived. Nothing is
+            # wrong, and a twenty-line traceback in the journal said otherwise.
+            log.debug("%s went away before the answer was written", self.client_address)
 
     def _json(self, payload: dict, code: int = 200) -> None:
         self._send(
@@ -434,7 +626,64 @@ class Handler(BaseHTTPRequestHandler):
         signed = webauth.verify(
             self.headers.get("X-Telegram-Init-Data", ""), self.bot_token
         )
-        return signed if signed is not None else self.owner_id
+        if signed is not None:
+            return signed
+        # The owner flag is an identity nobody proved, so it may only be
+        # believed when this process is talking to the person directly. Applied
+        # here rather than at each call site: every verb resolves identity
+        # through this method, and a guard that has to be remembered three times
+        # gets remembered twice — un-starring was the one that was missed, and
+        # through a tunnel it let the internet empty the owner's list one id at
+        # a time, learning which ids were on it from the answer.
+        return self.owner_id if self._direct() else None
+
+    def _paying(self, conn: sqlite3.Connection) -> bool:
+        """Whether this request may see the shelf at all.
+
+        The shelf is the thing being sold, so unlike the hearts — which a
+        signed-out reader simply does not get — this is the gate. Two ways
+        through it: a live subscription, or being the person who runs the
+        collector. The second is not a courtesy; a shop owner locked out of
+        their own shop by their own paywall cannot debug it.
+
+        `is_subscribed` and not `subscription_state`, deliberately: the grace
+        period keeps a feed alive through a failed renewal, and handing back the
+        thing being sold as well would make grace a free month.
+        """
+        # Nothing is being sold yet, so nothing is being withheld. See
+        # Config.subscription and docs/subscription.md.
+        if not self.subscription:
+            return True
+        reader = self._reader()
+        if reader is None:
+            return False
+        # `exempt_id` is safe anywhere, because Telegram had to sign the request
+        # naming that person for `_reader` to have returned it at all.
+        if self.exempt_id is not None and reader == self.exempt_id:
+            return True
+        # `owner_id` is deliberately not a second way through. It says "whoever
+        # reaches me is that person", which was true while the only way to reach
+        # this process was to be sitting at it, and stopped being true the day a
+        # tunnel pointed at 127.0.0.1. `_direct` narrows that, but it is a
+        # blocklist and blocklists fail open: an ssh -L forward, a socat, an
+        # nginx without proxy_set_header — none of them announce themselves, and
+        # each would hand the whole shelf away.
+        #
+        # So the inference is gone rather than qualified. The flag still names a
+        # reader, which is all it was ever for; an operator who wants the shelf
+        # opens the mini-app, or gives themselves access with `pi grant`.
+        return dbm.is_subscribed(conn, reader)
+
+    # Headers a reverse proxy adds and a browser talking to us directly does
+    # not. cloudflared sends the first two. Not a security boundary on its own —
+    # see `_paying` — but enough to keep an unproven identity off a tunnel.
+    _PROXY_HEADERS = ("X-Forwarded-For", "CF-Connecting-IP", "X-Real-IP", "Forwarded")
+
+    def _direct(self) -> bool:
+        """Whether this request reached us without passing through anything."""
+        if any(self.headers.get(name) for name in self._PROXY_HEADERS):
+            return False
+        return self.client_address[0] in ("127.0.0.1", "::1")
 
     def _body(self) -> dict:
         """The JSON a write sent, or {}."""
@@ -460,14 +709,48 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         try:
             if parsed.path in ("/", "/index.html"):
-                with self._open() as conn:
-                    body = render_page(conn, read_query(parsed.query), self._reader())
+                with closing(self._open()) as conn:
+                    reader = self._reader()
+                    if reader is None:
+                        # Nobody has said who this is *yet*, and on this request
+                        # nobody can: inside Telegram the signature arrives in
+                        # the URL fragment, which browsers never send to a
+                        # server. Judging the subscription here therefore showed
+                        # the paywall to paying readers — the shelf they had
+                        # bought, refused on the one request that could not
+                        # carry proof of having bought it.
+                        #
+                        # So the shell goes out unseeded, carrying no offers at
+                        # all, and the page proves itself on its first API call.
+                        # Every one of those is signed and every one of them
+                        # checks `_paying`, so nothing is given away here: an
+                        # unsubscribed reader gets the same pitch, drawn by the
+                        # page instead of served in its place.
+                        body = render_page(
+                            conn, read_query(parsed.query), None, seeded=False
+                        )
+                    elif not self._paying(conn):
+                        # Known, and not paying. Here the answer is certain, so
+                        # it is given straight: a page rather than a 402,
+                        # because whoever followed a link out of the bot needs
+                        # to learn what this is, and a status code says nothing.
+                        self._send(200, locked_page(conn), "text/html; charset=utf-8")
+                        return
+                    else:
+                        body = render_page(conn, read_query(parsed.query), reader)
                 self._send(200, body, "text/html; charset=utf-8")
                 return
             if parsed.path == "/api/facets":
-                with self._open() as conn:
+                with closing(self._open()) as conn:
+                    if not self._paying(conn):
+                        self._json(SUBSCRIPTION_REQUIRED, 402)
+                        return
                     self._json(
-                        dbm.shelf_facets(conn, kids=read_query(parsed.query)["kids"])
+                        dbm.shelf_facets(
+                            conn,
+                            kids=read_query(parsed.query)["kids"],
+                            all_discounts=read_query(parsed.query)["all_discounts"],
+                        )
                     )
                 return
             if parsed.path.startswith("/api/product/"):
@@ -476,7 +759,10 @@ class Handler(BaseHTTPRequestHandler):
                 except ValueError:
                     self._json({"error": "not a product id"}, 400)
                     return
-                with self._open() as conn:
+                with closing(self._open()) as conn:
+                    if not self._paying(conn):
+                        self._json(SUBSCRIPTION_REQUIRED, 402)
+                        return
                     found = product_page(
                         conn, product_id, read_variant(parsed.query)
                     )
@@ -484,11 +770,17 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if parsed.path == "/api/lookup":
                 wanted = (parse_qs(parsed.query).get("q", [""])[0] or "").strip()
-                with self._open() as conn:
+                with closing(self._open()) as conn:
+                    if not self._paying(conn):
+                        self._json(SUBSCRIPTION_REQUIRED, 402)
+                        return
                     self._json(lookup_page(conn, wanted))
                 return
             if parsed.path == "/api/offers":
-                with self._open() as conn:
+                with closing(self._open()) as conn:
+                    if not self._paying(conn):
+                        self._json(SUBSCRIPTION_REQUIRED, 402)
+                        return
                     self._json(shelf_page(conn, read_query(parsed.query)))
                 return
             if parsed.path == "/api/favorites":
@@ -499,7 +791,16 @@ class Handler(BaseHTTPRequestHandler):
                 if user_id is None:
                     self._json({"error": "not signed in"}, 401)
                     return
-                with self._open() as conn:
+                with closing(self._open()) as conn:
+                    # Gated like the shelf, because it *is* the shelf. A starred
+                    # row carries the title, the shop, the live price and the
+                    # discount — the same fields the card draws. Left on the
+                    # identity check alone, a reader who never paid could star
+                    # product ids in a loop and read the whole priced catalogue
+                    # back through here, past four 402s.
+                    if not self._paying(conn):
+                        self._json(SUBSCRIPTION_REQUIRED, 402)
+                        return
                     items = dbm.favorites_for(conn, user_id)
                 self._json({"user": user_id, "items": [favorite_json(i) for i in items]})
                 return
@@ -513,6 +814,13 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
         try:
+            if parsed.path == "/api/pitch":
+                who = self._reader()
+                if who is None:
+                    self._json({"error": "not signed in"}, 401)
+                    return
+                self._json({"sent": nudge_in_chat(self.bot_token, who)})
+                return
             if parsed.path != "/api/favorites":
                 self._json({"error": "not found"}, 404)
                 return
@@ -530,7 +838,14 @@ class Handler(BaseHTTPRequestHandler):
                 variant_id = int(payload["variant_id"])
             except (KeyError, TypeError, ValueError):
                 variant_id = None
-            with self._open_rw() as conn:
+            with closing(self._open_rw()) as conn, conn:
+                # Starring is a subscriber feature: `pipeline` only sends
+                # followed-price alerts to `subscribers()`, so a free reader
+                # gets nothing from a star except a row they could read a price
+                # out of. Removing one stays open — see do_DELETE.
+                if not self._paying(conn):
+                    self._json(SUBSCRIPTION_REQUIRED, 402)
+                    return
                 exists = conn.execute(
                     "SELECT 1 FROM products WHERE id = ?", (product_id,)
                 ).fetchone()
@@ -561,7 +876,11 @@ class Handler(BaseHTTPRequestHandler):
             if product_id is None:
                 self._json({"error": "not a product id"}, 400)
                 return
-            with self._open_rw() as conn:
+            # Deliberately not behind the paywall. Somebody whose subscription
+            # lapsed must still be able to take their own things off their own
+            # list, and un-starring reveals nothing: it reads no product row and
+            # answers with the id the caller already sent.
+            with closing(self._open_rw()) as conn, conn:
                 removed = dbm.remove_favorite(conn, user_id, product_id)
                 conn.commit()
             self._json({"product_id": product_id, "removed": removed})
@@ -577,12 +896,24 @@ def serve(
     port: int = 8000,
     bot_token: str | None = None,
     owner_id: int | None = None,
+    exempt_id: int | None = None,
+    subscription: bool = False,
 ) -> None:
-    """Run until interrupted."""
+    """Run until interrupted.
+
+    `owner_id` says who an unsigned request is, and only makes sense on
+    localhost. `exempt_id` says who never has to pay, and is safe anywhere
+    because it grants nothing on its own — the reader still has to prove they
+    are that person with Telegram's signature.
+    """
     handler = type(
         "BoundHandler",
         (Handler,),
-        {"db_path": Path(db_path), "bot_token": bot_token, "owner_id": owner_id},
+        {
+            "db_path": Path(db_path), "bot_token": bot_token,
+            "owner_id": owner_id, "exempt_id": exempt_id,
+            "subscription": subscription,
+        },
     )
     server = ThreadingHTTPServer((host, port), handler)
     log.info("shelf on http://%s:%d — Ctrl-C to stop", host, port)

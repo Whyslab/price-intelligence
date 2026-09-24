@@ -27,6 +27,7 @@ import html
 import json
 import logging
 import re
+from collections import Counter
 from urllib.parse import urljoin, urlparse
 
 import httpx
@@ -52,6 +53,8 @@ PER_HOST_CONCURRENCY = 4
 # crawled every hour for a week.
 NO_PRODUCT_URLS = "no product URLs in the sitemap or by crawling"
 NO_MARKUP = "no schema.org/Product markup found"
+# Not one product page answered 200: a wall or an outage, not a markup problem.
+PAGES_WOULD_NOT_LOAD = "product pages would not load"
 
 SITEMAP_CANDIDATES = ("/sitemap.xml", "/sitemap_index.xml", "/sitemap/products.xml")
 # robots.txt is where a site is supposed to declare its sitemap, and plenty put
@@ -279,6 +282,22 @@ def _offers_of(node: dict) -> tuple[list[ScrapedVariant], str] | None:
     return (found, currency) if currency else None
 
 
+# www.ssense.com writes its picture addresses as a template the page fills in
+# with script: `/images/__IMAGE_PARAMS__/…`. Taken as written, every one of its
+# 25,110 products had a picture that answered 404. These are the parameters its
+# own pages use.
+IMAGE_TEMPLATES = {"__IMAGE_PARAMS__": "b_white,g_center,f_auto,q_auto:best"}
+
+
+def resolve_image_template(image: str | None) -> str | None:
+    """An image address with any known page-side template filled in."""
+    if not image:
+        return image
+    for marker, value in IMAGE_TEMPLATES.items():
+        image = image.replace(marker, value)
+    return image
+
+
 def _image_of(node: dict, url: str) -> str | None:
     image = node.get("image")
     if isinstance(image, dict):
@@ -287,7 +306,9 @@ def _image_of(node: dict, url: str) -> str | None:
         image = next(
             (i if isinstance(i, str) else (i or {}).get("url") for i in image if i), None
         )
-    return urljoin(url, html.unescape(image).strip()) if isinstance(image, str) else None
+    if not isinstance(image, str):
+        return None
+    return resolve_image_template(urljoin(url, html.unescape(image).strip()))
 
 
 def _variants_of(node: dict) -> tuple[list[ScrapedVariant], str] | None:
@@ -376,7 +397,7 @@ def parse_product(page: str, url: str) -> tuple[ScrapedProduct, str] | None:
         product = ScrapedProduct(
             external_id=_text(node.get("productGroupID")) or sku or url,
             title=title,
-            url=_text(node.get("url")) or url,
+            url=_page_url(_text(node.get("url")), url),
             brand=_text(node.get("brand")),
             image_url=_image_of(node, url),
             category=_text(node.get("category")),
@@ -384,6 +405,20 @@ def parse_product(page: str, url: str) -> tuple[ScrapedProduct, str] | None:
         )
         return product, currency
     return None
+
+
+def _page_url(stated: str | None, page: str) -> str:
+    """The product's own address, resolved against the page it was read from.
+
+    Markup may give it relative — www.toddsnyder.com and www.43einhalb.com write
+    `/nl/p/…` — and 2,993 products were stored that way: a dead link on every
+    surface that did not resolve it again, and a Telegram button that sank the
+    whole message. Anything that is not a web address falls back to the page.
+    """
+    if not stated:
+        return page
+    resolved = urljoin(page, stated)
+    return resolved if urlparse(resolved).scheme in ("http", "https") else page
 
 
 def _looks_like_a_page(url: str) -> bool:
@@ -680,17 +715,30 @@ async def fetch(
         )
 
     start = cursor % len(urls)
-    window = (urls + urls)[start : start + budget]
+    # Never more than the catalogue: the window wraps around the end of the
+    # list, and with a budget larger than the shop every page was read twice
+    # in the same pass — twice the requests to a small shop for nothing.
+    window = (urls + urls)[start : start + min(budget, len(urls))]
     next_cursor = (start + len(window)) % len(urls)
 
     semaphore = asyncio.Semaphore(PER_HOST_CONCURRENCY)
     products: list[ScrapedProduct] = []
     currencies: dict[str, int] = {}
+    # How the pages answered, so a shop that stopped letting us in is not
+    # reported as a shop whose pages carry no prices: www.kickz.com said "no
+    # schema.org/Product markup" for three weeks, which is a different problem
+    # with a different fix.
+    answered: Counter[str] = Counter()
 
     async def one(url: str) -> None:
         async with semaphore:
-            resp = await _get(client, url)
-        if resp is None:
+            try:
+                resp = await client.get(url, follow_redirects=True)
+            except httpx.HTTPError as exc:
+                answered[type(exc).__name__] += 1
+                return
+        answered[f"HTTP {resp.status_code}"] += 1
+        if resp.status_code != 200:
             return
         parsed = parse_product(resp.text, url)
         if parsed is None:
@@ -705,11 +753,17 @@ async def fetch(
     await asyncio.gather(*(one(u) for u in window))
 
     if not products:
+        if not answered.get("HTTP 200"):
+            how = ", ".join(f"{what} ×{n}" for what, n in answered.most_common(3))
+            return FetchResult(
+                domain=domain, error=f"{PAGES_WOULD_NOT_LOAD} ({how})",
+                next_cursor=next_cursor,
+            )
         return FetchResult(
             domain=domain, error=NO_MARKUP, next_cursor=next_cursor
         )
 
-    dominant = currency or max(currencies, key=currencies.get)
+    dominant = currency or max(currencies, key=lambda code: currencies[code])
     return FetchResult(
         domain=domain, products=products, currency=dominant, next_cursor=next_cursor
     )

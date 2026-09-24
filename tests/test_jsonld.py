@@ -717,3 +717,81 @@ class TestAProductThatListsAnOfferPerSize:
                   offer(719.0, sku="b", size="EU 44")]
         product, _ = jsonld.parse_product(a_page(offers), "https://shop.example/p")
         assert [v.size for v in product.variants] == ["EU 42", "EU 44"]
+
+
+class TestAShopThatStoppedLettingUsIn:
+    """www.kickz.com was reported for three weeks as having "no schema.org/Product
+    markup", which sends whoever reads it to look at the parser. Its pages were
+    not loading at all — a different problem with a different fix."""
+
+    @staticmethod
+    def _sitemap():
+        respx.get("https://shop.example/robots.txt").mock(return_value=httpx.Response(404))
+        respx.get("https://shop.example/sitemap.xml").mock(
+            return_value=httpx.Response(
+                200,
+                text="""<urlset>
+                  <url><loc>https://shop.example/product/one.html</loc></url>
+                  <url><loc>https://shop.example/product/two.html</loc></url>
+                </urlset>""",
+            )
+        )
+        no_other_sitemaps()
+
+    @respx.mock
+    async def test_pages_that_will_not_load_are_called_that(self):
+        self._sitemap()
+        respx.get(url__regex=r"https://shop\.example/product/.*").mock(
+            return_value=httpx.Response(403)
+        )
+        async with httpx.AsyncClient() as client:
+            result = await jsonld.fetch(client, "shop.example")
+
+        assert result.error.startswith(jsonld.PAGES_WOULD_NOT_LOAD)
+        assert "HTTP 403 ×2" in result.error, "each page asked once, not twice"
+
+    @respx.mock
+    async def test_pages_that_load_without_prices_are_still_no_markup(self):
+        self._sitemap()
+        respx.get(url__regex=r"https://shop\.example/product/.*").mock(
+            return_value=httpx.Response(200, text="<html>no prices here</html>")
+        )
+        async with httpx.AsyncClient() as client:
+            result = await jsonld.fetch(client, "shop.example")
+
+        assert result.error == jsonld.NO_MARKUP
+
+
+def test_a_picture_address_written_as_a_template_is_filled_in():
+    """www.ssense.com's pages fill `__IMAGE_PARAMS__` in by script; taken as
+    written, all 25,110 of its pictures answered 404."""
+    page = """<script type="application/ld+json">{"@type": "Product",
+      "name": "Miniskirt", "sku": "232541F090003",
+      "image": "https://img.ssensemedia.com/images/__IMAGE_PARAMS__/232541F090003_1/skirt.jpg",
+      "offers": {"@type": "Offer", "price": "46", "priceCurrency": "USD",
+                 "availability": "https://schema.org/InStock"}}</script>"""
+    product, _ = jsonld.parse_product(page, "https://www.ssense.com/en-us/women/product/x/1")
+    assert product.image_url == (
+        "https://img.ssensemedia.com/images/b_white,g_center,f_auto,q_auto:best/"
+        "232541F090003_1/skirt.jpg"
+    )
+
+
+def test_a_relative_product_address_is_resolved_against_the_page():
+    """www.toddsnyder.com and www.43einhalb.com write `/nl/p/…`; 2,993 products
+    were stored that way and opened nothing."""
+    page = """<script type="application/ld+json">{"@type": "Product",
+      "name": "Laces", "sku": "194194", "url": "/es/p/43einhalb-laces-194194",
+      "offers": {"@type": "Offer", "price": "5", "priceCurrency": "EUR",
+                 "availability": "https://schema.org/InStock"}}</script>"""
+    product, _ = jsonld.parse_product(page, "https://www.43einhalb.com/es/p/laces")
+    assert product.url == "https://www.43einhalb.com/es/p/43einhalb-laces-194194"
+
+
+def test_a_product_address_that_is_not_a_web_page_falls_back_to_the_page():
+    page = """<script type="application/ld+json">{"@type": "Product",
+      "name": "Laces", "sku": "1", "url": "javascript:alert(1)",
+      "offers": {"@type": "Offer", "price": "5", "priceCurrency": "EUR",
+                 "availability": "https://schema.org/InStock"}}</script>"""
+    product, _ = jsonld.parse_product(page, "https://shop.example/p/laces")
+    assert product.url == "https://shop.example/p/laces"

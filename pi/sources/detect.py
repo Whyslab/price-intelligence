@@ -80,7 +80,9 @@ async def probe(
             body = resp.json()
             if isinstance(body, dict) and "products" in body:
                 out["platform"] = "shopify"
-                out["currency"] = await shopify.detect_currency(client, base, limiter)
+                out["currency"] = shopify.served_currency(resp) or (
+                    await shopify.detect_currency(client, base, limiter)
+                )
                 meta = await _meta(client, base)
                 out["name"] = meta.get("name")
                 out["country"] = meta.get("country")

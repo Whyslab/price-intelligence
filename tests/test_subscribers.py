@@ -6,12 +6,16 @@ because the first one never noticed.
 """
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from pi import db as dbm
 from pi import deals as dealm
 from pi import personal, pipeline
 from pi.config import Config, Filters
+
+from .conftest import ts
 
 OWNER_CHAT = "42"
 
@@ -28,6 +32,9 @@ def config(tmp_path) -> Config:
         shopify_host_rate=10_000.0,
         max_shopify_stores=0,
         log_level="WARNING",
+        # Selling is off by default (Config.subscription); these tests are
+        # about what happens when it is on, so they turn it on.
+        subscription=True,
         filters=Filters(min_discount_pct=30.0, min_saving_usd=40.0, min_score=50),
     )
 
@@ -58,9 +65,10 @@ class TestWhoTheRunWritesTo:
         assert readers[0].user_id == 0
         assert readers[0].reader.sizes == frozenset({"EU44"}), "filters.toml still counts"
 
-    def test_a_second_person_is_a_second_reader(self, conn):
+    def test_a_second_paying_person_is_a_second_reader(self, conn):
         dbm.upsert_bot_user(conn, 7, OWNER_CHAT, "owner", sizes="EU44")
         dbm.upsert_bot_user(conn, 9, "99", "someone", sizes="EU40")
+        dbm.grant(conn, 9, days=30)
 
         readers = personal.subscribers(conn, OWNER_CHAT, Filters())
 
@@ -80,6 +88,7 @@ class TestWhoTheRunWritesTo:
     def test_skipping_the_wizard_means_everything_not_nothing(self, conn):
         """Pressing /start and answering none of the questions is not unsubscribing."""
         dbm.upsert_bot_user(conn, 9, "99", "quiet")
+        dbm.grant(conn, 9, days=30)
 
         readers = personal.subscribers(conn, OWNER_CHAT, Filters())
 
@@ -88,6 +97,7 @@ class TestWhoTheRunWritesTo:
 
     def test_a_reader_who_blocked_the_bot_is_left_out(self, conn):
         dbm.upsert_bot_user(conn, 9, "99", "gone")
+        dbm.grant(conn, 9, days=30)
         personal.deactivate(conn, "99")
 
         assert "99" not in [r.chat_id for r in personal.subscribers(conn, OWNER_CHAT, Filters())]
@@ -95,6 +105,7 @@ class TestWhoTheRunWritesTo:
     def test_talking_to_the_bot_again_brings_them_back(self, conn):
         """The only evidence a chat reopened is the person turning up in it."""
         dbm.upsert_bot_user(conn, 9, "99", "gone")
+        dbm.grant(conn, 9, days=30)
         personal.deactivate(conn, "99")
 
         dbm.upsert_bot_user(conn, 9, "99", "back")
@@ -199,6 +210,29 @@ class TestArrangingOneReadersList:
         assert len(pipeline.arrange_for(
             conn, scored, config, market=None, fold_duplicates=False, kids=True
         )) == 1
+
+    def test_the_shelf_keeps_every_discounted_size_and_a_message_one(self, config, conn):
+        """The shelf is filtered by size against the variant on offer.
+
+        Holding only a product's best-scoring size made a shoe discounted in
+        EU44 invisible to somebody filtering for EU44 whenever EU42 had scored
+        a point higher. A message is different: one hoodie in six sizes is one
+        thing to hear about.
+        """
+        (deal, row), = self._scored(conn)
+        other_size = replace(deal, variant_id=deal.variant_id + 1000, score=deal.score - 1)
+        scored = [(deal, row), (other_size, row)]
+
+        shelf = pipeline.arrange_for(
+            conn, scored, config, market=None, cap_per_store=False,
+            fold_duplicates=False, skip_alerted=False, kids=True, per_product=False,
+        )
+        message = pipeline.arrange_for(
+            conn, scored, config, market=None, fold_duplicates=False
+        )
+
+        assert {d.variant_id for d, _ in shelf} == {deal.variant_id, other_size.variant_id}
+        assert [d.variant_id for d, _ in message] == [deal.variant_id]
 
     def test_an_article_asked_for_by_name_still_arrives(self, config, conn):
         """Naming an article is a clearer statement than a reading of a title."""
@@ -305,12 +339,18 @@ class TestFollowingAProduct:
     """
 
     @staticmethod
-    def _scored(conn, score: int = 20, price: float = 97.0) -> list:
-        """One deal nobody would be interrupted with: 20 points, well under the bar."""
+    def _scored(conn, score: int = 20, price: float = 97.0, gender: str = "men") -> list:
+        """One deal nobody would be interrupted with: 20 points, well under the bar.
+
+        `gender` defaults to what this shop stocks. Only the starred-thing test
+        wants women's, and it says so — a women's product is not carried at all
+        (pi.db.offers_for, pipeline.arrange_for), so leaving it as the fixture
+        default made every other test here depend on a rule none of them is about.
+        """
         product = a_product(conn)
         conn.execute(
-            "UPDATE products SET gender = 'women', kind = 'shoes', brand_family = 'Salomon'"
-            " WHERE id = ?", (product,),
+            "UPDATE products SET gender = ?, kind = 'shoes', brand_family = 'Salomon'"
+            " WHERE id = ?", (gender, product),
         )
         row = conn.execute(
             """
@@ -335,8 +375,8 @@ class TestFollowingAProduct:
         )
 
     def test_a_starred_thing_arrives_below_every_bar(self, config, conn):
-        """20 points against a bar of 50, and a gender the reader did not ask for."""
-        scored = self._scored(conn, score=20)
+        """20 points against a bar of 50, and a gender this shop does not stock."""
+        scored = self._scored(conn, score=20, gender="women")
         product = scored[0][0].product_id
 
         arrived = pipeline.arrange_for(
@@ -348,7 +388,7 @@ class TestFollowingAProduct:
         assert len(arrived) == 1
 
     def test_the_same_thing_does_not_reach_somebody_who_did_not_star_it(self, config, conn):
-        scored = self._scored(conn, score=20)
+        scored = self._scored(conn, score=20, gender="women")
 
         assert pipeline.arrange_for(
             conn, scored, config, market=None, user_id=9,
@@ -402,6 +442,51 @@ class TestFollowingAProduct:
             watched={product},
         ) == [], "1% is not news even about a thing somebody is waiting for"
 
+    def test_a_find_only_a_star_let_through_is_nobody_elses(self, config, conn):
+        """Review 24.09: one reader's star put a −3% price on the shelf everybody
+        reads. Scoring skips the bars for a followed product; the shelf and the
+        other readers' lists must not inherit that."""
+        scored = self._scored(conn, score=20)
+        scored[0][0].on_merit = False
+        product = scored[0][0].product_id
+
+        shelf = pipeline.arrange_for(
+            conn, scored, config, market=None, cap_per_store=False,
+            fold_duplicates=False, skip_alerted=False, kids=True, per_product=False,
+        )
+        mine = pipeline.arrange_for(
+            conn, scored, config, market=None, user_id=7, fold_duplicates=False,
+            watched={product},
+        )
+        theirs = pipeline.arrange_for(
+            conn, scored, config, market=None, user_id=9, fold_duplicates=False,
+            watched={12345},
+        )
+
+        assert shelf == [], "not on the shared shelf"
+        assert len(mine) == 1, "still the follower's"
+        assert theirs == []
+
+    def test_a_real_find_that_somebody_follows_is_still_everybodys(self, config, conn):
+        scored = self._scored(conn, score=90)
+        assert scored[0][0].on_merit
+
+        shelf = pipeline.arrange_for(
+            conn, scored, config, market=None, cap_per_store=False,
+            fold_duplicates=False, skip_alerted=False, kids=True, per_product=False,
+        )
+        assert len(shelf) == 1
+
+    def test_somebody_who_blocked_the_bot_follows_nothing(self, config, conn):
+        product = a_product(conn)
+        dbm.upsert_bot_user(conn, 7, "7", "reader")
+        dbm.upsert_bot_user(conn, 9, "9", "left")
+        dbm.add_favorite(conn, 7, product)
+        dbm.add_favorite(conn, 9, product)
+        personal.deactivate(conn, "9")
+
+        assert dbm.following(conn) == {7: {product}}
+
     def test_nobody_following_anything_changes_nothing(self, config, conn):
         scored = self._scored(conn, score=90)
 
@@ -409,3 +494,79 @@ class TestFollowingAProduct:
         assert len(pipeline.arrange_for(
             conn, scored, config, market=None, user_id=7, fold_duplicates=False,
         )) == 1
+
+
+class TestTheFeedIsWhatIsSold:
+    """A reader who has not paid hears from the digest, not from the run.
+
+    Every call here passes `subscription=True`: selling is off by default
+    (Config.subscription), and with it off there is no paid/free line to test.
+    """
+
+    def test_a_free_reader_with_a_full_profile_is_not_written_to(self, conn):
+        dbm.upsert_bot_user(conn, 9, "99", "browsing", sizes="EU40", brands="Nike")
+
+        readers = personal.subscribers(conn, OWNER_CHAT, Filters(), subscription=True)
+
+        assert "99" not in [r.chat_id for r in readers], (
+            "the feed is the thing being sold; a filled-in profile does not buy it"
+        )
+
+    def test_paying_puts_them_back(self, conn):
+        dbm.upsert_bot_user(conn, 9, "99", "paying", sizes="EU40")
+        dbm.grant(conn, 9, days=30)
+
+        assert "99" in [r.chat_id for r in personal.subscribers(conn, OWNER_CHAT, Filters(), subscription=True)]
+
+    def test_grace_keeps_the_feed_running(self, conn):
+        dbm.upsert_bot_user(conn, 9, "99", "lapsing", sizes="EU40")
+        dbm.grant(conn, 9, days=30)
+        conn.execute("UPDATE bot_users SET paid_until = ? WHERE id = 9", (ts(1),))
+
+        assert "99" in [r.chat_id for r in personal.subscribers(conn, OWNER_CHAT, Filters(), subscription=True)], (
+            "a failed renewal should cost a reminder, not the product"
+        )
+
+    def test_the_owner_never_has_to_pay(self, conn):
+        dbm.upsert_bot_user(conn, 7, OWNER_CHAT, "owner", sizes="EU44")
+
+        readers = personal.subscribers(conn, OWNER_CHAT, Filters(), subscription=True)
+
+        assert [r.chat_id for r in readers] == [OWNER_CHAT]
+
+
+class TestAFindFromAShopThatAskedNotToBeVisited:
+    async def test_is_not_confirmed_by_visiting_nor_sent_unconfirmed(self, conn, monkeypatch):
+        """Review 24.09: left out of the rows to confirm, its find read as "a
+        platform nobody can ask" and went out as it stood."""
+        product = a_product(conn)
+        conn.execute(
+            "UPDATE stores SET status = 'ok' WHERE domain = 'shop.example'"
+        )
+        (variant,) = conn.execute(
+            "SELECT id FROM variants WHERE product_id = ?", (product,)
+        ).fetchone()
+        conn.execute(
+            """
+            INSERT INTO offers (variant_id, product_id, found_at, checked_at, price_usd,
+                                reference_usd, reference_source, discount_pct, saving_usd,
+                                score, all_time_low)
+            VALUES (?, ?, ?, ?, 100, 200, 'market', 50, 100, 80, 0)
+            """,
+            (variant, product, dbm.utcnow(), dbm.utcnow()),
+        )
+        monkeypatch.setattr(dbm, "load_excluded", lambda: frozenset({"shop.example"}))
+
+        async def must_not_visit(*args):
+            raise AssertionError("an excluded shop was visited")
+
+        monkeypatch.setattr(pipeline, "_fetch_one", must_not_visit)
+        reader = personal.Subscriber(
+            user_id=7, chat_id="7", reader=personal.Reader(), label="r"
+        )
+        queues = [(reader, [(a_deal(product_id=product), {"product_id": product})])]
+
+        kept, report = await pipeline.confirm_before_announcing(conn, None, {}, None, queues)
+
+        assert kept == [], "nothing left to send"
+        assert report["dropped"] == 1

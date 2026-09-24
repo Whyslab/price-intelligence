@@ -83,19 +83,40 @@ class TestShelf:
         assert total == 1
         assert rows[0]["size_norm"] == "EU44"
 
-    def test_asking_for_women_excludes_the_unknown(self, conn):
+    def test_women_are_not_stocked_at_all(self, conn):
+        """Not a filter the reader turns off — this is a men's shop.
+
+        The row stays written, because it is still evidence about the price of
+        the same article elsewhere, and because a misreading nobody can see is a
+        misreading nobody can report. It is simply never shown.
+        """
         make_offer(conn, gender="women", title="Wmns")
         make_offer(conn, gender=None, title="Unsaid")
-        _, total = dbm.offers_for(conn, genders=["women"])
+        _, total = dbm.offers_for(conn)
+        assert total == 1
+        _, asked = dbm.offers_for(conn, genders=["women"])
+        assert asked == 0, "asking for women does not put them back"
+
+    def test_the_owner_can_still_see_them(self, conn):
+        """Otherwise a men's shoe read as women's is invisible and unfixable."""
+        make_offer(conn, gender="women", title="Wmns")
+        _, total = dbm.offers_for(conn, women=True)
         assert total == 1
 
-    def test_asking_for_men_lets_the_unknown_through(self, conn):
-        """87% of the catalogue never says, so excluding it would hide the shop."""
+    def test_asking_for_men_means_the_confirmed_ones(self, conn):
+        """Once women are out of the shop, "men" stops being protection from
+        them and starts being a preference: show me only what actually says so.
+
+        57% of the shelf says nothing, so this narrows hard on purpose — it is
+        the reader's choice, not the shop's boundary.
+        """
         make_offer(conn, gender="men", title="Mens")
         make_offer(conn, gender=None, title="Unsaid")
         make_offer(conn, gender="women", title="Wmns")
         _, total = dbm.offers_for(conn, genders=["men"])
-        assert total == 2
+        assert total == 1
+        _, everything = dbm.offers_for(conn)
+        assert everything == 2, "by default the unsaid are shown too"
 
     def test_a_brand_filter_matches_the_family(self, conn):
         """Asking for Nike finds a Jordan, which is the point of the family."""
@@ -228,6 +249,36 @@ class TestRouting:
         await robot.handle(self._message("/start"))
         buttons = calls[0][1]["reply_markup"]["inline_keyboard"][0]
         assert [b["callback_data"] for b in buttons] == ["wizard", "p:0"]
+
+    @staticmethod
+    def _shelf_buttons(calls) -> list[dict]:
+        rows = calls[0][1]["reply_markup"]["inline_keyboard"]
+        return [b for row in rows for b in row if "web_app" in b or "url" in b]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("private, sender, sees", [
+        (False, 7, True),    # an open shelf is everybody's
+        (True, 42, True),    # a private one is the owner's (TELEGRAM_CHAT_ID=42)
+        (True, 7, False),    # and nobody else gets a button that opens nothing
+    ])
+    async def test_who_is_offered_the_shelf(self, conn, tmp_path, monkeypatch, private, sender, sees):
+        from dataclasses import replace
+
+        config = replace(
+            self._config(tmp_path), web_url="https://shelf.example", web_private=private
+        )
+        robot = bot.Bot(config, conn)
+        calls = []
+
+        async def record(method, payload):
+            calls.append((method, payload))
+            return {"username": "test"}
+
+        monkeypatch.setattr(robot, "_call", record)
+        await robot.handle({"message": {
+            "chat": {"id": sender}, "from": {"id": sender, "username": "u"}, "text": "/start",
+        }})
+        assert bool(self._shelf_buttons(calls)) is sees
 
     @pytest.mark.asyncio
     async def test_the_list_button_sends_a_photo_for_every_offer(self, robot, calls, conn):
@@ -505,3 +556,195 @@ class TestCountingInRussian:
         assert say(11) == "11 магазинов", "the teens are the exception"
         assert say(21) == "21 магазин"
         assert say(112) == "112 магазинов"
+
+
+class TestStartingBeforeTheNetwork:
+    """The user manager starts the bot before DNS works, so the first getMe
+    failed and the journal said "bot @? is listening"."""
+
+    async def test_it_asks_again_until_telegram_answers(self, conn, tmp_path, monkeypatch, caplog):
+        import asyncio
+        import logging
+
+        instance = bot.Bot(TestRouting._config(tmp_path), conn)
+        asked: list[str] = []
+
+        async def answer(method, payload):
+            asked.append(method)
+            if method == "getMe":
+                return None if asked.count("getMe") < 3 else {"username": "pi_bot"}
+            raise asyncio.CancelledError  # stop at the first poll
+
+        async def no_wait(_seconds):
+            return None
+
+        monkeypatch.setattr(instance, "_call", answer)
+        monkeypatch.setattr(bot.asyncio, "sleep", no_wait)
+        caplog.set_level(logging.INFO, logger="pi.bot")
+
+        with pytest.raises(asyncio.CancelledError):
+            await instance.poll()
+
+        assert asked[:4] == ["getMe", "getMe", "getMe", "getUpdates"]
+        assert "@pi_bot is listening" in caplog.text
+        assert "@?" not in caplog.text
+
+
+class TestFollowingFromTheChat:
+    """The shelf's hearts need the mini-app, which only the owner can open (it is
+    reached through Tailscale). Following from the chat itself gives every
+    reader the thing the second customer segment pays for: a watch on one item."""
+
+    @staticmethod
+    def _stock(conn, domain, title, price, style=None, in_stock=True):
+        store = dbm.upsert_store(conn, domain, platform="shopify", currency="USD",
+                                 name=domain.split(".")[0])
+        product = dbm.upsert_product(conn, store, f"p-{domain}-{title}", title,
+                                     f"https://{domain}/products/x")
+        if style:
+            dbm.set_product_keys(conn, product, {("style", style)})
+        variant = dbm.upsert_variant(conn, product, f"v-{domain}")
+        dbm.record_price(conn, variant, price, None, in_stock, "USD", price, 1.0)
+        return product
+
+    @staticmethod
+    def _buttons(call) -> list[dict]:
+        return [b for row in call[1]["reply_markup"]["inline_keyboard"] for b in row]
+
+    @pytest.fixture
+    def robot(self, conn, tmp_path, calls, monkeypatch):
+        instance = bot.Bot(TestRouting._config(tmp_path), conn)
+
+        async def record(method, payload):
+            calls.append((method, payload))
+            return {"username": "test"}
+
+        monkeypatch.setattr(instance, "_call", record)
+        return instance
+
+    @pytest.fixture
+    def calls(self):
+        return []
+
+    @pytest.mark.asyncio
+    async def test_a_name_search_numbers_its_lines_and_offers_a_star_for_each(
+        self, robot, calls, conn
+    ):
+        first = self._stock(conn, "a.example", "Salomon XT-6 black", 150.0)
+        second = self._stock(conn, "b.example", "Salomon XT-6 white", 160.0)
+
+        await robot.handle(TestRouting._message("salomon xt-6"))
+
+        method, payload = calls[-1]
+        assert method == "sendMessage"
+        assert "1. " in payload["text"] and "2. " in payload["text"]
+        stars = [b["callback_data"] for b in self._buttons(calls[-1])]
+        assert stars == [f"fw:{first}", f"fw:{second}"]
+
+    @pytest.mark.asyncio
+    async def test_an_article_is_followed_in_every_shop_with_one_press(self, robot, calls, conn):
+        cheap = self._stock(conn, "a.example", "AF1", 90.0, style="CW2288-111")
+        dear = self._stock(conn, "b.example", "Air Force 1", 120.0, style="CW2288-111")
+
+        await robot.handle(TestRouting._message("CW2288-111"))
+        [star] = self._buttons(calls[-1])
+        assert star["callback_data"] == f"fwa:{cheap}"
+
+        await robot.handle(TestRouting._press(star["callback_data"]))
+
+        assert dbm.favorite_ids(conn, 7) == {cheap, dear}
+        assert "в 2 магазинах" in calls[-1][1]["text"]
+
+    @pytest.mark.asyncio
+    async def test_an_article_sold_out_everywhere_can_still_be_followed(self, robot, calls, conn):
+        """Review 24.09: it answered «Ничего не нашлось» with no star — for the
+        exact thing the second customer segment follows things for."""
+        first = self._stock(conn, "a.example", "AF1", 90.0, style="CW2288-111", in_stock=False)
+        second = self._stock(conn, "b.example", "Air Force 1", 120.0, style="CW2288-111",
+                             in_stock=False)
+
+        await robot.handle(TestRouting._message("CW2288-111"))
+
+        text = calls[-1][1]["text"]
+        assert "нет в наличии" in text and "Ничего не нашлось" not in text
+        assert "$90" in text, "with what it last cost"
+        [star] = self._buttons(calls[-1])
+        await robot.handle(TestRouting._press(star["callback_data"]))
+        assert dbm.favorite_ids(conn, 7) == {first, second}
+
+    @pytest.mark.asyncio
+    async def test_a_name_sold_out_everywhere_offers_a_star_per_thing(self, robot, calls, conn):
+        first = self._stock(conn, "a.example", "Salomon XT-6 black", 150.0, in_stock=False)
+
+        await robot.handle(TestRouting._message("salomon xt-6"))
+
+        assert "1. " in calls[-1][1]["text"]
+        assert [b["callback_data"] for b in self._buttons(calls[-1])] == [f"fw:{first}"]
+
+    @pytest.mark.asyncio
+    async def test_something_in_stock_is_answered_as_before(self, robot, calls, conn):
+        self._stock(conn, "a.example", "AF1", 90.0, style="CW2288-111", in_stock=False)
+        self._stock(conn, "b.example", "Air Force 1", 120.0, style="CW2288-111")
+
+        await robot.handle(TestRouting._message("CW2288-111"))
+
+        text = calls[-1][1]["text"]
+        assert "нет в наличии" not in text and "$120" in text and "$90" not in text
+
+    @pytest.mark.asyncio
+    async def test_following_has_a_ceiling(self, robot, calls, conn, monkeypatch):
+        """A crafted `fwa:` press adds a whole article's shops; nobody gets to
+        make every run score thousands of products on their behalf."""
+        monkeypatch.setattr(dbm, "MAX_FOLLOWED", 2)
+        first = self._stock(conn, "a.example", "One", 90.0)
+        second = self._stock(conn, "b.example", "Two", 90.0)
+        third = self._stock(conn, "c.example", "Three", 90.0)
+        for product in (first, second):
+            await robot.handle(TestRouting._press(f"fw:{product}"))
+
+        await robot.handle(TestRouting._press(f"fw:{third}"))
+
+        assert dbm.favorite_ids(conn, 7) == {first, second}
+        assert "/following" in calls[-1][1]["text"]
+        await robot.handle(TestRouting._press(f"fw:{first}"))
+        assert "уже следил" in calls[-1][1]["text"], "following one already followed is fine"
+
+    @pytest.mark.asyncio
+    async def test_the_list_shows_what_is_followed_and_a_cross_takes_it_off(
+        self, robot, calls, conn
+    ):
+        product = self._stock(conn, "a.example", "Salomon XT-6", 150.0)
+        await robot.handle(TestRouting._press(f"fw:{product}"))
+
+        await robot.handle(TestRouting._message("/following"))
+        method, payload = calls[-1]
+        assert "Salomon XT-6" in payload["text"]
+        [cross] = self._buttons(calls[-1])
+        assert cross["callback_data"] == f"uf:{product}"
+
+        await robot.handle(TestRouting._press(cross["callback_data"]))
+
+        assert dbm.favorite_ids(conn, 7) == set()
+        method, payload = calls[-1]
+        assert method == "editMessageText", "the list is redrawn in place"
+        assert "ни за чем не следите" in payload["text"]
+
+    @pytest.mark.asyncio
+    async def test_while_it_is_sold_a_free_reader_is_offered_the_subscription(
+        self, conn, tmp_path, calls, monkeypatch
+    ):
+        from dataclasses import replace
+
+        instance = bot.Bot(replace(TestRouting._config(tmp_path), subscription=True), conn)
+
+        async def record(method, payload):
+            calls.append((method, payload))
+            return {"username": "test"}
+
+        monkeypatch.setattr(instance, "_call", record)
+        product = self._stock(conn, "a.example", "Salomon XT-6", 150.0)
+
+        await instance.handle(TestRouting._press(f"fw:{product}"))
+
+        assert dbm.favorite_ids(conn, 7) == set()
+        assert any("подписк" in (p.get("text") or "").lower() for _, p in calls)

@@ -27,8 +27,13 @@ button,input,select{font:inherit;color:inherit}
 /* --- шапка --- */
 header{position:sticky;top:0;z-index:20;background:var(--bg);
        border-bottom:1px solid var(--line)}
-.bar{display:flex;gap:8px;align-items:center;padding:10px 12px;max-width:1400px;margin:0 auto}
-.field{flex:1 1 auto;position:relative;min-width:0}
+.bar{display:flex;gap:8px;align-items:center;padding:10px 12px;max-width:1400px;margin:0 auto;
+     flex-wrap:wrap}
+/* On a phone the search, the filter button, the sort and the count do not fit
+   on one line, and flexbox resolved that by crushing the search into a 40px
+   square. It takes the whole first row instead and the controls sit under it. */
+.field{flex:1 1 100%;position:relative;min-width:0;order:-1}
+@media (min-width:560px){ .field{flex:1 1 auto;order:0} }
 .field input{width:100%;background:var(--card);border:1px solid var(--line);
              border-radius:10px;padding:9px 32px 9px 12px}
 .field button{position:absolute;right:4px;top:50%;transform:translateY(-50%);
@@ -37,6 +42,9 @@ header{position:sticky;top:0;z-index:20;background:var(--bg);
 .tool{flex:0 0 auto;background:var(--card);border:1px solid var(--line);
       border-radius:10px;padding:9px 12px;cursor:pointer;white-space:nowrap}
 .tool[aria-expanded=true]{background:var(--ink);color:var(--bg);border-color:var(--ink)}
+/* Почему нет сердечек — только в обычном браузере, где об этом иначе не узнать. */
+.nofav{max-width:1400px;margin:0 auto;padding:0 12px 8px;font-size:12px;color:var(--dim)}
+.nofav code{font-size:11px}
 .tool .n{display:inline-block;min-width:18px;margin-left:5px;padding:0 5px;
          border-radius:9px;background:var(--hot);color:#fff;font-size:12px;text-align:center}
 /* display on the class would otherwise beat the hidden attribute, and the
@@ -82,25 +90,55 @@ select.tool{padding-right:8px}
 .more-link{border:none;background:none;color:var(--dim);font-size:12.5px;
            cursor:pointer;padding:5px 2px;text-decoration:underline}
 
-/* --- сетка --- */
-main{display:grid;gap:11px;padding:13px 12px 8px;max-width:1400px;margin:0 auto;
-     grid-template-columns:repeat(auto-fill,minmax(168px,1fr))}
-.card{background:var(--card);border:1px solid var(--line);border-radius:13px;
+/* --- сетка ---
+   Шире, чем было: на 168px карточка на ноутбуке выходила размером с иконку, а
+   вещь выбирают глазами. */
+/* 150px so a 390px phone gets two columns. At 206 it got one, and one card of
+   seven hundred pixels means one product per screenful — which is how a shelf
+   of five thousand things comes to feel empty. */
+main{display:grid;gap:10px;padding:12px 12px 8px;max-width:1400px;margin:0 auto;
+     grid-template-columns:repeat(auto-fill,minmax(150px,1fr))}
+@media (min-width:560px){ main{gap:16px;padding:16px 14px 8px;
+     grid-template-columns:repeat(auto-fill,minmax(206px,1fr))} }
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;
       overflow:hidden;display:flex;flex-direction:column;text-decoration:none;
-      color:inherit;transition:box-shadow .15s,transform .15s}
-.card:hover{box-shadow:var(--shadow);transform:translateY(-1px)}
-.thumb{aspect-ratio:1;background:var(--chip);position:relative}
-.thumb img{width:100%;height:100%;object-fit:cover;display:block}
-.badge{position:absolute;top:7px;left:7px;background:var(--hot);color:#fff;
-       border-radius:7px;padding:2px 7px;font-size:12px;font-weight:700}
-.low{position:absolute;top:32px;left:7px;background:var(--accent);color:#fff;
-     border-radius:7px;padding:2px 7px;font-size:11px;font-weight:700}
+      color:inherit;transition:box-shadow .18s,transform .18s,border-color .18s}
+.card:hover{box-shadow:var(--shadow);transform:translateY(-2px);border-color:var(--faint)}
+/* Портрет, а не квадрат: кроссовок и куртка снимаются вертикально, и квадрат
+   у них отрезает то носок, то капюшон. И `contain`, а не `cover` — магазины
+   снимают на белом, обрезка ради заполнения портит именно те кадры, которые
+   изначально были хорошими. */
+/* Square, not portrait. Portrait plus `contain` left a product shot swimming in
+   white — the photographs are not all the same shape, and the taller the box the
+   more of it is empty. */
+/* `min-height:0` и абсолютная картинка — иначе собственная высота фотографии
+   участвует в расчёте флекс-элемента и перебивает `aspect-ratio`: измерено,
+   превью выходили 248, 294 и 314 пикселей при ширине 236, и сетка ехала. */
+.thumb{aspect-ratio:1;background:#fff;position:relative;flex:0 0 auto;min-height:0}
+@media (prefers-color-scheme: dark){ .thumb{background:#17140f} }
+.thumb img{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;display:block}
+/* Бейдж скидки спокойный, без цвета. Сначала красным метились скидки от 50% —
+   и это была ошибка калибровки: правило подбиралось на полке, где лежали и
+   мелкие фальшивые уценки. Когда полка стала честной, на ней почти всё глубже
+   70%, и красным залило всё подряд — ровно то, от чего уходили.
+
+   Цвет остался за тем, что действительно редкость: зелёная метка «минимум»,
+   то есть цена ниже всего, что мы когда-либо видели у этого товара. */
+.badge{position:absolute;top:8px;left:8px;background:rgba(255,255,255,.92);
+       color:var(--ink);border-radius:8px;padding:3px 8px;font-size:12px;
+       font-weight:700;backdrop-filter:blur(4px);font-variant-numeric:tabular-nums}
+@media (prefers-color-scheme: dark){ .badge{background:rgba(28,25,23,.9);color:var(--ink)} }
+/* Внизу слева на картинке: верхний правый угол занят сердечком, и там они
+   перекрывали друг друга (замечено 18.09). */
+.low{position:absolute;bottom:8px;left:8px;background:var(--accent);color:#fff;
+     border-radius:8px;padding:3px 8px;font-size:11px;font-weight:700;
+     letter-spacing:.02em}
 /* Сама плитка — ссылка, и вкладывать в неё кнопку нельзя. Поэтому обёртка:
    карточка внутри, сердечко рядом, поверх угла картинки. */
 .wrap{position:relative;display:flex}
 .wrap > .card{flex:1;min-width:0}
 /* Сердечко — единственная кнопка на витрине, которая что-то записывает.
-   Внизу справа, чтобы не спорить с «минимумом» в верхнем углу. */
+   Вверху справа; «минимум» для этого живёт внизу слева. */
 .heart{position:absolute;top:6px;right:6px;width:30px;height:30px;border:none;
   border-radius:50%;background:rgba(255,255,255,.82);color:#57534e;font-size:15px;
   line-height:30px;padding:0;cursor:pointer;backdrop-filter:blur(3px)}
@@ -114,18 +152,35 @@ main{display:grid;gap:11px;padding:13px 12px 8px;max-width:1400px;margin:0 auto;
 .heart-inline{border:1px solid var(--line);background:var(--chip);border-radius:8px;
   padding:3px 9px;font-size:13px;cursor:pointer;white-space:nowrap}
 .heart-inline.on{background:var(--hot);border-color:var(--hot);color:#fff}
-.body{padding:9px 10px 11px;display:flex;flex-direction:column;gap:3px;flex:1}
-.brand{font-size:10.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--faint)}
-.name{font-size:13px;line-height:1.32;display:-webkit-box;-webkit-line-clamp:2;
-      -webkit-box-orient:vertical;overflow:hidden}
-.prices{display:flex;gap:6px;align-items:baseline;margin-top:auto;padding-top:6px}
-.now{font-weight:700}
-.then{color:var(--faint);text-decoration:line-through;font-size:12px}
-.meta{display:flex;justify-content:space-between;gap:6px;font-size:11px;color:var(--dim)}
+.body{padding:11px 12px 13px;display:flex;flex-direction:column;gap:4px;flex:1}
+.brand{font-size:10.5px;text-transform:uppercase;letter-spacing:.07em;
+       font-weight:600;color:var(--dim)}
+.name{font-size:13.5px;line-height:1.34;display:-webkit-box;-webkit-line-clamp:2;
+      -webkit-box-orient:vertical;overflow:hidden;color:var(--dim)}
+/* Цена — то, ради чего сюда пришли, и раньше она была набрана тем же кеглем,
+   что и всё остальное. Табличные цифры, чтобы колонка цен читалась колонкой. */
+.prices{display:flex;gap:7px;align-items:baseline;flex-wrap:wrap;
+        margin-top:auto;padding-top:8px;font-variant-numeric:tabular-nums}
+.now{font-size:17px;font-weight:700;letter-spacing:-.01em}
+.then{color:var(--faint);text-decoration:line-through;font-size:12.5px}
+/* Сэкономленное — самый убедительный аргумент на карточке, и он стоял внизу
+   самым мелким шрифтом. Теперь рядом с ценой. */
+.save{margin-left:auto;font-size:12px;font-weight:600;color:var(--accent);
+      white-space:nowrap}
+.meta{display:flex;justify-content:space-between;gap:6px;font-size:11px;
+      color:var(--faint);padding-top:2px}
 .stale{color:var(--hot)}
 #more{display:block;margin:14px auto 44px;padding:11px 28px;background:var(--card);
       border:1px solid var(--line);border-radius:11px;cursor:pointer}
 .empty{padding:56px 16px;text-align:center;color:var(--dim);grid-column:1/-1;line-height:1.7}
+/* Пейвол рисуется этой же страницей: решить, показывать ли его, можно только
+   там, где есть подпись Telegram, а она приезжает во фрагменте адреса. */
+.locked{grid-column:1/-1;max-width:34rem;margin:40px auto;padding:0 4px;line-height:1.6}
+.locked h2{font-size:1.35rem;margin:0 0 .5rem}
+.locked p{color:var(--dim);margin:.6rem 0}
+.locked b{color:var(--ink)}
+.locked button{margin-top:18px;width:100%;padding:13px;border:none;border-radius:11px;
+  background:var(--ink);color:var(--bg);font-weight:600;cursor:pointer}
 /* Полка — это то, что подешевело. Каталог — всё, что вообще есть. Второй
    вопрос задают редко, поэтому он строкой, а не второй строкой поиска. */
 #whole{max-width:1400px;margin:0 auto;padding:8px 12px 0}
@@ -154,6 +209,13 @@ td.p{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
 tr.us td{font-weight:700}
 tr.cheap td.p{color:var(--accent);font-weight:600}
 .sizes{display:flex;flex-wrap:wrap;gap:5px;margin:11px 0 4px}
+/* История цены: ступеньки, как цена и менялась, в валюте магазина. */
+.hist{margin:12px 0 4px}
+.hist-head{font-size:12px;color:var(--dim);margin-bottom:4px}
+.hist svg{width:100%;height:88px;display:block;color:var(--accent);
+  background:var(--chip);border-radius:10px}
+.hist-foot{display:flex;justify-content:space-between;gap:8px;font-size:11px;
+  color:var(--faint);margin-top:3px;font-variant-numeric:tabular-nums}
 .sz{border:1px solid var(--line);border-radius:7px;padding:3px 9px;font-size:12px}
 .sz.out{opacity:.32;text-decoration:line-through}
 .go{display:block;text-align:center;margin-top:15px;padding:12px;border-radius:11px;
@@ -180,6 +242,8 @@ tr.cheap td.p{color:var(--accent);font-weight:600}
     </select>
     <span class="count" id="count"></span>
   </div>
+  <p class="nofav" id="nofav" hidden>Сердечек нет: страница не знает, кто смотрит. Они есть в
+    Telegram и при запуске <code>pi web --owner &lt;ваш Telegram id&gt;</code>.</p>
   <div class="active" id="active"></div>
   <div class="panel" id="panel"><div class="inner">
     <div class="group">
@@ -191,7 +255,8 @@ tr.cheap td.p{color:var(--accent);font-weight:600}
         <span id="prange"></span>
       </div>
     </div>
-    <div class="group"><h3>Скидка не меньше</h3><div class="chips" id="f-disc"></div></div>
+    <div class="group"><h3>Скидка не меньше</h3><div class="chips" id="f-disc"></div>
+      <div class="chips" id="f-evidence"></div></div>
     <div class="group"><h3>Что</h3><div class="chips" id="f-kind"></div></div>
     <div class="group"><h3>Кому</h3><div class="chips" id="f-gender"></div>
       <div class="chips" id="f-kids"></div></div>
@@ -231,6 +296,9 @@ const plural = (n, one, few, many) => {
   const t = Math.abs(n) % 100, u = t % 10;
   return n + " " + (t > 10 && t < 20 ? many : u === 1 ? one : u > 1 && u < 5 ? few : many);
 };
+// The server already refuses anything that is not a web page; this is the
+// second lock, because a card's link is written by a shop, not by us.
+const safe = u => /^https?:\/\//i.test(String(u ?? "")) ? u : "#";
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c =>
   ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 
@@ -241,6 +309,51 @@ const tg_headers = () => {
   const d = window.Telegram?.WebApp?.initData;
   return d ? {"X-Telegram-Init-Data": d} : {};
 };
+
+/* Читать подписывается ровно так же, как писать. Подпись раньше уходила только
+   с избранным, а полка — то, что продаётся, — запрашивалась анонимно и получала
+   402. Снаружи это выглядело как «подписка есть, а полка закрыта». */
+const LOCKED = Symbol("нужна подписка");
+async function api(url){
+  const r = await fetch(url, {headers: tg_headers()});
+  if (r.status === 402) return LOCKED;
+  if (!r.ok) throw new Error(url + " → " + r.status);
+  return r.json();
+}
+
+/* Пейвол живёт здесь, а не на отдельной странице, потому что решить, показывать
+   ли его, можно только там, где есть подпись, — а подпись Telegram приезжает во
+   фрагменте адреса, которого браузер серверу не отправляет. */
+function show_paywall(){
+  document.querySelector("header").hidden = true;
+  el("more").hidden = true;
+  el("grid").innerHTML = `<div class="locked">
+    <h2>💎 Полка открывается по подписке</h2>
+    <p>Это всё, что подешевело прямо сейчас: поиск по размеру и марке,
+       сравнение цены между магазинами и цена на руках — с доставкой и пошлиной.</p>
+    <p><b>150 звёзд в месяц</b> или 1500 за год — два месяца в подарок.</p>
+    <button id="back">Вернуться в бота и оформить</button>
+  </div>`;
+  el("back").onclick = async () => {
+    /* Кнопка обещает «вернуться в бота и оформить», а раньше только закрывала
+     * окно: человек оказывался в чате, где ничего не происходило. Теперь
+     * сначала просим бота положить туда предложение, и только потом уходим —
+     * иначе возвращаться не к чему. */
+    const b = el("back");
+    b.disabled = true;
+    const was = b.textContent;
+    b.textContent = "Открываю…";
+    try {
+      await fetch("/api/pitch", { method: "POST", headers: tg_headers() });
+    } catch (e) {
+      /* Не дозвонились — всё равно закрываем: держать человека в тупике хуже,
+       * чем вернуть его в чат без сообщения. */
+    }
+    b.textContent = was;
+    const tg = window.Telegram?.WebApp;
+    if (tg?.close) tg.close(); else history.back();
+  };
+}
 
 function announce(user, ids){
   me = user;
@@ -258,7 +371,13 @@ async function identity(){
   if (me === null){
     let r;
     try { r = await fetch("/api/favorites", {headers: tg_headers()}); } catch { return; }
-    if (!r.ok) return;
+    if (!r.ok){
+      // 13.09 сердечки «пропали» у того, кто открыл полку командой без
+      // --owner, — и страница никак не сказала почему. Внутри Telegram
+      // подсказка не нужна: там это отказ, а не забытый ключ.
+      if (r.status === 401 && !window.Telegram?.WebApp?.initData) el("nofav").hidden = false;
+      return;
+    }
     const d = await r.json();
     announce(d.user, d.items.map(i => i.id));
     // Лист, открытый по ссылке из бота, успел нарисоваться без сердечка.
@@ -334,6 +453,7 @@ async function toggle_star(id, variant, button){
 
 const state = {kind:new Set(), gender:new Set(), size:new Set(), brand:new Set(),
                q:"", min_price:"", max_price:"", min_discount:"", kids:false,
+               all_discounts:false,
                sort:"score", page:0, view:"shelf"};
 let facets = null, expanded = {size:false, brand:false};
 // Кто смотрит. null — никто: страница открыта не из Telegram и без --owner,
@@ -356,6 +476,7 @@ function save(){
       kind:[...state.kind], gender:[...state.gender], size:[...state.size],
       brand:[...state.brand], min_price:state.min_price, max_price:state.max_price,
       min_discount:state.min_discount, kids:state.kids, sort:state.sort,
+      all_discounts:state.all_discounts,
     }));
   } catch {}
 }
@@ -368,6 +489,7 @@ function restore(){
     for (const k of ["min_price","max_price","min_discount","sort"])
       if (s[k] != null) state[k] = s[k];
     state.kids = Boolean(s.kids);
+    state.all_discounts = Boolean(s.all_discounts);
     return true;
   } catch { return false; }
 }
@@ -375,7 +497,8 @@ function restore(){
 function count_active(){
   return state.kind.size + state.gender.size + state.size.size + state.brand.size
        + (state.min_price ? 1 : 0) + (state.max_price ? 1 : 0)
-       + (state.min_discount ? 1 : 0) + (state.kids ? 1 : 0);
+       + (state.min_discount ? 1 : 0) + (state.kids ? 1 : 0)
+       + (state.all_discounts ? 1 : 0);
 }
 
 function toggle(name, value){
@@ -418,6 +541,25 @@ function discount_chips(){
 
 /* Детское скрыто по умолчанию: на полке его 447 из 33 738, и это не то, за чем
    сюда приходят. Но кнопка есть — иначе ошибку классификатора никто не увидит. */
+/* Полка показывает только те скидки, за которые ручается кто-то кроме продавца:
+   минимум за всё время наблюдения или цена в других магазинах на тот же артикул.
+   Из 26 013 карточек, которые она могла бы нарисовать, 20 908 держатся на одной
+   лишь зачёркнутой цене магазина — а это единственное число, которое магазин
+   пишет о себе сам, и ровно то, что пересказывает любой канал скидок.
+
+   Переключатель, а не запрет: тому, кто ищет конкретную вещь, слабое
+   свидетельство тоже нужно — помеченное как слабое. */
+function evidence_chip(){
+  const box = el("f-evidence");
+  box.innerHTML = "";
+  const b = document.createElement("button");
+  b.className = "chip"; b.type = "button";
+  b.setAttribute("aria-pressed", String(state.all_discounts));
+  b.textContent = "Все скидки, включая ценник магазина";
+  b.onclick = () => { state.all_discounts = !state.all_discounts; reload(); };
+  box.append(b);
+}
+
 function kids_chip(){
   const box = el("f-kids");
   box.innerHTML = "";
@@ -495,11 +637,26 @@ function freshness(iso){
   return {text:Math.floor(d) + " дн. назад", stale:d >= 4};
 }
 
+/* Одна карточка на товар, когда все его размеры стоят одинаково — иначе
+   полка трижды подряд показывает те же кроссовки. Но тогда имя одного размера
+   на карточке читается как «только этот и остался», поэтому вместо него
+   говорится, сколько их. Когда цена по размерам разная, карточки не
+   схлопываются вовсе и здесь по-прежнему стоит имя размера: цена на карточке
+   обязана быть ценой того размера, который на ней написан. */
+function sizes_label(o){
+  const n = o.sizes_on_offer || 1;
+  if (n < 2) return o.size || "";
+  const word = n % 10 === 1 && n % 100 !== 11 ? "размер"
+             : [2,3,4].includes(n % 10) && ![12,13,14].includes(n % 100) ? "размера"
+             : "размеров";
+  return `${n} ${word}`;
+}
+
 function card(o){
   const wrap = document.createElement("div");
   wrap.className = "wrap";
   const a = document.createElement("a");
-  a.className = "card"; a.href = o.url; a.target = "_blank"; a.rel = "noopener";
+  a.className = "card"; a.href = safe(o.url); a.target = "_blank"; a.rel = "noopener";
   // The link is real, so middle-click and "open in new tab" still work; the
   // click is intercepted only to show what everyone else charges first.
   a.onclick = e => { e.preventDefault(); open_sheet(o.id, o.variant); };
@@ -514,10 +671,10 @@ function card(o){
       <div class="brand">${esc(o.brand || o.shop)}</div>
       <div class="name">${esc(o.title)}</div>
       <div class="prices"><span class="now">${money(o.price)}</span>
-        <span class="then">${money(o.was)}</span></div>
-      <div class="meta"><span>${esc(o.size || "—")}</span><span>${esc(o.shop)}</span></div>
-      <div class="meta"><span class="${f.stale ? "stale" : ""}">${f.text}</span>
-        <span>−${money(o.saving)}</span></div>
+        <span class="then">${money(o.was)}</span>
+        <span class="save">−${money(o.saving)}</span></div>
+      <div class="meta"><span>${[sizes_label(o), o.shop].filter(Boolean).map(esc).join(" · ")}</span>
+        <span class="${f.stale ? "stale" : ""}">${f.text}</span></div>
     </div>`;
   wrap.append(a);
   wrap.append(heart_button(o.id, o.variant));
@@ -533,7 +690,7 @@ function fav_card(o){
   const wrap = document.createElement("div");
   wrap.className = "wrap";
   const a = document.createElement("a");
-  a.className = "card"; a.href = o.url; a.target = "_blank"; a.rel = "noopener";
+  a.className = "card"; a.href = safe(o.url); a.target = "_blank"; a.rel = "noopener";
   a.onclick = e => { e.preventDefault(); open_sheet(o.id, o.variant); };
   const f = freshness(o.checked_at);
   const move = (o.price != null && o.since) ? o.price - o.since : null;
@@ -600,7 +757,9 @@ function render(data, append){
 
 async function load(append){
   if (!append) el("grid").innerHTML = `<div class="skeleton">Ищу…</div>`;
-  render(await (await fetch("/api/offers?" + params())).json(), append);
+  const data = await api("/api/offers?" + params());
+  if (data === LOCKED) return show_paywall();
+  render(data, append);
 }
 
 function draw_mine(){
@@ -622,9 +781,9 @@ function reload(){
   }
   if (facets && facets_kids !== state.kids){
     save();
-    fetch("/api/facets" + (state.kids ? "?kids=1" : ""))
-      .then(r => r.json())
-      .then(f => { facets = f; facets_kids = state.kids; reload(); });
+    api("/api/facets" + (state.kids ? "?kids=1" : ""))
+      .then(f => { if (f === LOCKED) return show_paywall();
+                   facets = f; facets_kids = state.kids; reload(); });
     return;
   }
   if (facets){
@@ -635,6 +794,7 @@ function reload(){
     chips("f-gender", "gender", facets.genders, v => GENDER_RU[v] || v, facets.mine?.genders);
     discount_chips();
     kids_chip();
+    evidence_chip();
   }
   draw_whole();
   save();
@@ -649,14 +809,56 @@ function shop_row(o, mine, cheap){
           <td class="p">${money(o.price)}</td></tr>`;
 }
 
+// Цена в валюте магазина: так её и назначали, а доллары рисуют ступеньки,
+// которые сделал курс, а не магазин.
+const native = (n, cur) => {
+  try {
+    return new Intl.NumberFormat("ru-RU", {style: "currency", currency: cur,
+      maximumFractionDigits: n < 100 ? 2 : 0}).format(n);
+  } catch { return `${Math.round(n)} ${cur}`; }
+};
+const day = t => new Date(t).toLocaleDateString("ru-RU", {day: "numeric", month: "short"});
+
+function price_chart(h){
+  const pts = (h && h.points) || [];
+  if (!pts.length) return "";
+  const cur = h.currency;
+  if (pts.length === 1)
+    return `<div class="hist"><div class="hist-head">Цена не менялась с ${day(pts[0].t)}
+            — ${native(pts[0].p, cur)}</div></div>`;
+  const W = 320, H = 88, pad = 8;
+  const ts = pts.map(x => Date.parse(x.t)), ps = pts.map(x => x.p);
+  const t0 = ts[0], t1 = Math.max(Date.now(), ts[ts.length - 1]);
+  const lo = Math.min(...ps), hi = Math.max(...ps);
+  const X = t => (pad + (W - 2 * pad) * (t - t0) / Math.max(1, t1 - t0)).toFixed(1);
+  const Y = p => (hi === lo ? H / 2 : pad + (H - 2 * pad) * (hi - p) / (hi - lo)).toFixed(1);
+  let d = `M${X(ts[0])},${Y(ps[0])}`;
+  for (let i = 1; i < pts.length; i++) d += ` H${X(ts[i])} V${Y(ps[i])}`;
+  d += ` H${X(t1)}`;
+  const gone = pts.filter(x => !x.in_stock).map(x =>
+    `<circle cx="${X(Date.parse(x.t))}" cy="${Y(x.p)}" r="3" fill="var(--faint)"/>`).join("");
+  return `<div class="hist">
+    <div class="hist-head">История цены · ${esc(cur)} · ${plural(pts.length, "изменение", "изменения", "изменений")}</div>
+    <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img"
+         aria-label="Цена от ${native(lo, cur)} до ${native(hi, cur)}">
+      <path d="${d}" fill="none" stroke="currentColor" stroke-width="2"
+            vector-effect="non-scaling-stroke"/>${gone}
+    </svg>
+    <div class="hist-foot"><span>${day(t0)}</span>
+      <span>мин ${native(lo, cur)} · макс ${native(hi, cur)}</span><span>сейчас</span></div>
+  </div>`;
+}
+
 async function open_sheet(id, variant){
   reopen = () => open_sheet(id, variant);
   const d = el("sheet");
   el("sheet-body").innerHTML = "<p style='color:var(--dim)'>Смотрю, у кого ещё это есть…</p>";
   if (!d.open) d.showModal();
-  const r = await fetch("/api/product/" + id + (variant ? "?variant=" + variant : ""));
-  if (!r.ok){ el("sheet-body").innerHTML = "<p>Это предложение уже сняли с полки.</p>"; return; }
-  const {ours, sizes, elsewhere, cheapest_elsewhere: cheap} = await r.json();
+  let got;
+  try { got = await api("/api/product/" + id + (variant ? "?variant=" + variant : "")); }
+  catch { el("sheet-body").innerHTML = "<p>Это предложение уже сняли с полки.</p>"; return; }
+  if (got === LOCKED){ d.close(); return show_paywall(); }
+  const {ours, sizes, elsewhere, cheapest_elsewhere: cheap} = got;
 
   let verdict;
   if (!elsewhere.length)
@@ -692,12 +894,13 @@ async function open_sheet(id, variant){
       </div>
     </div>
     ${verdict}
+    ${price_chart(got.history)}
     ${have.length || gone.length ? `<div class="sizes">
       ${have.map(s => `<span class="sz">${esc(s.size)}</span>`).join("")}
       ${gone.map(s => `<span class="sz out">${esc(s.size)}</span>`).join("")}
     </div>` : ""}
     ${elsewhere.length ? `<table>${all.map(o => shop_row(o, ours, cheap)).join("")}</table>` : ""}
-    <a class="go" href="${esc(ours.url)}" target="_blank" rel="noopener">Открыть в ${esc(ours.shop)}</a>`;
+    <a class="go" href="${esc(safe(ours.url))}" target="_blank" rel="noopener">Открыть в ${esc(ours.shop)}</a>`;
   wire_hearts(el("sheet-body"));
 }
 
@@ -719,8 +922,8 @@ async function open_lookup(query){
   const d = el("sheet");
   el("sheet-body").innerHTML = "<p style='color:var(--dim)'>Смотрю по всем магазинам…</p>";
   if (!d.open) d.showModal();
-  const r = await fetch("/api/lookup?q=" + encodeURIComponent(query));
-  const f = await r.json();
+  const f = await api("/api/lookup?q=" + encodeURIComponent(query));
+  if (f === LOCKED){ d.close(); return show_paywall(); }
 
   if (!f.shops.length){
     el("sheet-body").innerHTML = `<h2>«${esc(query)}»</h2>
@@ -748,7 +951,7 @@ async function open_lookup(query){
       <td>${f.same_thing ? "" : esc(String(o.title).slice(0, 46))}</td>
       <td style="text-align:right">${money(o.price)}${
         o.discount_pct ? ` <span class="badge" style="position:static">−${Math.round(o.discount_pct)}%</span>` : ""}</td>
-      <td><a href="${esc(o.url)}" target="_blank" rel="noopener">открыть</a></td>
+      <td><a href="${esc(safe(o.url))}" target="_blank" rel="noopener">открыть</a></td>
       ${me === null ? "" : `<td>${heart_inline(o.product_id, null)}</td>`}
     </tr>`).join("");
 
@@ -851,13 +1054,15 @@ for (const [id, key] of [["pmin","min_price"], ["pmax","max_price"]]){
     chips("f-gender", "gender", facets.genders, v => GENDER_RU[v] || v, facets.mine?.genders);
     discount_chips();
     kids_chip();
+    evidence_chip();
     draw_whole();
     render(seed.offers, false);
     if (state.view === "fav") reload();
   } else if (seed){
     ready(seed.facets);
   } else {
-    fetch("/api/facets" + (state.kids ? "?kids=1" : "")).then(r => r.json()).then(ready);
+    api("/api/facets" + (state.kids ? "?kids=1" : ""))
+      .then(f => f === LOCKED ? show_paywall() : ready(f));
   }
 })();
 </script>

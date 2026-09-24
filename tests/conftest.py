@@ -5,12 +5,49 @@ import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import httpx
 import pytest
+import respx
 
 from pi import db as dbm
 from pi.config import Filters
+from pi.sources import shopify
 
 FIXTURES = Path(__file__).parent / "fixtures"
+
+
+def end_of_catalogue(base: str = "https://shop.example", page: int = 2):
+    """The empty pages a Shopify catalogue ends with.
+
+    A short page is not the end — Shopify filters a page after cutting it, so
+    one comes back short in the middle of a catalogue — and the walk only stops
+    when a page lists nothing. When products the shop was selling have not come
+    up by then, it asks up to shopify.GAP_PAGES further, so those are empty
+    too, as every page past the end of a real catalogue is. A test that mocks
+    one of these pages itself afterwards replaces it: respx keeps one route per
+    pattern.
+    """
+    for later in range(page + shopify.GAP_PAGES, page, -1):
+        respx.get(f"{base}/products.json?limit=250&page={later}").mock(
+            return_value=httpx.Response(200, json={"products": []})
+        )
+    return respx.get(f"{base}/products.json?limit=250&page={page}").mock(
+        return_value=httpx.Response(200, json={"products": []})
+    )
+
+
+def numbered_products(payload: dict, page: int, count: int = 250) -> dict:
+    """A catalogue page of `count` products shaped like the fixture's, with ids
+    and handles no other page uses — a real shop never repeats a product on
+    two pages, and a walk now stops at a page that lists nothing new."""
+    template = payload["products"]
+    out = []
+    for n in range(count):
+        product = json.loads(json.dumps(template[n % len(template)]))
+        product["id"] = page * 1_000_000 + n
+        product["handle"] = f"p{page}-{n}"
+        out.append(product)
+    return {"products": out}
 
 
 @pytest.fixture
@@ -61,3 +98,19 @@ def make_history(
             (ts(days_ago), price, compare, money, price, compare),
         )
     return scratch.execute("SELECT * FROM p ORDER BY ts").fetchall()
+
+
+@pytest.fixture(autouse=True)
+def _shopify_unstated_currency_keeps_the_record(request, monkeypatch):
+    """Most tests stand in a shop that names no currency, and are about
+    something else. Asking /meta.json again would be a request they never
+    mocked, so they keep the recorded currency; tests of that very path mark
+    themselves `asks_meta` and get the real thing."""
+    if request.node.get_closest_marker("asks_meta"):
+        return
+    from pi.sources import shopify
+
+    async def keep(client, base, limiter, recorded):
+        return recorded
+
+    monkeypatch.setattr(shopify, "currency_when_unstated", keep)

@@ -27,7 +27,12 @@ CREATE TABLE IF NOT EXISTS stores (
     -- fingerprint. Measured on the 25 shops that reply 403 to us: nine answer
     -- 200 that way and three of those go on to yield products. See
     -- pi.sources.impersonate.
-    impersonate   INTEGER NOT NULL DEFAULT 0
+    impersonate   INTEGER NOT NULL DEFAULT 0,
+    -- The last full read that claimed a large part of this shop had gone and
+    -- was not believed, as "<when> · <how many> of <how many>". Shown in the
+    -- daily summary; cleared by the next read that withdraws normally. See
+    -- pipeline.withdraw_missing.
+    withdrawal_held TEXT
 );
 
 CREATE TABLE IF NOT EXISTS products (
@@ -58,6 +63,12 @@ CREATE TABLE IF NOT EXISTS products (
     -- Cleared the moment the product turns up again: catalogues hiccup, and one
     -- absence is not a verdict.
     missing_since TEXT,
+    -- When a catalogue read or a product's own page last listed it. What a card
+    -- means by «проверено»: the shop's last read is not it, because a large shop
+    -- is read a slice at a time and a product outside the slice was not looked
+    -- at. Kept per product so the shelf can leave out what nobody has seen for a
+    -- week (db.STALE_PRODUCT_DAYS) instead of calling it confirmed today.
+    last_seen     TEXT,
     UNIQUE (store_id, external_id)
 );
 CREATE INDEX IF NOT EXISTS ix_products_brand ON products(brand);
@@ -157,7 +168,13 @@ CREATE TABLE IF NOT EXISTS offers (
     discount_pct     REAL    NOT NULL,
     saving_usd       REAL    NOT NULL,
     score            INTEGER NOT NULL,
-    all_time_low     INTEGER NOT NULL DEFAULT 0
+    all_time_low     INTEGER NOT NULL DEFAULT 0,
+    -- When a one-by-one check last tried this card, answered or not. The queue
+    -- is ordered by the later of this and checked_at, so a card whose page
+    -- will not load goes to the back instead of holding the front for ever:
+    -- 34 kickz.com cards did exactly that for three weeks, taking 45 of every
+    -- 60 checks. Never shown: it says we asked, not that the shop answered.
+    tried_at         TEXT
 );
 CREATE INDEX IF NOT EXISTS ix_offers_score ON offers(score DESC);
 CREATE INDEX IF NOT EXISTS ix_offers_product ON offers(product_id);
@@ -189,7 +206,34 @@ CREATE TABLE IF NOT EXISTS bot_users (
     -- spends a request and a second of its notification budget on somebody who
     -- left, and the log fills with a failure nobody can act on. Talking to the
     -- bot again sets it back.
-    active      INTEGER NOT NULL DEFAULT 1
+    active      INTEGER NOT NULL DEFAULT 1,
+    -- What this reader paid for. 'free' sees two finds a day and nothing else;
+    -- 'paid' sees the shelf, the search and their own feed.
+    --
+    -- The state is `paid_until`, not this column: a plan with a date in the
+    -- past is not a subscription, and asking "which plan?" without asking
+    -- "until when?" is how a lapsed reader keeps everything forever. Nothing
+    -- outside pi.db.is_subscribed is allowed to answer the question.
+    plan        TEXT    NOT NULL DEFAULT 'free',
+    paid_until  TEXT,
+    -- When they first paid, kept across lapses. A reader who leaves and comes
+    -- back is not a new reader, and the difference is worth knowing before
+    -- deciding what a subscriber is worth.
+    plan_since  TEXT,
+    -- Stars received from this reader, ever. Cumulative on purpose: refunding
+    -- the last month should not erase that the year before was paid for.
+    stars_paid  INTEGER NOT NULL DEFAULT 0,
+    -- Telegram's id for the most recent charge, whichever plan it was. Required
+    -- to refund it, and a refund is the one thing that cannot be done from any
+    -- other record.
+    charge_id   TEXT,
+    -- The charge that renews itself, which is not always the most recent one. A
+    -- monthly subscriber who then buys a year makes a second, one-off payment;
+    -- cancelling against that id asks Telegram to stop a subscription that the
+    -- id does not name, Telegram refuses, and the reader is told the bot cannot
+    -- help while the monthly charge keeps firing. Kept apart so /cancel always
+    -- names the thing that is actually recurring.
+    sub_charge_id TEXT
 );
 
 -- What one reader asked to be told about, whatever the thresholds say.
@@ -219,6 +263,12 @@ CREATE TABLE IF NOT EXISTS favorites (
     added_at       TEXT    NOT NULL,
     notify         INTEGER NOT NULL DEFAULT 1,
     last_price_usd REAL,
+    -- When this reader was last told it came back in stock, and when they were
+    -- told the shop stopped selling it. The first keeps a size that flickers in
+    -- and out of stock from arriving hourly; the second is compared with the
+    -- product's missing_since, so each disappearance is reported once.
+    restock_notified_at TEXT,
+    gone_notified_at    TEXT,
     PRIMARY KEY (user_id, product_id)
 );
 -- Read once per run, to collect everything anybody follows.

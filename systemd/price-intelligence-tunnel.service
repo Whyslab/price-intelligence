@@ -1,0 +1,23 @@
+# NOT ENABLED, and not to be started while the shelf is reached through
+# `tailscale serve --https=10000` (since 18.09.2026): scripts/tunnel.sh rewrites
+# PI_WEB_URL in .env to a temporary trycloudflare address and restarts the bot.
+# Kept for the day the shelf needs a public address; install-units.sh skips it.
+[Unit]
+Description=Price Intelligence — temporary https tunnel for the shelf
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Projects/price-intelligence
+ExecStart=%h/Projects/price-intelligence/scripts/tunnel.sh
+Restart=on-failure
+RestartSec=30
+
+# Not hardened the way the collector's units are: this one edits .env and asks
+# systemd to restart the bot, so it needs the home directory writable and a
+# path to the user bus.
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

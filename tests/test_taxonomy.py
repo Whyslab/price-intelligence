@@ -1,6 +1,8 @@
 """Brand, gender, kind and audience: what the shops did not tell us."""
 from __future__ import annotations
 
+from typing import ClassVar
+
 import pytest
 
 from pi import db as dbm
@@ -256,3 +258,92 @@ class TestItalianSizing:
     def test_half_sizes_rule_it_out(self):
         sizes = ["EU44", "EU44.5", "EU46", "EU48"]
         assert taxonomy.kind("Runner", None, sizes) == "shoes"
+
+
+class TestTheBrandTheShopWroteInTheTitle:
+    """`canonical_brand` reads the vendor field and nothing else. 166,948
+    products name no brand there, 10,151 of them standing on the shelf — dropped
+    by `require_brand` before they can be a find, and invisible to the rule that
+    refuses to call two products the same article when their brands differ."""
+
+    INDEX: ClassVar[dict[str, str]] = {
+        "nike": "Nike", "adidas": "adidas", "newbalance": "New Balance",
+        "thenorthface": "The North Face", "balmain": "Balmain",
+        "vintage": "Vintage",
+    }
+
+    def test_the_brand_at_the_front_is_taken(self):
+        assert taxonomy.brand_from_title("Nike Air Max 90", self.INDEX)[0] == "Nike"
+
+    def test_the_longest_name_wins(self):
+        """"New" is a brand nowhere; "New Balance" is one."""
+        assert (
+            taxonomy.brand_from_title("New Balance 991v2 Made in UK", self.INDEX)[0]
+            == "New Balance"
+        )
+
+    def test_a_word_that_merely_starts_like_a_brand_is_not_one(self):
+        """Folding drops spaces, so a folded-prefix test would read this as Nike."""
+        assert taxonomy.brand_from_title("Nikelodeon Slime Tee", self.INDEX) == (None, None)
+
+    def test_a_condition_is_not_a_maker(self):
+        """Enough shops write "Vintage" in the vendor field that the index
+        promotes it, and then a Balmain blazer becomes a Vintage."""
+        brand, _ = taxonomy.brand_from_title(
+            "Vintage Balmain Paris Wool Blazer", self.INDEX
+        )
+        assert brand == "Balmain"
+        assert taxonomy.canonical_brand("Vintage", self.INDEX) == (None, None)
+
+    def test_the_words_shops_put_before_a_brand_are_stepped_over(self):
+        brand, _ = taxonomy.brand_from_title(
+            "PRE OWNED adidas Yeezy Boost 700", self.INDEX
+        )
+        assert brand == "adidas"
+
+    def test_a_brand_named_only_in_the_middle_is_not_taken(self):
+        """7,260 of these titles name two brands — a collaboration, where the
+        second name is not the maker. Only the front is read."""
+        assert taxonomy.brand_from_title(
+            "Limited Edt GEL-Kayano 14 x Nike", self.INDEX
+        ) == (None, None)
+
+    def test_nothing_is_a_real_answer(self):
+        assert taxonomy.brand_from_title("Some Unknown Thing", self.INDEX) == (None, None)
+        assert taxonomy.brand_from_title(None, self.INDEX) == (None, None)
+
+
+class TestTheWaysAShopSaysWomensWithoutTheWord:
+    """Measured against the 18,083 shelf products the word-based rules leave
+    unlabelled: a trailing W reaches 90 of them and a named garment 318. Small —
+    about 2% — and clean, which is the only reason they are worth having."""
+
+    def test_the_trailing_w_is_the_womens_cut_of_a_model(self):
+        """adidas, Asics, On and Nike all write it this way."""
+        assert taxonomy.gender("Superstar II W") == "women"
+        assert taxonomy.gender("Gazelle Bold W") == "women"
+        assert taxonomy.gender("Gel-1090 W") == "women"
+
+    def test_a_lone_w_in_the_middle_is_not_read(self):
+        """There it is an initial or a size, not a cut."""
+        assert taxonomy.gender("W. Simmons Tee") is None
+        assert taxonomy.gender("Samba OG") is None
+
+    def test_a_named_garment_counts(self):
+        assert taxonomy.gender("Monogram Spaghetti Mini Dress") == "women"
+        assert taxonomy.gender("SANDALI ELEVATED ELEFTHERIA") == "women"
+        assert taxonomy.gender("BORSA FLECA NOBUCK") == "women"
+
+    def test_dress_as_a_colour_is_not_a_dress(self):
+        """The false class here was not "dress shirt", which does not occur in
+        these titles at all, but "Dress Blues" — a colour, on a DC sweatshirt."""
+        assert taxonomy.gender("DC Cooper 1/4 Zip Sweat - Dress Blues") is None
+        assert taxonomy.gender("Vans DNA Branding Sweatshirt - Dress Blues") is None
+
+    def test_dress_as_an_adjective_is_not_one_either(self):
+        assert taxonomy.gender("Brooks Brothers Dress Shirt") is None
+        assert taxonomy.gender("Leather Dress Shoes") is None
+
+    def test_the_word_still_wins_when_it_is_there(self):
+        assert taxonomy.gender("Nike Women's Air Footscape") == "women"
+        assert taxonomy.gender("Herren Jacke") == "men"

@@ -34,7 +34,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 from .config import Filters
-from .reference import MAX_DROP, Market, Trust, prior_floor
+from .reference import MAX_DROP, MAX_SPREAD, Market, Trust, prior_floor
 
 # How much of the reference window has to be covered by observations before the
 # floor it produces is worth believing. A "30-day low" drawn from two days of
@@ -93,6 +93,10 @@ class Deal:
     # say, because the point of watching one is not to be told only about the
     # big drops.
     watched: bool = False
+    # Whether it clears the thresholds without that. A find scored only because
+    # somebody follows it is theirs: it must not reach the shared shelf or
+    # anybody else's feed (pipeline.arrange_for).
+    on_merit: bool = True
 
     @property
     def bucket(self) -> int:
@@ -182,7 +186,8 @@ def evaluate(
     """
     if not in_stock or price_usd <= 0 or not history:
         return None
-    if not watched and not (filters.min_price_usd <= price_usd <= filters.max_price_usd):
+    in_range = filters.min_price_usd <= price_usd <= filters.max_price_usd
+    if not watched and not in_range:
         return None
     market = market or Market()
     trust = trust or Trust()
@@ -203,6 +208,19 @@ def evaluate(
     msrp_native = to_native(market.msrp_usd) if market.has_msrp(filters.msrp_min_shops) else None
     low_native = to_native(market.low_usd) if market.priced(filters.market_min_shops) else None
 
+    # The rule agreeing_prices keeps between other shops, kept against this one
+    # too: prices more than MAX_SPREAD apart describe different things. Before
+    # it, the top of the shelf was allikestore.com's "Sean Wotherspoon" at
+    # $55.98 — 95% below the $1,100 resale shops ask — and a run of the same:
+    # a placeholder price, a child's size, a different item under one SKU. A
+    # real clearance does not undercut every other seller four times over.
+    # Their struck-through prices go with them: the recommended price is read
+    # from the same shops' tags, so it is a claim about the same other thing
+    # (review 24.09: $180 across three of them made a $55.98 find −69%).
+    unrelated = market_native is not None and market_native > price_native * MAX_SPREAD
+    if unrelated:
+        market_native = low_native = msrp_native = None
+
     # Veto: whatever it is marked down from, a price above what other shops are
     # asking for the same article is not a discount.
     if market_native is not None and price_native > market_native + 0.005:
@@ -219,6 +237,12 @@ def evaluate(
     tag_native = (
         compare_native if compare_native and not rule_priced and not inflated_tag else None
     )
+    if unrelated:
+        # With the market judged a different thing there is nothing left to
+        # hold the shop's own tag against: the inflated-tag test needs the
+        # recommended price just dropped. Only the shop's history may speak
+        # (review 24.09: $55.98 "was $300" made −81%, score 100).
+        tag_native = None
 
     floor = prior_floor(history, filters.reference_window_days)
     if floor is not None and floor.covered_days < MIN_HISTORY_DAYS:
@@ -250,9 +274,10 @@ def evaluate(
 
     discount_pct = (reference_native - price_native) / reference_native * 100
     saving_usd = round((reference_native - price_native) / fx_rate, 2)
-    if not watched and (
-        discount_pct < filters.min_discount_pct or saving_usd < filters.min_saving_usd
-    ):
+    big_enough = (
+        discount_pct >= filters.min_discount_pct and saving_usd >= filters.min_saving_usd
+    )
+    if not watched and not big_enough:
         return None
 
     past = [r["price_native"] for r in history[:-1] if r["currency"] == current["currency"]]
@@ -276,7 +301,8 @@ def evaluate(
     if rule_priced:
         score -= 20         # so is every other "was" price in this shop
     score = int(max(0, min(100, round(score))))
-    if not watched and score < filters.min_score:
+    good_enough = score >= filters.min_score
+    if not watched and not good_enough:
         return None
 
     return Deal(
@@ -292,15 +318,17 @@ def evaluate(
         fake_sale=fake_sale,
         dropped_hours_ago=_dropped_hours_ago(history, price_native),
         history_points=len(history),
-        market_shops=market.shops,
-        market_median_usd=market.median_usd,
+        # Not shown as the market's view either, when it was about something else.
+        market_shops=0 if unrelated else market.shops,
+        market_median_usd=None if unrelated else market.median_usd,
         beats_market=beats_market,
-        msrp_usd=market.msrp_usd if market.has_msrp(filters.msrp_min_shops) else None,
-        msrp_shops=market.msrp_shops if market.has_msrp(filters.msrp_min_shops) else 0,
+        msrp_usd=market.msrp_usd if msrp_native is not None else None,
+        msrp_shops=market.msrp_shops if msrp_native is not None else 0,
         inflated_tag=inflated_tag,
         blanket_pct=trust.blanket_pct if rule_priced else None,
         rule_priced=rule_priced,
         watched=watched,
+        on_merit=in_range and big_enough and good_enough,
     )
 
 

@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections.abc import Collection
 from urllib.parse import urlparse
 
 import httpx
@@ -43,6 +44,38 @@ _CURRENCY_META = re.compile(
     re.IGNORECASE,
 )
 _LINK_NEXT = re.compile(r'<([^>]+)>\s*;\s*rel="next"')
+_CART_CURRENCY = re.compile(r"(?:^|[;,\s])cart_currency=([A-Za-z]{3})(?:[;,\s]|$)")
+
+
+def served_currency(resp: httpx.Response) -> str | None:
+    """The currency this particular answer is priced in, as the shop said so.
+
+    With Shopify Markets on, /products.json is not quoted in the shop's base
+    currency but in the one it chose for the visitor, and it names that choice
+    in the `cart_currency` cookie of the very same answer — or, once the cookie
+    is held, in the one the request carried back. Measured on 18.09.2026 from
+    Norway: www.stadiumgoods.com states USD in /meta.json and served NOK, and
+    seven other shops did the same, so from 2 September their kroner went into
+    the database as dollars — a 1,095 kr Air Force 1 shown at $1095. The same
+    cookie says GBP at www.slamcity.com, whose prices really are pounds, so
+    trusting the answer over /meta.json keeps that fix without the damage.
+    """
+    # The last statement wins: a redirect may set the cookie on the way in,
+    # and a later answer that sets it again has changed its mind.
+    stated = None
+    for answer in (*resp.history, resp):
+        for value in answer.headers.get_list("set-cookie"):
+            for found in _CART_CURRENCY.finditer(value):
+                stated = found.group(1).upper()
+    if stated:
+        return stated
+    try:
+        sent = resp.request.headers.get("cookie", "")
+    except RuntimeError:  # a response built by hand has no request behind it
+        return None
+    found = _CART_CURRENCY.search(sent)
+    return found.group(1).upper() if found else None
+
 
 # Used only when the storefront gives nothing away.
 _COUNTRY_CURRENCY = {
@@ -60,10 +93,14 @@ _COUNTRY_CURRENCY = {
 async def detect_currency(
     client: httpx.AsyncClient, base: str, limiter: RateLimiter | NullLimiter | None = None
 ) -> str | None:
-    """Which currency /products.json is denominated in.
+    """Which currency /products.json is denominated in, before it has answered.
+
+    Only the first guess: a Markets shop may quote the visitor's currency
+    instead, and then the answer itself says so — see `served_currency`, which
+    wins over this whenever the shop names one.
 
     `/meta.json` is asked first because it is the shop's own statement of its
-    base currency, and that is what /products.json quotes. The storefront names
+    base currency, and that is what /products.json quotes otherwise. The storefront names
     something else: with Shopify Markets on, `Shopify.currency.active` is the
     currency chosen for *this visitor*, converted from the base for display, and
     which one that is depends on where the request appeared to come from.
@@ -109,6 +146,14 @@ async def detect_currency(
     except httpx.HTTPError as exc:
         log.debug("%s: storefront unreadable for currency (%s)", base, exc)
     return None
+
+
+async def currency_when_unstated(
+    client: httpx.AsyncClient, base: str, limiter: RateLimiter | NullLimiter,
+    recorded: str | None,
+) -> str | None:
+    """The shop's own statement, for an answer that named no currency at all."""
+    return await detect_currency(client, base, limiter) or recorded
 
 
 async def _get_page(
@@ -221,16 +266,27 @@ def _option_slots(raw: dict) -> tuple[int, int]:
     return size, colour
 
 
+def _listed_id(raw) -> str:
+    """How a page names one of its products, whether or not it parses."""
+    if isinstance(raw, dict):
+        return str(raw.get("id") or raw.get("handle") or "")
+    return ""
+
+
 def parse_products(payload: dict, base: str) -> list[ScrapedProduct]:
     """Turn one /products.json body into our own shapes. Pure — no I/O, easy to test."""
     out: list[ScrapedProduct] = []
     for raw in payload.get("products") or []:
+        if not isinstance(raw, dict):
+            continue
         handle = raw.get("handle") or ""
         variants: list[ScrapedVariant] = []
         image = None
         size_slot, colour_slot = _option_slots(raw)
         options = ("option1", "option2", "option3")
         for rv in raw.get("variants") or []:
+            if not isinstance(rv, dict):
+                continue
             price = _money(rv.get("price"))
             if price is None:
                 continue
@@ -310,13 +366,38 @@ async def fetch_product(
         payload = resp.json()
     except ValueError:
         return "unreachable", None
+    if not isinstance(payload, dict):
+        # `[]` or `null` with a 200: not an answer about this product either way.
+        return "unreachable", None
     raw = payload.get("product")
     if not isinstance(raw, dict):
         return "unreachable", None
     parsed = parse_products({"products": [raw]}, base)
+    if parsed:
+        # The single-product form names its currency on every variant; the
+        # cookie is the same statement, kept for an answer that leaves it out.
+        stated = next(
+            (str(v.get("price_currency") or "") for v in raw.get("variants") or []
+             if isinstance(v, dict) and v.get("price_currency")),
+            "",
+        ).strip().upper()
+        parsed[0].currency = (
+            stated if len(stated) == 3 and stated.isalpha() else served_currency(resp)
+        )
     # Still published, but with nothing left that has a price: no variant can be
     # bought, which is the same thing as gone as far as a shelf is concerned.
     return ("ok", parsed[0]) if parsed else ("gone", None)
+
+
+# The furthest `?page=` Shopify will answer, given the page size above: it caps
+# `page * limit` at 25,000 and returns HTTP 400 past it.
+SHOPIFY_PAGE_WINDOW = 25_000
+LAST_PAGE = SHOPIFY_PAGE_WINDOW // PAGE_SIZE
+
+# How many empty pages in a row a pass from the beginning looks past while
+# products the shop was selling have not come up yet. A gap is a run of 250
+# products this visitor may not buy; two such pages in a row are 500.
+GAP_PAGES = 2
 
 
 async def fetch(
@@ -326,6 +407,7 @@ async def fetch(
     max_pages: int = MAX_PAGES,
     limiter: RateLimiter | NullLimiter | None = None,
     cursor: int = 0,
+    known: Collection[str] | None = None,
 ) -> FetchResult:
     """Read a slice of a Shopify catalogue, paginating with ?page=N.
 
@@ -333,6 +415,10 @@ async def fetch(
     `next_cursor` where to carry on, so a catalogue larger than one pass — or a
     pass that Shopify cut short — is finished by the following run instead of
     being quietly truncated to whatever arrived first.
+
+    `known` is the ids of the products the database holds as on sale here. A
+    pass from the beginning that meets an empty page while some of them are
+    still unlisted asks one page further before calling it the end (see below).
     """
     limiter = limiter or NullLimiter()
     # Waits out a suspected block rather than giving up on the spot. A store
@@ -351,15 +437,45 @@ async def fetch(
 
     products: list[ScrapedProduct] = []
     seen_ids: set[str] = set()
+    # Ids as the pages listed them, before parsing drops the unpriced: a page
+    # of products that all fail to parse is still a page of the catalogue.
+    listed_ids: set[str] = set()
+    followed_link = previous_full = False
+    empties = 0  # empty pages in a row
     page_number = max(1, cursor)
+    # Shopify refuses `page * limit` beyond 25,000 — the 101st page of 250
+    # answers HTTP 400 "Page * Limit exceeds the 25000 limit" — and a cursor
+    # that walked into that wall used to stay there. Five shops stopped being
+    # read on 1-2 September and 9,535 of their cards aged on the shelf until
+    # somebody asked why a fifth of it was three weeks old. The catalogue is
+    # read in slices across runs; after the last slice it starts again.
+    if page_number > LAST_PAGE:
+        page_number = 1
     url = f"{base}/products.json?limit={PAGE_SIZE}"
     if page_number > 1:
         url += f"&page={page_number}"
     exhausted = False
+    read = 0
 
-    for _ in range(max_pages):
+    def past_the_end() -> FetchResult:
+        # A page past an empty one that does not answer as a page: the pass
+        # read what there was up to the empty page and cannot say whether the
+        # catalogue ends there. Nothing is claimed, and the next pass starts at
+        # the beginning — left pointing past the end, the cursor failed every
+        # run after it (www.natterjacks.com, stuck at page 3 from 15.09).
+        log.info("%s: the page after an empty one did not answer; starting over next run",
+                 domain)
+        return FetchResult(domain=domain, products=products, currency=currency)
+
+    # The pages looked at past an empty one do not count against max_pages: a
+    # pass meeting its first empty page on the last page it may read would
+    # otherwise never finish looking, and never withdraw anything again.
+    while read < max_pages or empties:
+        read += 1
         resp = await _get_page(client, url, limiter, domain)
         if resp is None:
+            if empties:
+                return past_the_end()
             if not products:
                 return FetchResult(
                     domain=domain, currency=currency,
@@ -369,14 +485,33 @@ async def fetch(
         try:
             payload = resp.json()
         except ValueError:
+            if empties:
+                return past_the_end()
             break
         if not isinstance(payload, dict) or "products" not in payload:
+            if empties:
+                return past_the_end()
+            if products:
+                break  # pages already read are still a result; resume from here
             return FetchResult(domain=domain, currency=currency, error="not a Shopify catalogue")
 
         raw = payload.get("products") or []
+        served = served_currency(resp)
+        if served is None and not products:
+            # The record may be a cookie from another day and another address:
+            # a collector that moves country and meets a shop which no longer
+            # says what it serves would otherwise store dollars as kroner, ten
+            # times too cheap and every one of them a "deal". Only the first
+            # page asks — later ones are the same answer, and a client that
+            # keeps its cookies to itself (curl_cffi) names nothing after it.
+            served = await currency_when_unstated(client, base, limiter, currency)
+        if served and served != currency:
+            log.info("%s: priced in %s, not the %s on record", domain, served, currency)
+            currency = served
         for product in parse_products(payload, base):
             if product.external_id not in seen_ids:
                 seen_ids.add(product.external_id)
+                product.currency = served
                 products.append(product)
 
         # The storefront endpoint paginates with ?page=N and sends no Link header —
@@ -385,13 +520,62 @@ async def fetch(
         # so it is consulted before the short-page rule.
         link = _LINK_NEXT.search(resp.headers.get("Link", ""))
         if link:
+            followed_link = True
             page_number += 1
             url = link.group(1)
             continue
-        if len(raw) < PAGE_SIZE:
+        if followed_link:
+            # A walk the shop led by Link headers ends where the links end; its
+            # page numbers mean nothing to ?page=, and asking one anyway could
+            # leave a cursor pointing at a page that will never answer.
             exhausted = True
-            break  # a short page is the last page
+            break
+        # Only an empty page ends the catalogue. A short one does not: Shopify
+        # cuts the page first and removes what this visitor may not buy
+        # afterwards, so a page comes back short in the middle of the list.
+        # Measured on 23.09.2026: shop.simon.com answered 245 products on page
+        # one and 250 on page two, www.sneakersnstuff.com 221 and then 227.
+        # Reading the short page as the last one told the run it had seen the
+        # whole shop, and 76,062 of shop.simon.com's products — and 23,955 of
+        # italist's, 4,182 of Sneakersnstuff's — were marked as withdrawn while
+        # every one of them was still for sale. The price of knowing is one
+        # empty page per finished pass.
+        fresh = {_listed_id(item) for item in raw} - listed_ids
+        listed_ids |= fresh
+        if raw and not fresh:
+            # A page of nothing new: a storefront ignoring ?page=, or the list
+            # shifting under the walk. Neither says the catalogue ended, so the
+            # pass stops without claiming it read everything.
+            break
+        if not raw:
+            empties += 1
+            unlisted = cursor <= 1 and known is not None and any(
+                product_id not in listed_ids for product_id in known
+            )
+            # An empty page is either the end of the catalogue or a page whose
+            # every product this visitor may not buy — 250 in a row filtered
+            # out after the cut. After a full page either is as likely: one
+            # more page tells which. After a short one it is usually the end,
+            # and asking every time would cost a request per pass; but while
+            # products the shop was selling have not come up, calling it the
+            # end marks them withdrawn — www.italist.com on 24.09.2026 ended
+            # on an empty page after 2,841 of its 44,342 products. Then up to
+            # GAP_PAGES are asked, so a gap of two filtered pages is read past.
+            allowed = GAP_PAGES if unlisted else 1 if previous_full else 0
+            if empties <= allowed:
+                page_number += 1
+                if page_number > LAST_PAGE:
+                    break
+                url = f"{base}/products.json?limit={PAGE_SIZE}&page={page_number}"
+                continue
+            exhausted = True
+            break
+        previous_full, empties = len(raw) >= PAGE_SIZE, 0
         page_number += 1
+        if page_number > LAST_PAGE:
+            # Past the window Shopify answers at all. Asking anyway costs a
+            # request and returns HTTP 400; the next pass starts again at one.
+            break
         url = f"{base}/products.json?limit={PAGE_SIZE}&page={page_number}"
 
     if exhausted:

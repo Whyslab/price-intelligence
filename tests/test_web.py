@@ -15,6 +15,9 @@ from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
+import httpx
+import respx
+
 from pi import db as dbm
 from pi import web
 
@@ -435,11 +438,14 @@ def _offer(conn, store_id, key, price, discount, score=None):
         INSERT INTO offers (variant_id, product_id, found_at, checked_at,
                             price_usd, reference_usd, reference_source,
                             discount_pct, saving_usd, score, all_time_low)
-        VALUES (?, ?, ?, ?, ?, ?, 'tag', ?, ?, ?, 0)
+        VALUES (?, ?, ?, ?, ?, ?, 'market', ?, ?, ?, 0)
         """,
         (variant, product, ts(1), ts(0), price, price * 2, discount, price,
          score if score is not None else discount),
     )
+    # 'market' and not 'tag': the shelf shows only discounts somebody other than
+    # the seller vouches for, and these tests are about the order of what it
+    # shows, not about which evidence gets in.
 
 
 class TestWhoseFindGoesFirst:
@@ -528,7 +534,16 @@ class TestStarringSomethingOverHttp:
     @staticmethod
     @contextmanager
     def _serving(conn, **attrs):
+        """A server with the paywall **on**.
+
+        It ships off (Config.subscription), because nothing is being sold yet.
+        These tests are about what the paywall does when it is switched on, so
+        they switch it on rather than assert the default — otherwise the rules
+        that guard the thing being sold would quietly stop being tested the day
+        selling was paused.
+        """
         path = Path(conn.execute("PRAGMA database_list").fetchone()[2])
+        attrs = {"subscription": True, **attrs}
         handler = type("Bound", (web.Handler,), {"db_path": path, **attrs})
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         # A short poll, or every one of these tests spends half a second in
@@ -588,6 +603,8 @@ class TestStarringSomethingOverHttp:
 
     def test_telegram_says_who_it_is_and_the_star_is_saved(self, conn):
         product, variant = self._a_product(conn)
+        dbm.upsert_bot_user(conn, 7, "7")
+        dbm.grant(conn, 7, days=30)
         with self._serving(conn, bot_token=TOKEN) as base:
             code, body = self._call(
                 f"{base}/api/favorites", "POST",
@@ -601,6 +618,7 @@ class TestStarringSomethingOverHttp:
     def test_the_owner_flag_stands_in_for_telegram(self, conn):
         """What debugging outside Telegram uses, and it has to be typed."""
         product, _ = self._a_product(conn)
+        dbm.comp(conn, 7)  # --owner names a reader; access is a separate thing
         with self._serving(conn, owner_id=7) as base:
             code, _ = self._call(f"{base}/api/favorites", "POST", {"product_id": product})
             listed_code, listed = self._call(f"{base}/api/favorites")
@@ -612,12 +630,14 @@ class TestStarringSomethingOverHttp:
 
     def test_starring_something_that_does_not_exist_is_refused(self, conn):
         self._a_product(conn)
+        dbm.comp(conn, 7)  # --owner names a reader; access is a separate thing
         with self._serving(conn, owner_id=7) as base:
             code, _ = self._call(f"{base}/api/favorites", "POST", {"product_id": 9999})
 
         assert code == 404
 
     def test_a_body_without_a_product_is_a_bad_request_not_a_crash(self, conn):
+        dbm.comp(conn, 7)  # --owner names a reader; access is a separate thing
         with self._serving(conn, owner_id=7) as base:
             code, _ = self._call(f"{base}/api/favorites", "POST", {"nothing": True})
 
@@ -625,6 +645,7 @@ class TestStarringSomethingOverHttp:
 
     def test_unstarring_removes_it(self, conn):
         product, _ = self._a_product(conn)
+        dbm.comp(conn, 7)  # --owner names a reader; access is a separate thing
         with self._serving(conn, owner_id=7) as base:
             self._call(f"{base}/api/favorites", "POST", {"product_id": product})
             code, body = self._call(f"{base}/api/favorites/{product}", "DELETE")
@@ -632,8 +653,49 @@ class TestStarringSomethingOverHttp:
         assert (code, body["removed"]) == (200, True)
         assert dbm.favorite_ids(conn, 7) == set()
 
+    def test_starring_is_a_subscriber_feature(self, conn):
+        """A free reader gets nothing from a star, and could read prices out of it."""
+        product, variant = self._a_product(conn)
+        with self._serving(conn, bot_token=TOKEN) as base:
+            code, _ = self._call(
+                f"{base}/api/favorites", "POST",
+                {"product_id": product, "variant_id": variant},
+                {"X-Telegram-Init-Data": signed(user_id=7)},
+            )
+            listed, _ = self._call(
+                f"{base}/api/favorites", headers={"X-Telegram-Init-Data": signed(user_id=7)}
+            )
+
+        # Left on the identity check alone, this was the whole shelf: star ids
+        # in a loop, then read title, shop, live price and discount back out.
+        assert (code, listed) == (402, 402)
+        assert dbm.favorite_ids(conn, 7) == set()
+
+    def test_unstarring_stays_open_after_a_subscription_lapses(self, conn):
+        product, _ = self._a_product(conn)
+        dbm.upsert_bot_user(conn, 7, "7")
+        dbm.grant(conn, 7, days=30)
+        with self._serving(conn, bot_token=TOKEN) as base:
+            self._call(
+                f"{base}/api/favorites", "POST", {"product_id": product},
+                {"X-Telegram-Init-Data": signed(user_id=7)},
+            )
+            conn.execute("UPDATE bot_users SET paid_until = ? WHERE id = 7", (ts(90),))
+            code, _ = self._call(
+                f"{base}/api/favorites/{product}", "DELETE",
+                headers={"X-Telegram-Init-Data": signed(user_id=7)},
+            )
+
+        # Somebody must always be able to take their own things off their own
+        # list, and un-starring reveals nothing.
+        assert code == 200
+        assert dbm.favorite_ids(conn, 7) == set()
+
     def test_one_readers_star_is_invisible_to_another(self, conn):
         product, _ = self._a_product(conn)
+        for user_id in (7, 9):
+            dbm.upsert_bot_user(conn, user_id, str(user_id))
+            dbm.grant(conn, user_id, days=30)
         with self._serving(conn, bot_token=TOKEN) as base:
             self._call(
                 f"{base}/api/favorites", "POST", {"product_id": product},
@@ -645,13 +707,45 @@ class TestStarringSomethingOverHttp:
 
         assert theirs["items"] == []
 
-    def test_reading_the_shelf_still_needs_nobody(self, conn):
-        """Favourites are the only thing that needs a name; browsing never did."""
+    def test_reading_the_shelf_needs_a_subscription(self, conn):
+        """The shelf is the thing being sold, so browsing it is what is gated."""
         a_shelf(conn, 2)
         with self._serving(conn) as base:
             code, body = self._call(f"{base}/api/offers")
 
+        # 402 rather than 403: the request is understood, and the only thing
+        # missing is payment.
+        assert code == 402
+        assert body["error"] == "subscription required"
+
+    def test_the_owner_is_not_a_customer_of_their_own_collector(self, conn):
+        a_shelf(conn, 2)
+        dbm.comp(conn, 7)  # --owner names a reader; access is a separate thing
+        with self._serving(conn, owner_id=7) as base:
+            code, body = self._call(f"{base}/api/offers")
+
         assert (code, body["total"]) == (200, 2)
+
+    def test_a_subscriber_gets_the_shelf(self, conn):
+        a_shelf(conn, 2)
+        dbm.upsert_bot_user(conn, 9, "99")
+        dbm.grant(conn, 9, days=30)
+        with self._serving(conn, owner_id=9) as base:
+            code, body = self._call(f"{base}/api/offers")
+
+        assert (code, body["total"]) == (200, 2)
+
+    def test_a_lapsed_reader_loses_the_shelf(self, conn):
+        a_shelf(conn, 2)
+        dbm.upsert_bot_user(conn, 9, "99")
+        dbm.grant(conn, 9, days=30)
+        conn.execute("UPDATE bot_users SET paid_until = ? WHERE id = 9", (ts(1),))
+        with self._serving(conn, owner_id=None) as base:
+            code, _ = self._call(f"{base}/api/offers")
+
+        # Inside the grace period the feed still runs; the shelf does not, or
+        # grace would be a free month of the thing being sold.
+        assert code == 402
 
     @staticmethod
     def _page(url):
@@ -662,6 +756,7 @@ class TestStarringSomethingOverHttp:
         """No round trip and no flash: the server already knows who this is."""
         product, _ = self._a_product(conn)
         a_shelf(conn, 1)
+        dbm.comp(conn, 7)  # --owner names a reader; access is a separate thing
         with self._serving(conn, owner_id=7) as base:
             self._call(f"{base}/api/favorites", "POST", {"product_id": product})
             page = self._page(base + "/")
@@ -672,6 +767,7 @@ class TestStarringSomethingOverHttp:
     def test_a_link_to_the_list_arrives_with_the_list_in_it(self, conn):
         """?favorites=1 is a link somebody can be sent, so it opens on the answer."""
         product, _ = self._a_product(conn)
+        dbm.comp(conn, 7)  # --owner names a reader; access is a separate thing
         with self._serving(conn, owner_id=7) as base:
             self._call(f"{base}/api/favorites", "POST", {"product_id": product})
             page = self._page(base + "/?favorites=1")
@@ -680,15 +776,30 @@ class TestStarringSomethingOverHttp:
         assert "Salomon XT-6" in page
         assert '"favorites_items": null' in ordinary, "an unopened list costs nothing"
 
-    def test_a_page_served_to_nobody_says_so(self, conn):
+    def test_a_page_served_to_nobody_offers_the_subscription(self, conn):
+        """Whoever lands here followed a button out of the bot.
+
+        They need to know what this is and how to open it, and an error code
+        tells them neither — it reads as a broken link.
+        """
         a_shelf(conn, 1)
         with self._serving(conn) as base:
             page = self._page(base + "/")
 
-        assert '"me": null' in page
+        assert "Полка открывается по подписке" in page
+        assert "150 звёзд в месяц" in page
+
+    def test_a_page_served_to_the_owner_says_who_they_are(self, conn):
+        a_shelf(conn, 1)
+        dbm.comp(conn, 7)  # --owner names a reader; access is a separate thing
+        with self._serving(conn, owner_id=7) as base:
+            page = self._page(base + "/")
+
+        assert '"me": 7' in page
 
     def test_a_starred_row_carries_what_the_card_draws(self, conn):
         product, _ = self._a_product(conn)
+        dbm.comp(conn, 7)  # --owner names a reader; access is a separate thing
         with self._serving(conn, owner_id=7) as base:
             self._call(f"{base}/api/favorites", "POST", {"product_id": product})
             _, listed = self._call(f"{base}/api/favorites")
@@ -696,3 +807,558 @@ class TestStarringSomethingOverHttp:
         item = listed["items"][0]
         assert set(item) >= {"id", "title", "url", "image", "shop", "price", "since"}
         assert item["price"] == 180.0
+
+
+class TestTheOwnerFlagBehindAProxy:
+    """`--owner` says "whoever reaches me is that person". A tunnel makes that
+    false while every other signal still says localhost.
+
+    The guard lives in `_reader`, not in `_paying`: identity is what the flag
+    hands out, and every verb — including the one that deletes — resolves it
+    there. Put on `_paying` alone it was remembered twice out of three times.
+    """
+
+    # The server harness lives on the class above; borrowed rather than copied.
+    _serving = staticmethod(TestStarringSomethingOverHttp._serving)
+    _call = staticmethod(TestStarringSomethingOverHttp._call)
+    _a_product = staticmethod(TestStarringSomethingOverHttp._a_product)
+
+    def test_a_direct_request_is_believed(self, conn):
+        a_shelf(conn, 2)
+        dbm.comp(conn, 7)  # --owner names a reader; access is a separate thing
+        with self._serving(conn, owner_id=7) as base:
+            code, body = self._call(f"{base}/api/offers")
+
+        assert (code, body["total"]) == (200, 2)
+
+    def test_a_proxied_request_is_not(self, conn):
+        a_shelf(conn, 2)
+        dbm.comp(conn, 7)  # --owner names a reader; access is a separate thing
+        with self._serving(conn, owner_id=7) as base:
+            code, _ = self._call(
+                f"{base}/api/offers", headers={"X-Forwarded-For": "203.0.113.9"}
+            )
+
+        # cloudflared points at 127.0.0.1, so the peer address says localhost
+        # for the whole internet. What a proxy cannot hide is being one.
+        assert code == 402
+
+    def test_cloudflares_own_header_counts_too(self, conn):
+        a_shelf(conn, 1)
+        dbm.comp(conn, 7)  # --owner names a reader; access is a separate thing
+        with self._serving(conn, owner_id=7) as base:
+            code, _ = self._call(
+                f"{base}/api/offers", headers={"CF-Connecting-IP": "203.0.113.9"}
+            )
+
+        assert code == 402
+
+    def test_a_signed_exempt_reader_is_believed_through_a_proxy(self, conn):
+        """Unlike --owner, this identity was proved, so a proxy changes nothing."""
+        a_shelf(conn, 1)
+        with self._serving(conn, bot_token=TOKEN, exempt_id=7) as base:
+            code, body = self._call(
+                f"{base}/api/offers",
+                headers={
+                    "X-Telegram-Init-Data": signed(user_id=7),
+                    "X-Forwarded-For": "203.0.113.9",
+                },
+            )
+
+        assert (code, body["total"]) == (200, 1)
+
+    def test_the_delete_verb_is_guarded_too(self, conn):
+        """The verb that was missed: it destroys, and its answer is an oracle."""
+        product, _ = self._a_product(conn)
+        dbm.comp(conn, 7)
+        dbm.add_favorite(conn, 7, product, None)
+        with self._serving(conn, owner_id=7) as base:
+            code, _ = self._call(
+                f"{base}/api/favorites/{product}", "DELETE",
+                headers={"CF-Connecting-IP": "203.0.113.9"},
+            )
+
+        # Through a tunnel this was `for i in $(seq 1 200000); do curl -X DELETE`
+        # emptying the owner's list, and the removed flag flipping true→false
+        # said which ids had been on it.
+        assert code == 401
+        assert dbm.favorite_ids(conn, 7) == {product}
+
+    def test_the_owner_can_still_unstar_directly(self, conn):
+        product, _ = self._a_product(conn)
+        dbm.comp(conn, 7)
+        dbm.add_favorite(conn, 7, product, None)
+        with self._serving(conn, owner_id=7) as base:
+            code, _ = self._call(f"{base}/api/favorites/{product}", "DELETE")
+
+        assert code == 200
+        assert dbm.favorite_ids(conn, 7) == set()
+
+    def test_the_page_does_not_name_the_owner_through_a_proxy(self, conn):
+        a_shelf(conn, 1)
+        dbm.comp(conn, 7)
+        with self._serving(conn, owner_id=7) as base:
+            page = self._page_with(base + "/", {"X-Forwarded-For": "203.0.113.9"})
+
+        assert "Полка открывается по подписке" in page
+        assert '"me": 7' not in page
+
+    @staticmethod
+    def _page_with(url, headers):
+        request = Request(url, headers=headers)
+        with urlopen(request, timeout=5) as response:
+            return response.read().decode("utf-8")
+
+
+def a_tied_shelf(conn, n=1200, stores=2):
+    """n offers that tie on every key the shelf can sort by.
+
+    The duplicate this exists to catch is not a duplicate row — it is one row
+    served twice. OFFSET paging over a non-unique ORDER BY is undefined: SQLite
+    may hand back tied rows in a different order for each page, so the same card
+    lands on page one and again on page two while another is never drawn at all.
+
+    Two shops rather than one because the default sort ranks within a shop
+    first, so a single-shop fixture would leave that window unexercised. On the
+    live database 29,703 of 33,277 offers sit in a group tied on
+    (shop, score, discount), so this fixture is the ordinary case.
+    """
+    for i in range(n):
+        store = dbm.upsert_store(
+            conn, f"tied{i % stores}.example", platform="shopify", currency="USD"
+        )
+        product = dbm.upsert_product(
+            conn, store, f"t{i}", f"Tied {i}", f"https://tied.example/{i}",
+            brand="Nike", image_url="https://img.example/x.jpg",
+        )
+        conn.execute(
+            "UPDATE products SET kind = 'shoes', gender = 'men', brand_family = 'Nike'"
+            " WHERE id = ?", (product,),
+        )
+        variant = dbm.upsert_variant(
+            conn, product, f"tv{i}", size="US 10", size_norm="US10"
+        )
+        conn.execute(
+            """
+            INSERT INTO offers (variant_id, product_id, found_at, checked_at,
+                                price_usd, reference_usd, reference_source,
+                                discount_pct, saving_usd, score, all_time_low)
+            VALUES (?, ?, ?, ?, 100.0, 200.0, 'market', 50.0, 100.0, 77, 0)
+            """,
+            (variant, product, ts(1), ts(0)),
+        )
+
+
+def _walk(conn, order_by, limit=24):
+    """Every variant id the shelf hands out, page by page, in order."""
+    seen, page = [], 0
+    while True:
+        rows, total = dbm.offers_for(
+            conn, order_by=order_by, limit=limit, offset=page * limit
+        )
+        if not rows:
+            return seen, total
+        seen += [row["variant_id"] for row in rows]
+        page += 1
+        assert page < 500, "paging did not terminate"
+
+
+class TestPagingNeverServesTheSameOfferTwice:
+    """A shelf of ties, walked to the end, must yield each offer exactly once.
+
+    Honest about what this does and does not show. Walked against the live
+    database of 32,139 standing offers, the ordering *without* a unique
+    tiebreaker also returned every card exactly once: SQLite's order for tied
+    rows is undefined by contract but stable in practice while the query plan
+    and the data both hold still. So this test did not fail before the
+    tiebreaker was added and does not demonstrate that it fixed anything.
+
+    It is kept as a guard on the contract rather than as proof of a bug. What
+    the tiebreaker actually buys is that a plan change — a new index, a widened
+    filter — cannot silently start dropping cards. The repetition a reader
+    really sees on the shelf is a different thing entirely: 1,539 products hold
+    more than one card because they are discounted in several sizes, and 2,428
+    title-and-brand groups repeat across shops. That is folding, and no ordering
+    fixes it.
+    """
+
+    def test_every_offered_sort(self, conn):
+        a_tied_shelf(conn)
+        for name, order_by in web.SORTS.items():
+            seen, total = _walk(conn, order_by)
+            assert len(seen) == len(set(seen)), f"{name}: an offer was served twice"
+            assert len(seen) == total, f"{name}: walked {len(seen)} of {total}"
+
+    def test_the_default_ordering_of_offers_for(self, conn):
+        """`pi.bot` pages the same table without passing a sort of its own."""
+        a_tied_shelf(conn, n=200)
+        seen, total = _walk(conn, dbm.offers_for.__defaults__[4])
+        assert len(seen) == len(set(seen))
+        assert len(seen) == total
+
+
+class TestSizesAreFoldedOnlyWhenTheyCostTheSame:
+    """One shoe listed in three sizes at one price is the shelf repeating itself.
+
+    The same shoe at three different prices is not: folding it would put a price
+    on the card that is not the price of the size somebody came for. Measured on
+    the live shelf, 1,539 products hold more than one card and 910 of them are
+    priced differently by size, so both halves of this are the common case.
+    """
+
+    @staticmethod
+    def _product(conn, prices, handle="p"):
+        """One product offered in len(prices) sizes, at the prices given."""
+        store = dbm.upsert_store(conn, f"{handle}.example", platform="shopify", currency="USD")
+        product = dbm.upsert_product(
+            conn, store, handle, "Salomon XT-6", f"https://{handle}.example/p",
+            brand="Salomon", image_url="https://img.example/x.jpg",
+        )
+        for i, price in enumerate(prices):
+            variant = dbm.upsert_variant(
+                conn, product, f"{handle}v{i}", size=f"US{10 + i}", size_norm=f"US{10 + i}"
+            )
+            conn.execute(
+                """
+                INSERT INTO offers (variant_id, product_id, found_at, checked_at,
+                                    price_usd, reference_usd, reference_source,
+                                    discount_pct, saving_usd, score, all_time_low)
+                VALUES (?, ?, ?, ?, ?, 290.0, 'market', 50.0, ?, 70, 0)
+                """,
+                (variant, product, ts(1), ts(0), price, 290.0 - price),
+            )
+        return product
+
+    def test_one_price_across_sizes_becomes_one_card(self, conn):
+        self._product(conn, [90.0, 90.0, 90.0])
+        page = web.shelf_page(conn, web.read_query(""))
+        assert len(page["offers"]) == 1
+        assert page["offers"][0]["sizes_on_offer"] == 3
+        assert page["total"] == 1
+
+    def test_prices_that_differ_by_size_stay_apart(self, conn):
+        self._product(conn, [90.0, 180.0])
+        page = web.shelf_page(conn, web.read_query(""))
+        assert len(page["offers"]) == 2
+        assert page["total"] == 2
+        # Never "3 sizes at this price" on a card that is one price of several.
+        assert {card["sizes_on_offer"] for card in page["offers"]} == {1}
+
+    def test_the_count_matches_what_paging_hands_out(self, conn):
+        """`total` drives the page counter, so a disagreement is visible."""
+        self._product(conn, [90.0, 90.0], handle="same")
+        self._product(conn, [70.0, 140.0], handle="split")
+        seen, total = _walk(conn, web.SORTS[web.DEFAULT_SORT], limit=1)
+        assert total == 3  # one folded card, two unfolded
+        assert len(seen) == total
+
+    def test_a_size_filter_still_picks_the_size_asked_for(self, conn):
+        """Folding after the WHERE, not before: the card must be the US11 row."""
+        self._product(conn, [90.0, 90.0])
+        page = web.shelf_page(conn, web.read_query("size=US11"))
+        assert len(page["offers"]) == 1
+        assert page["offers"][0]["size"] == "US11"
+        assert page["offers"][0]["sizes_on_offer"] == 1
+
+
+class TestTheShelfIsNotGivenAwayOnTheFirstRequest:
+    """Inside Telegram the signature rides in the URL fragment, which browsers
+    never send. So the first GET cannot know who is asking — and must neither
+    refuse a paying reader nor hand the shelf to a stranger."""
+
+    def test_an_unsigned_request_gets_no_offers_in_the_page(self, conn):
+        a_shelf(conn, 3)
+        page = web.render_page(conn, web.read_query(""), None, seeded=False)
+        assert b'{"seed": null}' in page
+        assert b"Nike Air Max" not in page
+
+    def test_a_known_reader_still_gets_the_first_screen(self, conn):
+        a_shelf(conn, 3)
+        page = web.render_page(conn, web.read_query(""), 42)
+        assert b'{"seed": null}' not in page
+        assert b"Nike Air Max" in page
+
+
+class TestWithNothingBeingSold:
+    """Selling is switched off, not removed (Config.subscription).
+
+    The paywall, Stars, renewal, grace and refunds all stay in the code and
+    stay tested; what changes is that the shelf is open. Проверяется именно
+    выключенное состояние, потому что оно сейчас и работает у людей.
+    """
+
+    def test_the_shelf_opens_without_any_signature(self, conn):
+        a_shelf(conn, 3)
+        serving = TestStarringSomethingOverHttp._serving(conn, subscription=False)
+        with serving as base, urlopen(base + "/api/offers?limit=3") as r:
+            assert r.status == 200
+            assert json.loads(r.read())["total"] == 3
+
+    def test_the_page_still_carries_its_first_screen(self, conn):
+        """With no paywall there is nobody to withhold it from."""
+        a_shelf(conn, 3)
+        page = web.render_page(conn, web.read_query(""), None)
+        assert b"Nike Air Max" in page
+
+    def test_the_paywall_is_still_there_when_switched_on(self, conn):
+        """The point of a switch: the rules it guards do not rot while it is off."""
+        a_shelf(conn, 3)
+        with TestStarringSomethingOverHttp._serving(conn, subscription=True) as base:
+            try:
+                urlopen(base + "/api/offers?limit=3")
+                raise AssertionError("the shelf was handed over without a subscription")
+            except HTTPError as refused:
+                assert refused.code == 402
+
+
+class TestOnlyDiscountsSomebodyElseVouchesFor:
+    """20,908 of the 26,013 cards the shelf could draw rest on nothing but the
+    shop's own struck-through price — the one number a shop writes about itself,
+    and the one every free discount channel repeats. A page of those reads as a
+    jumble sale whatever it is dressed in."""
+
+    @staticmethod
+    def _offer(conn, domain, source, all_time_low=0):
+        store = dbm.upsert_store(conn, domain, platform="shopify", currency="USD")
+        product = dbm.upsert_product(
+            conn, store, domain, f"Shoe {domain}", f"https://{domain}/p", brand="Nike"
+        )
+        conn.execute(
+            "UPDATE products SET kind='shoes', brand_family='Nike' WHERE id = ?",
+            (product,),
+        )
+        variant = dbm.upsert_variant(conn, product, f"v-{domain}", size_norm="US10")
+        conn.execute(
+            """
+            INSERT INTO offers (variant_id, product_id, found_at, checked_at,
+                                price_usd, reference_usd, reference_source,
+                                discount_pct, saving_usd, score, all_time_low)
+            VALUES (?, ?, ?, ?, 100.0, 200.0, ?, 50.0, 100.0, 80, ?)
+            """,
+            (variant, product, ts(1), ts(0), source, all_time_low),
+        )
+
+    def test_the_shops_own_tag_is_not_shown(self, conn):
+        self._offer(conn, "tag.example", "tag")
+        self._offer(conn, "market.example", "market")
+        rows, total = dbm.offers_for(conn)
+        assert total == 1
+        assert rows[0]["reference_source"] == "market"
+
+    def test_an_all_time_low_counts_even_on_a_tag(self, conn):
+        """Our own record of the price is evidence the shop did not write."""
+        self._offer(conn, "low.example", "tag", all_time_low=1)
+        assert dbm.offers_for(conn)[1] == 1
+
+    def test_the_full_view_is_one_click_away(self, conn):
+        """Somebody hunting one particular thing wants the weak evidence too."""
+        self._offer(conn, "tag.example", "tag")
+        self._offer(conn, "market.example", "market")
+        assert dbm.offers_for(conn, all_discounts=True)[1] == 2
+
+    def test_the_counts_follow_what_the_page_will_show(self, conn):
+        self._offer(conn, "tag.example", "tag")
+        self._offer(conn, "market.example", "market")
+        assert dbm.shelf_facets(conn)["total"] == 1
+        assert dbm.shelf_facets(conn, all_discounts=True)["total"] == 2
+
+    def test_the_query_reads_the_switch(self):
+        assert web.read_query("")["all_discounts"] is False
+        assert web.read_query("all_discounts=1")["all_discounts"] is True
+        assert web.read_query("all_discounts=nonsense")["all_discounts"] is False
+
+
+class TestTheButtonThatPromisesToTakeYouBackAndSubscribe:
+    """«Вернуться в бота и оформить» должно оформлять, а не только закрывать.
+
+    Кнопка на закрытой полке умела ровно одно — закрыть окно. Человек
+    оказывался в чате, где ничего не происходило, и оформить было негде.
+    Теперь страница сперва просит бота положить туда предложение.
+    """
+
+    @staticmethod
+    @contextmanager
+    def _serving(conn, **attrs):
+        path = Path(conn.execute("PRAGMA database_list").fetchone()[2])
+        handler = type("Bound", (web.Handler,), {"db_path": path, "bot_token": TOKEN, **attrs})
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        thread = threading.Thread(target=server.serve_forever, args=(0.02,), daemon=True)
+        thread.start()
+        try:
+            yield f"http://127.0.0.1:{server.server_address[1]}"
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+    @staticmethod
+    def _call(url, headers=None):
+        request = Request(url, method="POST", data=b"{}",
+                          headers={"Content-Type": "application/json", **(headers or {})})
+        try:
+            with urlopen(request, timeout=5) as response:
+                return response.status, json.loads(response.read() or b"{}")
+        except HTTPError as failure:
+            return failure.code, json.loads(failure.read() or b"{}")
+
+    def test_a_stranger_cannot_make_the_bot_write_to_anybody(self, conn):
+        """Без подписи неизвестно, чей это чат, — и писать некому."""
+        with self._serving(conn) as base:
+            code, body = self._call(f"{base}/api/pitch")
+        assert code == 401
+        assert body["error"] == "not signed in"
+
+    @respx.mock
+    def test_a_signed_reader_gets_the_offer_put_in_their_chat(self, conn):
+        route = respx.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage").mock(
+            return_value=httpx.Response(200, json={"ok": True})
+        )
+        with self._serving(conn) as base:
+            code, body = self._call(f"{base}/api/pitch",
+                                    {"X-Telegram-Init-Data": signed(user_id=77)})
+
+        assert code == 200
+        assert body == {"sent": True}
+        assert route.called
+        sent = json.loads(route.calls[0].request.content)
+        assert sent["chat_id"] == 77, "предложение должно уйти тому, кто нажал"
+        button = sent["reply_markup"]["inline_keyboard"][0][0]
+        assert button["callback_data"] == "pitch", (
+            "развилка «продажа включена или нет» живёт в боте — "
+            "страница только нажимает ту же кнопку, что и меню"
+        )
+
+    @respx.mock
+    def test_telegram_being_down_does_not_break_the_page(self, conn):
+        """Не дозвонились — честно говорим «не отправил», а не падаем с 500."""
+        respx.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage").mock(
+            side_effect=httpx.ConnectError("нет сети")
+        )
+        with self._serving(conn) as base:
+            code, body = self._call(f"{base}/api/pitch",
+                                    {"X-Telegram-Init-Data": signed(user_id=77)})
+        assert code == 200
+        assert body == {"sent": False}
+
+
+class TestTheLinkACardOpens:
+    """A shop writes the link itself, so the shelf decides what it may be."""
+
+    def test_a_link_relative_to_the_shop_opens_the_shop(self):
+        # 2,769 products carried one; from the shelf it opened the shelf's 404.
+        assert web.shop_link("/products/thing", "shop.example") == "https://shop.example/products/thing"
+
+    def test_an_absolute_link_is_left_alone(self):
+        url = "https://other.example/p/1?x=2"
+        assert web.shop_link(url, "shop.example") == url
+
+    def test_a_link_that_is_not_a_web_page_is_refused(self):
+        # The page runs inside Telegram with the reader's signature to hand.
+        for bad in ("javascript:alert(1)", " JavaScript:alert(1)", "data:text/html,x", "vbscript:x"):
+            assert web.shop_link(bad, "shop.example") is None, bad
+
+    def test_no_link_is_no_link(self):
+        assert web.shop_link(None, "shop.example") is None
+        assert web.shop_link("", "shop.example") is None
+
+    def test_the_shelf_hands_out_the_resolved_link(self, conn):
+        a_shelf(conn, n=1)
+        conn.execute("UPDATE products SET url = '/products/relative'")
+        conn.commit()
+        page = web.shelf_page(conn, web.read_query(""))
+        urls = [o["url"] for o in page["offers"]]
+        assert urls and all(u.startswith("https://") and u.endswith("/products/relative") for u in urls)
+
+
+class TestTheServerLetsGoOfTheDatabase:
+    def test_many_requests_leave_no_open_handles_behind(self, conn):
+        import gc
+        import os
+
+        a_shelf(conn, n=3)
+        path = Path(conn.execute("PRAGMA database_list").fetchone()[2])
+
+        def db_handles() -> int:
+            n = 0
+            for fd in os.listdir("/proc/self/fd"):
+                try:
+                    if os.readlink(f"/proc/self/fd/{fd}").startswith(str(path)):
+                        n += 1
+                except OSError:
+                    pass
+            return n
+
+        handler = type("Bound", (web.Handler,), {"db_path": path})
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        thread = threading.Thread(target=server.serve_forever, args=(0.02,), daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        gc.disable()  # a leak that only garbage collection hides is still a leak
+        try:
+            before = db_handles()
+            for _ in range(40):
+                with urlopen(base + "/api/offers?limit=3") as r:
+                    r.read()
+            after = db_handles()
+        finally:
+            gc.enable()
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+        assert after - before < 5, (before, after)
+
+    def test_a_slow_client_cannot_hold_a_thread_for_good(self):
+        assert web.Handler.timeout and web.Handler.timeout <= 60
+
+
+class TestAReaderWhoLeavesMidAnswer:
+    """A page closed before its answer arrived printed a twenty-line traceback
+    into the journal every time; nothing was wrong."""
+
+    def test_a_broken_pipe_is_not_an_error(self, caplog):
+        import io
+        import logging
+
+        class Gone(io.BytesIO):
+            def write(self, data):
+                raise BrokenPipeError(32, "Broken pipe")
+
+        handler = web.Handler.__new__(web.Handler)
+        handler.request_version = "HTTP/1.1"
+        handler.requestline = "GET /api/offers HTTP/1.1"
+        handler.command = "GET"
+        handler.client_address = ("127.0.0.1", 1)
+        handler.wfile = Gone()
+        caplog.set_level(logging.DEBUG, logger="pi.web")
+
+        handler._send(200, b"{}", "application/json")
+
+        assert "went away" in caplog.text
+
+
+class TestTheCardShowsItsPriceHistory:
+    """The evidence behind «было»: a discount against the shop's own lowest
+    price of the month is as convincing as being able to see the month."""
+
+    def test_the_history_is_the_shops_own_price_change_by_change(self, conn):
+        a_shelf(conn, n=1)
+        variant, product = conn.execute("SELECT variant_id, product_id FROM offers").fetchone()
+        dbm.record_price(conn, variant, 150.0, None, True, "USD", 150.0, 1.0, ts=ts(20))
+        dbm.record_price(conn, variant, 80.0, None, True, "USD", 80.0, 1.0, ts=ts(0))
+
+        history = web.product_page(conn, product)["history"]
+
+        assert history["currency"] == "USD"
+        assert [point["p"] for point in history["points"]][-2:] == [150.0, 80.0]
+
+    def test_a_shop_that_changed_currency_draws_only_the_current_one(self, conn):
+        a_shelf(conn, n=1)
+        variant, product = conn.execute("SELECT variant_id, product_id FROM offers").fetchone()
+        dbm.record_price(conn, variant, 100.0, None, True, "USD", 100.0, 1.0, ts=ts(9))
+        dbm.record_price(conn, variant, 96.0, None, True, "CAD", 131.0, 1.36, ts=ts(1))
+        dbm.record_price(conn, variant, 90.0, None, True, "CAD", 122.0, 1.36, ts=ts(0))
+
+        history = web.product_page(conn, product)["history"]
+
+        assert history["currency"] == "CAD"
+        assert [point["p"] for point in history["points"]] == [131.0, 122.0]

@@ -28,7 +28,7 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass
 
-from . import landed
+from . import db, landed
 from .config import Filters
 
 # Added to the discount's own score to order one reader's list.
@@ -151,6 +151,7 @@ def ranker(
     shipping: landed.Rules = landed.EMPTY,
     eur_usd: float | None = None,
     following: frozenset[int] | set[int] = frozenset(),
+    filters=None,
 ):
     """A (deal, row) -> priority-or-None function for `find_deals` to sort by.
 
@@ -158,16 +159,29 @@ def ranker(
     does filter rather than adjust: asking for women's things and being sent
     men's is not a near miss, it is the wrong answer.
 
+    `filters` carries the rules about the find rather than about the reader —
+    whether anyone but the seller says the price used to be higher, whether the
+    brand and the type could be read at all. They are checked here because this
+    is the notification path and only the notification path: the shelf keeps
+    showing everything (see pipeline.shelf_config), and a reader who goes
+    looking is a different act from being interrupted.
+
     `following` is the set of products this reader starred, and it passes
-    everything — the bar, the gender, the lot. Every other rule here is an
-    inference from a profile about what somebody probably wants; a star is the
-    person saying it. A shoe classified as men's, in a size they do not take,
-    at 6% off, is still the shoe they asked to be told about.
+    everything — the bar, the gender, the find rules, the lot. Every other rule
+    here is an inference from a profile about what somebody probably wants; a
+    star is the person saying it. A shoe classified as men's, in a size they do
+    not take, at 6% off, is still the shoe they asked to be told about — and so
+    is one whose only evidence is the shop's own struck-through price.
     """
 
     def rank(deal, row: sqlite3.Row) -> float | None:
         if deal.product_id in following:
             return priority(deal, row, reader, shipping, eur_usd) + FOLLOWED_BONUS
+        if filters is not None and not filters.worth_interrupting(
+            deal.reference_source, deal.all_time_low,
+            row["brand_family"] or row["brand_norm"], row["kind"], row["gender"],
+        ):
+            return None
         wants_women_only = "women" in reader.genders and "men" not in reader.genders
         if wants_women_only and row["gender"] != "women":
             return None
@@ -216,18 +230,30 @@ class Subscriber:
 
 
 def subscribers(
-    conn: sqlite3.Connection, owner_chat_id: str | None, filters: Filters
+    conn: sqlite3.Connection, owner_chat_id: str | None, filters: Filters,
+    subscription: bool = False,
 ) -> list[Subscriber]:
     """Everyone this run should write to, the owner first.
 
-    Anyone who has spoken to the bot and not blocked it is a reader, whether or
-    not they finished the wizard: somebody who pressed /start and skipped the
-    questions is saying they want everything, not that they want nothing.
-
-    The owner is always included even with no profile of their own, because the
-    chat id in `.env` is what a fresh install has instead of a subscriber list,
-    and a run that wrote to nobody would look exactly like a run that found
+    Anyone who has spoken to the bot, not blocked it and is paying is a reader,
+    whether or not they finished the wizard: somebody who pressed /start and
+    skipped the questions is saying they want everything, not that they want
     nothing.
+
+    Paying is what the feed is — **while the feed is being sold**. With
+    `subscription` off nothing is, so everyone hears from here and the digest
+    has nobody left to talk to. See Config.subscription and docs/subscription.md.
+
+    A reader who has not subscribed hears from the digest once a day and not
+    from here — the whole difference being sold is that this arrives when the
+    price falls rather than at six in the evening.
+    The grace period counts as paying, which is the entire point of having one:
+    a failed renewal should cost the reader a reminder, not the product.
+
+    The owner is always included, and never asked to pay. The chat id in `.env`
+    is what a fresh install has instead of a subscriber list, a run that wrote
+    to nobody would look exactly like a run that found nothing, and the person
+    who owns the collector is not a customer of it.
     """
     out: list[Subscriber] = []
     seen: set[str] = set()
@@ -242,6 +268,15 @@ def subscribers(
     for row in rows:
         chat_id = str(row["chat_id"])
         if chat_id in seen:
+            continue
+        # Free readers are held back only while there is something to buy. With
+        # selling switched off (Config.subscription) everyone is a reader, which
+        # is the whole point of switching it off.
+        if (
+            subscription
+            and chat_id != owner
+            and db.subscription_state(conn, int(row["id"])) == "free"
+        ):
             continue
         seen.add(chat_id)
         reader = Reader.from_profile(row)

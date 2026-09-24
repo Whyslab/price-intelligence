@@ -269,6 +269,223 @@ class TestMigrationCoverage:
         assert migrated.execute("PRAGMA user_version").fetchone()[0] == dbm.SCHEMA_VERSION
 
 
+class TestGivingBackWhatAShortPageWithdrew:
+    """Version 16 undoes the marks a short Shopify page made.
+
+    A pass writes one timestamp for everything it withdraws, so a batch of
+    products sharing a shop and a moment is a pass's verdict — the kind the
+    short page got wrong 110,796 times. A lone mark is a product whose own page
+    answered 404, which was checked and stays.
+    """
+
+    @staticmethod
+    def _product(conn, store_id, name, missing_since=None):
+        product_id = dbm.upsert_product(conn, store_id, name, name, f"https://x/{name}")
+        conn.execute(
+            "UPDATE products SET missing_since = ? WHERE id = ?", (missing_since, product_id)
+        )
+        return product_id
+
+    def test_a_batch_is_given_back_and_a_single_check_is_not(self, tmp_path):
+        path = tmp_path / "old.db"
+        conn = dbm.connect(path)
+        shopify = dbm.upsert_store(conn, "shop.example", platform="shopify")
+        crawled = dbm.upsert_store(conn, "crawl.example", platform="jsonld")
+        batch = [self._product(conn, shopify, f"b{n}", "2026-09-22T18:20:50+00:00") for n in range(3)]
+        single = self._product(conn, shopify, "one", "2026-09-22T19:00:00+00:00")
+        crawled_batch = [
+            self._product(conn, crawled, f"c{n}", "2026-09-21T10:00:00+00:00") for n in range(2)
+        ]
+        on_sale = self._product(conn, shopify, "fine")
+        conn.execute("PRAGMA user_version = 15")
+        conn.close()
+
+        migrated = dbm.connect(path)
+
+        def missing(product_id):
+            return migrated.execute(
+                "SELECT missing_since FROM products WHERE id = ?", (product_id,)
+            ).fetchone()[0]
+
+        assert all(missing(p) is None for p in batch), "the short page's verdict is undone"
+        assert missing(single), "a product whose own page said 404 stays withdrawn"
+        assert all(missing(p) for p in crawled_batch), "only Shopify passes had the fault"
+        assert missing(on_sale) is None
+        assert migrated.execute("PRAGMA user_version").fetchone()[0] == 16
+
+    def test_stored_addresses_are_repaired_once(self, tmp_path):
+        path = tmp_path / "old.db"
+        conn = dbm.connect(path)
+        store = dbm.upsert_store(conn, "www.43einhalb.com", platform="jsonld")
+        relative = dbm.upsert_product(conn, store, "a", "Laces", "/es/p/laces-1")
+        pictured = dbm.upsert_product(
+            conn, store, "b", "Skirt", "https://www.43einhalb.com/p/b",
+            image_url="https://img.ssensemedia.com/images/__IMAGE_PARAMS__/1_1/skirt.jpg",
+        )
+        conn.execute("PRAGMA user_version = 15")
+        conn.close()
+
+        migrated = dbm.connect(path)
+
+        def column(name, product_id):
+            return migrated.execute(
+                f"SELECT {name} FROM products WHERE id = ?", (product_id,)
+            ).fetchone()[0]
+
+        assert column("url", relative) == "https://www.43einhalb.com/es/p/laces-1"
+        assert column("image_url", pictured) == (
+            "https://img.ssensemedia.com/images/b_white,g_center,f_auto,q_auto:best/1_1/skirt.jpg"
+        )
+
+    def test_a_database_already_at_16_is_not_touched_again(self, tmp_path):
+        """Batch marks made after the upgrade are the fixed walk's verdict."""
+        path = tmp_path / "new.db"
+        conn = dbm.connect(path)
+        shopify = dbm.upsert_store(conn, "shop.example", platform="shopify")
+        batch = [self._product(conn, shopify, f"b{n}", "2026-09-30T10:00:00+00:00")
+                 for n in range(3)]
+        conn.close()
+
+        again = dbm.connect(path)
+
+        assert all(
+            again.execute("SELECT missing_since FROM products WHERE id = ?", (p,)).fetchone()[0]
+            for p in batch
+        )
+
+
+def _a_card(conn, store_id, name, checked, tried=None, score=50, source="market"):
+    """One product with one offer on the shelf, stamped as given."""
+    product = dbm.upsert_product(
+        conn, store_id, name, name, f"https://shop.example/products/{name}"
+    )
+    variant = dbm.upsert_variant(conn, product, name)
+    conn.execute(
+        """
+        INSERT INTO offers (variant_id, product_id, found_at, checked_at, price_usd,
+                            reference_usd, reference_source, discount_pct, saving_usd,
+                            score, all_time_low, tried_at)
+        VALUES (?, ?, ?, ?, 100, 200, ?, 50, 100, ?, 0, ?)
+        """,
+        (variant, product, checked, checked, source, score, tried),
+    )
+    return product
+
+
+class TestTheCheckingQueue:
+    """Which cards `pi verify` opens next.
+
+    Ordered by the last answer alone, a card whose page never loads stayed the
+    oldest thing on the shelf for good: 34 kickz.com cards took 45 of every 60
+    checks for three weeks.
+    """
+
+    def test_a_card_that_did_not_answer_goes_to_the_back(self, conn):
+        store = dbm.upsert_store(conn, "shop.example", platform="shopify", status="ok")
+        stuck = _a_card(conn, store, "stuck", checked=ts(20), tried=ts(0))
+        waiting = _a_card(conn, store, "waiting", checked=ts(2))
+
+        rows = dbm.stale_offers(conn, 10, ("shopify",))
+
+        assert [row["product_id"] for row in rows] == [waiting, stuck]
+
+    def test_an_attempt_is_written_down_whatever_the_answer(self, conn):
+        store = dbm.upsert_store(conn, "shop.example", platform="shopify", status="ok")
+        card = _a_card(conn, store, "card", checked=ts(5))
+
+        dbm.note_attempt(conn, card, ts(0))
+
+        tried, checked = conn.execute(
+            "SELECT tried_at, checked_at FROM offers WHERE product_id = ?", (card,)
+        ).fetchone()
+        assert tried == ts(0)
+        assert checked == ts(5), "asking is not the shop answering"
+
+    def test_a_shop_whose_last_read_failed_is_not_asked_one_card_at_a_time(self, conn):
+        broken = dbm.upsert_store(conn, "broken.example", platform="jsonld", status="error")
+        _a_card(conn, broken, "old", checked=ts(20))
+
+        assert dbm.stale_offers(conn, 10, ("jsonld",)) == []
+
+
+class TestHiddenCardsDoNotTakeEveryCheck:
+    """Review 24.09: cards hidden because nobody has seen their product for a
+    week are the oldest on the shelf by construction, and took every check —
+    after schema 16, two weeks of them before a visible card was looked at."""
+
+    def _cards(self, conn, store, prefix, count, seen_days):
+        cards = []
+        for n in range(count):
+            card = _a_card(conn, store, f"{prefix}{n}", checked=ts(seen_days))
+            conn.execute("UPDATE products SET last_seen = ? WHERE id = ?", (ts(seen_days), card))
+            cards.append(card)
+        return set(cards)
+
+    def test_the_hidden_get_a_quarter(self, conn):
+        store = dbm.upsert_store(conn, "shop.example", platform="shopify", status="ok")
+        hidden = self._cards(conn, store, "old", 20, seen_days=30)
+        shown = self._cards(conn, store, "new", 20, seen_days=2)
+
+        rows = {row["product_id"] for row in dbm.stale_offers(conn, 8, ("shopify",))}
+
+        assert len(rows & shown) == 6 and len(rows & hidden) == 2
+
+    def test_what_one_side_does_not_need_goes_to_the_other(self, conn):
+        store = dbm.upsert_store(conn, "shop.example", platform="shopify", status="ok")
+        hidden = self._cards(conn, store, "old", 20, seen_days=30)
+        shown = self._cards(conn, store, "new", 2, seen_days=2)
+
+        rows = {row["product_id"] for row in dbm.stale_offers(conn, 8, ("shopify",))}
+        assert shown <= rows and len(rows & hidden) == 6
+
+        conn.executemany("DELETE FROM offers WHERE product_id = ?", [(c,) for c in hidden])
+        more = self._cards(conn, store, "more", 20, seen_days=2)
+        rows = {row["product_id"] for row in dbm.stale_offers(conn, 8, ("shopify",))}
+        assert len(rows) == 8 and rows <= shown | more, "nothing hidden: every check is theirs"
+
+    def test_a_product_nobody_recorded_seeing_counts_as_shown(self, conn):
+        store = dbm.upsert_store(conn, "shop.example", platform="shopify", status="ok")
+        card = _a_card(conn, store, "card", checked=ts(30))
+
+        assert [row["product_id"] for row in dbm.stale_offers(conn, 4, ("shopify",))] == [card]
+
+
+class TestAShopNobodyCouldReadLeavesThePage:
+    """Cards stay in the table and come back the moment the shop reads again;
+    they are only kept off the page while nobody can vouch for them."""
+
+    def _shelf(self, conn, last_ok_days):
+        store = dbm.upsert_store(
+            conn, "shop.example", platform="shopify", status="ok", last_ok=ts(last_ok_days)
+        )
+        return _a_card(conn, store, "card", checked=ts(last_ok_days))
+
+    def test_a_shop_silent_for_days_is_not_on_the_page(self, conn):
+        self._shelf(conn, last_ok_days=4)
+
+        rows, total = dbm.offers_for(conn)
+        facets = dbm.shelf_facets(conn)
+
+        assert rows == [] and total == 0
+        assert facets["total"] == 0, "the counts promise what the page will show"
+
+    def test_a_shop_read_yesterday_is(self, conn):
+        card = self._shelf(conn, last_ok_days=1)
+
+        rows, total = dbm.offers_for(conn)
+
+        assert [row["product_id"] for row in rows] == [card] and total == 1
+        assert dbm.shelf_facets(conn)["total"] == 1
+
+    def test_the_cards_come_back_when_the_shop_does(self, conn):
+        card = self._shelf(conn, last_ok_days=4)
+        dbm.upsert_store(conn, "shop.example", last_ok=ts(0))
+
+        rows, _ = dbm.offers_for(conn)
+
+        assert [row["product_id"] for row in rows] == [card]
+
+
 class TestRecordingWhatIsOnOffer:
     """The shelf's two dates both used to be the clock, and both were wrong.
 
@@ -616,3 +833,149 @@ class TestFollowingAProduct:
         dbm.record_favorite_price(conn, 7, product, 149.0)
 
         assert dbm.favorite_prices(conn, 7) == {product: 149.0}
+
+
+class TestAShopThatAskedNotToBeVisited:
+    """`data/excluded.txt` is the answer to being asked, and it is not advisory."""
+
+    @staticmethod
+    def _excluded(tmp_path, *domains) -> None:
+        (tmp_path / "excluded.txt").write_text(
+            "# comment\n" + "\n".join(domains) + "\n", encoding="utf-8"
+        )
+
+    def test_an_excluded_shop_is_not_returned(self, conn, tmp_path, monkeypatch):
+        dbm.upsert_store(conn, "keep.example", platform="shopify")
+        dbm.upsert_store(conn, "gone.example", platform="shopify")
+        self._excluded(tmp_path, "gone.example")
+        monkeypatch.setattr(dbm, "load_excluded", lambda: frozenset({"gone.example"}))
+
+        assert [s["domain"] for s in dbm.get_stores(conn)] == ["keep.example"]
+
+    def test_naming_it_by_hand_does_not_override_the_list(
+        self, conn, tmp_path, monkeypatch
+    ):
+        dbm.upsert_store(conn, "gone.example", platform="shopify")
+        monkeypatch.setattr(dbm, "load_excluded", lambda: frozenset({"gone.example"}))
+
+        # `--stores gone.example` goes through the same door. "We do not want you
+        # here" is not a preference a debug flag gets to override.
+        assert dbm.get_stores(conn, domains=("gone.example",)) == []
+
+    def test_www_is_the_same_shop(self, conn, monkeypatch):
+        dbm.upsert_store(conn, "www.gone.example", platform="shopify")
+        monkeypatch.setattr(dbm, "load_excluded", lambda: frozenset({"gone.example"}))
+
+        assert dbm.get_stores(conn) == []
+
+    def test_its_cards_are_not_opened_one_by_one_either(self, conn, monkeypatch):
+        """Review 24.09: the checks never read the list, so an excluded shop's
+        cards kept having their product pages opened."""
+        keep = dbm.upsert_store(conn, "keep.example", platform="shopify", status="ok")
+        gone = dbm.upsert_store(conn, "www.gone.example", platform="shopify", status="ok")
+        kept = _a_card(conn, keep, "kept", checked=ts(3))
+        _a_card(conn, gone, "dropped", checked=ts(5))
+        monkeypatch.setattr(dbm, "load_excluded", lambda: frozenset({"gone.example"}))
+
+        assert [row["product_id"] for row in dbm.stale_offers(conn, 10, ("shopify",))] == [kept]
+
+    def test_its_old_cards_do_not_fill_the_queue(self, conn, monkeypatch):
+        """Left out after the LIMIT, an excluded shop's cards — never read again,
+        so always the oldest — took every place and nothing was checked."""
+        keep = dbm.upsert_store(conn, "keep.example", platform="shopify", status="ok")
+        gone = dbm.upsert_store(conn, "gone.example", platform="shopify", status="ok")
+        for n in range(100):
+            _a_card(conn, gone, f"old{n}", checked=ts(30))
+        kept = {_a_card(conn, keep, f"new{n}", checked=ts(2)) for n in range(30)}
+        monkeypatch.setattr(dbm, "load_excluded", lambda: frozenset({"gone.example"}))
+
+        rows = dbm.stale_offers(conn, 60, ("shopify",))
+
+        assert {row["product_id"] for row in rows} == kept
+
+    def test_an_empty_list_changes_nothing(self, conn, monkeypatch):
+        dbm.upsert_store(conn, "keep.example", platform="shopify")
+        monkeypatch.setattr(dbm, "load_excluded", lambda: frozenset())
+
+        assert [s["domain"] for s in dbm.get_stores(conn)] == ["keep.example"]
+
+
+def test_the_shipped_exclusion_file_parses(tmp_path):
+    from pi.domains import load_excluded
+
+    path = tmp_path / "excluded.txt"
+    path.write_text(
+        "# a comment\n\nWWW.Gone.Example  # trailing\nother.example\n", encoding="utf-8"
+    )
+    assert load_excluded(path) == frozenset({"gone.example", "other.example"})
+
+
+class TestHowFreshTheShelfIs:
+    def test_the_share_confirmed_within_two_days_is_counted(self, conn):
+        store = dbm.upsert_store(conn, "shop.example", platform="shopify", status="ok",
+                                 last_ok=ts(0))
+        _a_card(conn, store, "today", checked=ts(0.5))
+        _a_card(conn, store, "stale", checked=ts(3))
+        _a_card(conn, store, "tagged", checked=ts(0), source="tag")  # not on the default shelf
+
+        assert dbm.shelf_freshness(conn) == (1, 2)
+
+
+class TestWhenAProductWasLastSeen:
+    """A large shop is read a slice at a time, so its last read says nothing
+    about a product outside the slice. shop.simon.com holds 77,000 products in
+    the database and pages through 25,000; a rebuilt shelf put back cards for
+    products it no longer lists, each saying «проверено сегодня»."""
+
+    def _card(self, conn, seen_days_ago):
+        store = dbm.upsert_store(conn, "shop.example", platform="shopify", status="ok",
+                                 last_ok=ts(0))
+        card = _a_card(conn, store, "card", checked=ts(0))
+        conn.execute("UPDATE products SET last_seen = ? WHERE id = ?", (ts(seen_days_ago), card))
+        return card
+
+    def test_a_product_nobody_has_seen_for_a_week_is_off_the_page(self, conn):
+        self._card(conn, seen_days_ago=8)
+        assert dbm.offers_for(conn) == ([], 0)
+        assert dbm.shelf_facets(conn)["total"] == 0
+        assert dbm.shelf_freshness(conn) == (0, 0)
+
+    def test_one_seen_this_week_is_on_it(self, conn):
+        card = self._card(conn, seen_days_ago=6)
+        rows, total = dbm.offers_for(conn)
+        assert [row["product_id"] for row in rows] == [card] and total == 1
+
+    def test_a_card_written_now_says_when_its_product_was_seen(self, conn):
+        store = dbm.upsert_store(conn, "shop.example", platform="shopify", last_ok=ts(0))
+        product = dbm.upsert_product(conn, store, "p", "Shoe", "https://shop.example/p")
+        variant = dbm.upsert_variant(conn, product, "v")
+        seen = ts(5)
+        conn.execute("UPDATE products SET last_seen = ? WHERE id = ?", (seen, product))
+        deal = dealm.Deal(
+            variant_id=variant, product_id=product, price_usd=50.0, reference_usd=100.0,
+            reference_source="history", discount_pct=50.0, saving_usd=50.0, score=80,
+            all_time_low=False, fake_sale=False, dropped_hours_ago=None, history_points=2,
+        )
+
+        dbm.record_offers(conn, [variant], [deal], ts(0))
+
+        assert conn.execute("SELECT checked_at FROM offers").fetchone()[0] == seen, (
+            "not the shop's last read, which never looked at this product"
+        )
+
+    def test_the_migration_starts_it_from_the_last_recorded_price(self, tmp_path):
+        path = tmp_path / "old.db"
+        conn = dbm.connect(path)
+        store = dbm.upsert_store(conn, "shop.example", platform="shopify")
+        product = dbm.upsert_product(conn, store, "p", "Shoe", "https://shop.example/p")
+        variant = dbm.upsert_variant(conn, product, "v")
+        dbm.record_price(conn, variant, 50.0, None, True, "USD", 50.0, 1.0, ts=ts(9))
+        latest = ts(3)
+        dbm.record_price(conn, variant, 45.0, None, True, "USD", 45.0, 1.0, ts=latest)
+        conn.execute("UPDATE products SET last_seen = NULL")
+        conn.execute("PRAGMA user_version = 15")
+        conn.close()
+
+        migrated = dbm.connect(path)
+
+        assert migrated.execute("SELECT last_seen FROM products").fetchone()[0] == latest

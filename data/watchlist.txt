@@ -1,10 +1,12 @@
-# Article numbers to be told about whatever the thresholds say.
+# Что отслеживать вне зависимости от порогов — по строке на запись.
 #
-# One per line, written the way the manufacturer writes it. Matched against the
-# article numbers found in titles and SKUs, and against the shops' own SKUs.
-# Lines starting with # are ignored, so this file can be left as it is.
+# Номер модели: без пробелов и хотя бы с одной цифрой, как пишет
+# производитель — CW2288-111, M2002RDB. Сверяется и с артикулами, которые
+# мы извлекаем, и с собственными SKU магазинов.
 #
-# Examples — delete the # to switch one on:
-# CW2288-111    # Nike Air Force 1 '07 White
-# M2002RDB      # New Balance 2002R
-# 1201A019-021  # ASICS Gel-Kayano 14
+# Название: всё остальное — «Salomon XT-6», «Salomon», «сумка на пояс».
+# Это поиск, а не совпадение: одно название найдёт много разных товаров,
+# и обо всех расскажут. Тот же поиск, что у `pi price`.
+#
+# Строки, начинающиеся с #, игнорируются, так что файл можно оставить как есть.
+#

@@ -251,6 +251,45 @@ class TestAnInflatedReferencePrice:
         assert deal.reference_usd == pytest.approx(200.0)
         assert deal.beats_market, "cheaper than every shop we can see"
 
+    def test_a_price_four_times_below_every_other_shop_is_not_the_same_thing(self, filters):
+        """allikestore.com's "Sean Wotherspoon" at $55.98 against the $1,100
+        resale shops ask topped the shelf at −95%. Prices that far apart are the
+        rule agreeing_prices keeps between other shops: different things."""
+        history = make_history([(55.98, None, 0)])
+        market = Market(median_usd=1099.88, low_usd=700.0, shops=5)
+        deal = deals.evaluate(1, 1, 55.98, None, True, history, filters, market=market)
+        assert deal is None
+
+    def test_their_recommended_price_goes_with_them(self, filters):
+        """Review 24.09: the same shops' struck-through $180 made the $55.98 find
+        −69% against msrp, score 100, an all-time low worth interrupting for."""
+        # A day of history: too short for the shop's own floor to decide.
+        history = make_history([(60.0, None, 1), (55.98, None, 0)])
+        market = Market(median_usd=1099.88, low_usd=700.0, shops=5, msrp_usd=180.0, msrp_shops=3)
+        assert deals.evaluate(1, 1, 55.98, None, True, history, filters, market=market) is None
+
+    def test_a_find_measured_otherwise_does_not_show_their_view(self, filters):
+        history = make_history([(200.0, None, 10), (55.98, None, 0)])
+        market = Market(median_usd=1099.88, low_usd=700.0, shops=5, msrp_usd=180.0, msrp_shops=3)
+        deal = deals.evaluate(1, 1, 55.98, None, True, history, filters, market=market)
+        assert deal is not None and deal.reference_source == "history"
+        assert deal.market_shops == 0 and deal.market_median_usd is None
+        assert deal.msrp_usd is None
+
+    def test_nor_does_the_shops_own_tag_speak_then(self, filters):
+        """Dropping the msrp also switched off the inflated-tag test, which
+        compares the tag with it — so the shop's "was $300" became the reference."""
+        history = make_history([(60.0, 300.0, 1), (55.98, 300.0, 0)])
+        market = Market(median_usd=1099.88, low_usd=700.0, shops=5, msrp_usd=180.0, msrp_shops=3)
+        assert deals.evaluate(1, 1, 55.98, 300.0, True, history, filters, market=market) is None
+
+    def test_a_deep_but_believable_cut_against_the_market_still_counts(self, filters):
+        history = make_history([(80.0, None, 0)])
+        market = Market(median_usd=300.0, low_usd=260.0, shops=5)
+        deal = deals.evaluate(1, 1, 80.0, None, True, history, filters, market=market)
+        assert deal is not None and deal.reference_source == "market"
+        assert deal.discount_pct == pytest.approx(73.3, abs=0.1)
+
     def test_a_tag_far_above_the_recommended_price_is_not_used(self, filters):
         """Six shops strike through 200; this one strikes through 300. The 300 is
         this shop's invention, so it is not a reference for anything."""
@@ -360,3 +399,24 @@ def _evaluate(price, compare_at):
         in_stock=True, history=history,
         filters=Filters(min_discount_pct=30.0, min_saving_usd=10.0),
     )
+
+
+class TestAFindOnlyAStarLetThrough:
+    """A followed product skips the bars so its follower hears small moves; the
+    deal says whether it would have cleared them anyway (review 24.09)."""
+
+    def test_a_small_move_on_a_followed_product_is_not_on_merit(self, filters):
+        history = make_history([(100.0, None, 10), (97.0, None, 0)])
+        assert deals.evaluate(1, 1, 97.0, None, True, history, filters) is None
+        deal = deals.evaluate(1, 1, 97.0, None, True, history, filters, watched=True)
+
+        assert deal is not None and deal.watched
+        assert not deal.on_merit
+
+    def test_a_real_discount_is_on_merit_followed_or_not(self, filters):
+        history = make_history([(200.0, None, 10), (100.0, None, 0)])
+        plain = deals.evaluate(1, 1, 100.0, None, True, history, filters)
+        followed = deals.evaluate(1, 1, 100.0, None, True, history, filters, watched=True)
+
+        assert plain is not None and plain.on_merit
+        assert followed is not None and followed.on_merit

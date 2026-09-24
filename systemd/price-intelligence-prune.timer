@@ -2,7 +2,9 @@
 Description=Prune Price Intelligence history weekly
 
 [Timer]
-# Sunday, well away from the six-hourly collection slots.
+# Sunday night. It no longer has to dodge the hourly run by the clock: the
+# two take turns on the database (pi.db.collector_lock), so whichever starts
+# second waits for the first.
 OnCalendar=Sun *-*-* 04:30:00
 RandomizedDelaySec=30min
 Persistent=yes

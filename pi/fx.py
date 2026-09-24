@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections import Counter
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -40,14 +41,20 @@ class Rates:
         self.rates.setdefault("USD", 1.0)
         self.fetched_at = fetched_at
         self.source = source
+        # Prices thrown away for want of a rate, by the currency they named.
+        # Counted rather than logged one by one: www.ssense.com's Saudi pages
+        # quote "USE", which is no currency, and wrote 536 identical warnings a
+        # day. The run logs the tally once (see pipeline.run).
+        self.dropped: Counter[str] = Counter()
 
     def to_usd(self, amount: float, currency: str | None) -> tuple[float, float] | None:
         """Return (usd_amount, rate_used), or None if the currency is unknown."""
         if not currency:
             return None
-        rate = self.rates.get(currency.upper())
+        code = currency.upper()
+        rate = self.rates.get(code)
         if not rate or rate <= 0:
-            log.warning("no exchange rate for %s — price dropped", currency)
+            self.dropped[code] += 1
             return None
         return round(amount / rate, 2), rate
 

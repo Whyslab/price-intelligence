@@ -1,20 +1,23 @@
 """SQLite access. Plain SQL, one connection helper, schema versioned by PRAGMA."""
 from __future__ import annotations
 
+import fcntl
 import logging
 import re
 import sqlite3
+import time
+from collections import Counter
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from . import reference
-from .domains import same_shop
+from .domains import load_excluded, same_host, same_shop
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 16
 SCHEMA_SQL = Path(__file__).with_name("schema.sql")
 
 
@@ -44,8 +47,55 @@ def connect(path: Path | str) -> sqlite3.Connection:
     # already checkpointed and none of it needed. With a limit set, each
     # checkpoint truncates the file back down to it.
     conn.execute(f"PRAGMA journal_size_limit = {WAL_SIZE_LIMIT}")
-    migrate(conn)
+    # One process at a time. The bot, the shelf and the hourly run all open the
+    # database, and after an upgrade they start within a second of each other:
+    # two of them adding the same column is "duplicate column name" and a
+    # process that does not start. The loser waits, then finds nothing to do.
+    with _migration_lock(path):
+        migrate(conn)
     return conn
+
+
+@contextmanager
+def collector_lock(path: Path | str, wait_seconds: float) -> Iterator[bool]:
+    """Hold the database for one heavy writer at a time. Yields whether it did.
+
+    The hourly run and the weekly prune are the two large writers, and on
+    20.09.2026 they met: the prune's deletes held the write lock past the run's
+    thirty-second patience, and the run died on "database is locked" twice in
+    a row. The same goes for a rebuild of the shelf or of the article index
+    started by hand while a sweep is going.
+
+    Waits up to `wait_seconds` for the holder to finish, then yields False
+    rather than raising, so the caller can say plainly that it stood aside.
+    """
+    lock = Path(path).with_name(Path(path).name + ".lock")
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock, "a") as handle:
+        deadline = time.monotonic() + max(0.0, wait_seconds)
+        while True:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    yield False
+                    return
+                time.sleep(min(5.0, max(0.05, deadline - time.monotonic())))
+        try:
+            yield True
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+@contextmanager
+def _migration_lock(path: Path) -> Iterator[None]:
+    with open(path.with_name(path.name + ".migrate.lock"), "a") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
 
 
 def migrate(conn: sqlite3.Connection) -> None:
@@ -76,6 +126,8 @@ def migrate(conn: sqlite3.Connection) -> None:
         _migrate_5_to_6(conn)
     if current < 10:
         _migrate_9_to_10(conn)
+    if 0 < current < 16:
+        _migrate_15_to_16(conn)
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
 
@@ -257,6 +309,100 @@ def _migrate_9_to_10(conn: sqlite3.Connection) -> None:
         conn.execute("PRAGMA foreign_keys = ON")
 
 
+def _migrate_15_to_16(conn: sqlite3.Connection) -> None:
+    """Give back the products a short catalogue page marked as withdrawn.
+
+    Until 16 a Shopify pass stopped at the first page shorter than 250 and,
+    having started at page one, called that the whole shop. Shopify returns
+    short pages in the middle of a catalogue — it cuts the page and then drops
+    what this visitor may not buy — so shops were declared mostly withdrawn
+    while still selling everything: 76,062 products at shop.simon.com on
+    22.09, 23,955 at italist on 13.09, 4,182 at Sneakersnstuff on 21.09. Every
+    sampled one answered 200. Two weeks after the mark `pi prune` deletes a
+    product with its whole price history, so the marks have to go before that.
+
+    Only marks made in a batch are undone: a pass writes one timestamp for
+    everything it withdraws, while the one-by-one check marks a single product
+    after its own page answered 404. A genuine withdrawal undone here is marked
+    again by the next full read of its shop, which now reads to the empty page.
+    Nothing is deleted either way; the offers these products lost come back
+    with `pi reshelve`.
+    """
+    restored = conn.execute(
+        """
+        UPDATE products SET missing_since = NULL
+         WHERE missing_since IS NOT NULL
+           AND store_id IN (SELECT id FROM stores WHERE platform = 'shopify')
+           AND (store_id, missing_since) IN (
+                   SELECT store_id, missing_since FROM products
+                    WHERE missing_since IS NOT NULL
+                    GROUP BY store_id, missing_since
+                   HAVING COUNT(*) > 1)
+        """
+    ).rowcount
+    if restored:
+        log.warning(
+            "restored %d product(s) a short catalogue page had marked as withdrawn "
+            "— run `pi reshelve` to put their offers back on the shelf", restored,
+        )
+    # Nothing recorded when a product was last seen before this column, so it
+    # starts from the best evidence there is: the last time its price was
+    # written, or — for what is on the shelf — the last read that listed it,
+    # which mark_offers_seen has been writing onto the offer since 12.09. Both
+    # are moments it certainly was seen; the next read of its shop brings it up
+    # to date.
+    conn.execute(
+        """
+        CREATE TEMP TABLE pi_last_point AS
+        SELECT v.product_id AS id, MAX(pp.ts) AS ts
+          FROM variants v JOIN price_points pp ON pp.variant_id = v.id
+         GROUP BY v.product_id
+        """
+    )
+    conn.execute(
+        """
+        UPDATE pi_last_point SET ts = shelf.seen
+          FROM (SELECT product_id, MAX(checked_at) AS seen FROM offers GROUP BY product_id)
+               AS shelf
+         WHERE shelf.product_id = pi_last_point.id AND shelf.seen > pi_last_point.ts
+        """
+    )
+    conn.execute(
+        """
+        UPDATE products SET last_seen = pi_last_point.ts
+          FROM pi_last_point
+         WHERE pi_last_point.id = products.id AND products.last_seen IS NULL
+        """
+    )
+    conn.execute("DROP TABLE temp.pi_last_point")
+    # And the links two shops' markup gave relative (`/nl/p/…`), which the
+    # crawler now resolves as it reads. Written out once so every surface — the
+    # bot's buttons above all, where one broke the whole message — gets an
+    # address it can open.
+    resolved = conn.execute(
+        """
+        UPDATE products
+           SET url = 'https://' || (SELECT domain FROM stores WHERE stores.id = products.store_id) || url
+         WHERE url LIKE '/%' AND url NOT LIKE '//%'
+        """
+    ).rowcount
+    if resolved:
+        log.info("resolved %d relative product link(s) against their shop", resolved)
+    # And www.ssense.com's picture addresses, stored with the template marker
+    # its pages fill in by script, so every one of them answered 404. The same
+    # substitution the crawler now makes as it reads (jsonld.IMAGE_TEMPLATES).
+    pictures = conn.execute(
+        """
+        UPDATE products
+           SET image_url = replace(image_url, '__IMAGE_PARAMS__',
+                                   'b_white,g_center,f_auto,q_auto:best')
+         WHERE instr(image_url, '__IMAGE_PARAMS__') > 0
+        """
+    ).rowcount
+    if pictures:
+        log.info("filled in the picture template on %d product(s)", pictures)
+
+
 def _rebuild_alerts(conn: sqlite3.Connection) -> None:
     conn.executescript(
         """
@@ -392,9 +538,45 @@ def get_stores(
     # Least-recently-collected first, so a run that cannot finish still makes
     # progress: the next one picks up where this one stopped instead of starting
     # at the top of the alphabet and re-collecting the same shops forever.
-    return conn.execute(
+    rows = conn.execute(
         sql + " ORDER BY last_ok IS NOT NULL, last_ok, domain", params
     ).fetchall()
+
+    # A shop that asked not to be visited is dropped here rather than in the
+    # sweep, because this is the single door every path goes through: the sweep,
+    # `detect`, `verify`, and `--stores` naming one by hand. The last one on
+    # purpose — "we do not want you here" is not a preference a debug flag gets
+    # to override.
+    excluded = load_excluded()
+    if not excluded:
+        return rows
+    kept = [row for row in rows if same_host(row["domain"]) not in excluded]
+    if len(kept) != len(rows):
+        log.info(
+            "%d shop(s) skipped: they are in data/excluded.txt", len(rows) - len(kept)
+        )
+    return kept
+
+
+
+def note_failed_run(conn: sqlite3.Connection, why: str) -> None:
+    """Say on the unfinished run row why it will never finish. Best effort."""
+    try:
+        conn.execute(
+            """
+            UPDATE runs SET note = ?
+             WHERE id = (SELECT MAX(id) FROM runs) AND finished_at IS NULL
+            """,
+            (f"failed: {why}"[:300],),
+        )
+    except sqlite3.Error:
+        log.warning("could not record why the run failed: %s", why)
+
+# The reader the free digest files its publications under. Defined here as well
+# as in pi.digest because the two counters below have to exclude it, and a
+# module that counts alerts importing the module that sends them would be a
+# cycle. See pi.digest.FREE_READER for what it means.
+DIGEST_READER = -1
 
 
 def productive_store_ids(conn: sqlite3.Connection, days: int) -> set[int]:
@@ -406,7 +588,10 @@ def productive_store_ids(conn: sqlite3.Connection, days: int) -> set[int]:
     hourly sweep would turn back into a six-hourly one for the shops that matter.
 
     Seeded rows are excluded — `sent = 0` marks a discount that was already
-    standing when collection began, which says nothing about the shop.
+    standing when collection began, which says nothing about the shop. So are
+    the free digest's, for exactly the same reason: being picked as one of two
+    advertisements says nothing about the shop either, and letting it count
+    would give sweep priority to whichever shops the digest happened to choose.
     """
     since = (datetime.now(UTC) - timedelta(days=days)).isoformat(timespec="seconds")
     rows = conn.execute(
@@ -414,9 +599,9 @@ def productive_store_ids(conn: sqlite3.Connection, days: int) -> set[int]:
         SELECT DISTINCT p.store_id
           FROM alerts a
           JOIN products p ON p.id = a.product_id
-         WHERE a.sent = 1 AND a.ts >= ?
+         WHERE a.sent = 1 AND a.user_id != ? AND a.ts >= ?
         """,
-        (since,),
+        (DIGEST_READER, since),
     )
     return {row["store_id"] for row in rows}
 
@@ -468,8 +653,12 @@ def record_offers(
 
     keep = {deal.variant_id for deal in qualifying}
     stale = [(variant_id,) for variant_id in scored if variant_id not in keep]
+    # Counted by what actually left the shelf. Counting the candidates instead
+    # logged "39 offer(s) on the shelf, 16126 withdrawn" for runs that had taken
+    # a handful of cards down: most of those 16,126 had never been on it.
+    removed = 0
     if stale:
-        conn.executemany("DELETE FROM offers WHERE variant_id = ?", stale)
+        removed = conn.executemany("DELETE FROM offers WHERE variant_id = ?", stale).rowcount
     conn.executemany(
         """
         INSERT INTO offers (
@@ -484,6 +673,7 @@ def record_offers(
                 ?
             ),
             COALESCE(
+                (SELECT last_seen FROM products WHERE id = ?),
                 (SELECT s.last_ok FROM stores s
                    JOIN products p ON p.store_id = s.id
                   WHERE p.id = ?),
@@ -509,7 +699,7 @@ def record_offers(
             (
                 deal.variant_id, deal.product_id,
                 dropped_at(deal), deal.variant_id, ts,   # found_at's COALESCE
-                deal.product_id, ts,                     # checked_at's COALESCE
+                deal.product_id, deal.product_id, ts,    # checked_at's COALESCE
                 deal.price_usd,
                 deal.reference_usd, deal.reference_source, deal.discount_pct,
                 deal.saving_usd, deal.score, int(deal.all_time_low),
@@ -517,7 +707,7 @@ def record_offers(
             for deal in qualifying
         ],
     )
-    return len(qualifying), len(stale)
+    return len(qualifying), removed
 
 
 # --- catalogue --------------------------------------------------------------
@@ -602,6 +792,7 @@ def record_price(
     fx_rate: float,
     ts: str | None = None,
     compare_at_native: float | None = None,
+    restocked: list[int] | None = None,
 ) -> bool:
     """Append a price point, but only if the shop actually changed something.
 
@@ -610,6 +801,10 @@ def record_price(
     at rates 1.2705 and 1.2713 became $123.97 and $123.89, and the second one was
     written down as news. That noise was most of the database, and it turned a
     currency wobble into an all-time low.
+
+    A variant that was sold out and is not any more is appended to `restocked`
+    when one is given: somebody following it wants to hear exactly that, and it
+    is the one moment the previous point is already in hand.
 
     Returns True when a row was written.
     """
@@ -621,6 +816,8 @@ def record_price(
         and bool(prev["in_stock"]) is bool(in_stock)
     ):
         return False
+    if restocked is not None and prev is not None and not prev["in_stock"] and in_stock:
+        restocked.append(variant_id)
     conn.execute(
         """
         INSERT OR REPLACE INTO price_points
@@ -659,6 +856,37 @@ def price_history(conn: sqlite3.Connection, variant_id: int) -> list[sqlite3.Row
     ).fetchall()
 
 
+def snapshot(conn: sqlite3.Connection, dest: Path) -> int:
+    """Write a consistent copy of the database to `dest`, returning its size.
+
+    Copying the file is not the same thing, and the difference is not academic.
+    The collector writes every hour into a write-ahead log that reaches tens of
+    megabytes; a copy taken mid-sweep catches the database without the tail of
+    the log that completes it. The backup that runs on this machine copies files
+    and deliberately has no pre-run hooks, so the only place this can be made
+    right is here.
+
+    `sqlite3`'s online backup API reads through the same locking the collector
+    uses, so the copy is a transaction-consistent database and the sweep is not
+    interrupted to make it. The result has no `-wal` beside it — it is finished.
+
+    Written to a temporary name and renamed, because the point of the file is to
+    be a good copy: a backup that starts while this is half-written should find
+    yesterday's whole snapshot rather than today's partial one.
+    """
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    staging = dest.with_name(dest.name + ".part")
+    staging.unlink(missing_ok=True)
+    target = sqlite3.connect(staging)
+    try:
+        conn.backup(target)
+    finally:
+        target.close()
+    staging.replace(dest)
+    return dest.stat().st_size
+
+
 def prune_history(conn: sqlite3.Connection, keep_days: int = 180) -> int:
     """Delete price points older than keep_days, returning how many went.
 
@@ -669,15 +897,39 @@ def prune_history(conn: sqlite3.Connection, keep_days: int = 180) -> int:
     cutoff = (
         datetime.now(UTC) - timedelta(days=keep_days)
     ).isoformat(timespec="seconds")
-    cur = conn.execute(
-        """
-        DELETE FROM price_points
-        WHERE ts < ?
-          AND ts <> (SELECT MAX(ts) FROM price_points p WHERE p.variant_id = price_points.variant_id)
-        """,
-        (cutoff,),
-    )
-    return cur.rowcount
+    doomed = [
+        row[0]
+        for row in conn.execute(
+            """
+            SELECT rowid FROM price_points
+            WHERE ts < ?
+              AND ts <> (SELECT MAX(ts) FROM price_points p
+                          WHERE p.variant_id = price_points.variant_id)
+            """,
+            (cutoff,),
+        )
+    ]
+    return _delete_in_batches(conn, "DELETE FROM price_points WHERE rowid IN ({})", doomed)
+
+
+# Rows deleted per transaction by the weekly prune. Small enough that the write
+# lock is held for a moment at a time: the hourly run and the bot write between
+# batches instead of waiting behind one statement for minutes and giving up.
+PRUNE_BATCH = 2000
+
+
+def _delete_in_batches(
+    conn: sqlite3.Connection, sql: str, ids: Sequence[int], batch: int = PRUNE_BATCH
+) -> int:
+    """Run `sql` (one `{}` for the id list) over `ids` a batch at a time."""
+    deleted = 0
+    for start in range(0, len(ids), batch):
+        chunk = ids[start : start + batch]
+        with transaction(conn):
+            deleted += conn.execute(
+                sql.format(",".join("?" * len(chunk))), list(chunk)
+            ).rowcount
+    return deleted
 
 
 def mark_missing(
@@ -698,11 +950,7 @@ def mark_missing(
     -93% Wotherspoon, a 404 for a fortnight — is the single worst thing this
     project has ever shown anybody.
     """
-    conn.execute("DROP TABLE IF EXISTS temp.pi_seen")
-    conn.execute("CREATE TEMP TABLE pi_seen (id INTEGER PRIMARY KEY)")
-    conn.executemany(
-        "INSERT OR IGNORE INTO pi_seen (id) VALUES (?)", ((pid,) for pid in seen)
-    )
+    _seen_table(conn, seen)
     gone = conn.execute(
         """
         UPDATE products SET missing_since = ?
@@ -723,6 +971,67 @@ def mark_missing(
     )
     conn.execute("DROP TABLE IF EXISTS temp.pi_seen")
     return gone
+
+
+def _seen_table(conn: sqlite3.Connection, seen: Sequence[int]) -> None:
+    conn.execute("DROP TABLE IF EXISTS temp.pi_seen")
+    conn.execute("CREATE TEMP TABLE pi_seen (id INTEGER PRIMARY KEY)")
+    conn.executemany(
+        "INSERT OR IGNORE INTO pi_seen (id) VALUES (?)", ((pid,) for pid in seen)
+    )
+
+
+def withdrawal_candidates(
+    conn: sqlite3.Connection, store_id: int, seen: Sequence[int]
+) -> list[sqlite3.Row]:
+    """What `mark_missing` would mark for this shop, without marking it.
+
+    Asked first so a read claiming that much of a shop has gone can be checked
+    before it is believed — see pipeline.withdraw_missing.
+    """
+    _seen_table(conn, seen)
+    try:
+        return conn.execute(
+            """
+            SELECT id, url, external_id, last_seen FROM products
+             WHERE store_id = ? AND missing_since IS NULL
+               AND id NOT IN (SELECT id FROM pi_seen)
+             ORDER BY id
+            """,
+            (store_id,),
+        ).fetchall()
+    finally:
+        conn.execute("DROP TABLE IF EXISTS temp.pi_seen")
+
+
+def missing_external_ids(conn: sqlite3.Connection, store_id: int) -> set[str]:
+    """The shop's own ids for what is marked as withdrawn there."""
+    return {
+        row[0]
+        for row in conn.execute(
+            "SELECT external_id FROM products WHERE store_id = ? AND missing_since IS NOT NULL",
+            (store_id,),
+        )
+    }
+
+
+def live_external_ids(conn: sqlite3.Connection, store_id: int) -> set[str]:
+    """The shop's own ids for everything it is held to be selling."""
+    return {
+        row[0]
+        for row in conn.execute(
+            "SELECT external_id FROM products WHERE store_id = ? AND missing_since IS NULL",
+            (store_id,),
+        )
+    }
+
+
+def live_products(conn: sqlite3.Connection, store_id: int) -> int:
+    """How many of this shop's products are not marked as withdrawn."""
+    return conn.execute(
+        "SELECT COUNT(*) FROM products WHERE store_id = ? AND missing_since IS NULL",
+        (store_id,),
+    ).fetchone()[0]
 
 
 def mark_product_missing(conn: sqlite3.Connection, product_id: int, ts: str) -> bool:
@@ -750,10 +1059,18 @@ def drop_delisted(conn: sqlite3.Connection, grace_days: int) -> int:
     cutoff = (
         datetime.now(UTC) - timedelta(days=grace_days)
     ).isoformat(timespec="seconds")
-    return conn.execute(
-        "DELETE FROM products WHERE missing_since IS NOT NULL AND missing_since < ?",
-        (cutoff,),
-    ).rowcount
+    doomed = [
+        row[0]
+        for row in conn.execute(
+            "SELECT id FROM products WHERE missing_since IS NOT NULL AND missing_since < ?",
+            (cutoff,),
+        )
+    ]
+    # A product takes its variants, history, offers and alerts with it, so a
+    # batch of products is many times as many rows: kept small for that reason.
+    return _delete_in_batches(
+        conn, "DELETE FROM products WHERE id IN ({})", doomed, batch=PRUNE_BATCH // 10
+    )
 
 
 def confirm_offer(conn: sqlite3.Connection, product_id: int, ts: str) -> None:
@@ -767,15 +1084,76 @@ def confirm_offer(conn: sqlite3.Connection, product_id: int, ts: str) -> None:
     conn.execute("UPDATE offers SET checked_at = ? WHERE product_id = ?", (ts, product_id))
 
 
-def stale_offers(conn: sqlite3.Connection, limit: int, platforms: Sequence[str]) -> list[sqlite3.Row]:
-    """What is on the shelf and has gone longest without being looked at.
+def mark_offers_seen(
+    conn: sqlite3.Connection, variant_ids: Sequence[int], ts: str
+) -> int:
+    """Record that the shop showed us these variants just now.
 
-    Ordered by how long ago, then by score: a dead card at -80% on the first
-    screen does more damage than a dead one at -31% on the fifth. One row per
-    product — the check opens a page, and a page is a product.
+    `offers.checked_at` is what a card means by "проверено N назад", and until
+    this existed nothing wrote it except a re-score and a one-by-one verify. A
+    price that does not move is never re-scored — `record_price` writes a point
+    only when the shop changed something, deliberately, because otherwise a
+    daily exchange-rate tick becomes news — so a stable price aged on the card
+    while the sweep read it over and over.
+
+    Measured before this: 29,092 of 33,141 offers looked older than two days,
+    while 23,554 of them belong to a shop that had been read inside two days.
+    The shelf was not stale; the record of it was.
+
+    Written in one statement per chunk rather than per variant: a Shopify sweep
+    hands back tens of thousands at a time.
     """
-    if not platforms:
+    total = 0
+    for start in range(0, len(variant_ids), 900):
+        chunk = variant_ids[start : start + 900]
+        marks = ",".join("?" * len(chunk))
+        cursor = conn.execute(
+            f"UPDATE offers SET checked_at = ? WHERE variant_id IN ({marks})",
+            [ts, *chunk],
+        )
+        total += cursor.rowcount
+    return total
+
+
+def mark_products_seen(conn: sqlite3.Connection, product_ids: Sequence[int], ts: str) -> None:
+    """Record that a read of the shop just listed these products."""
+    for start in range(0, len(product_ids), 900):
+        chunk = product_ids[start : start + 900]
+        marks = ",".join("?" * len(chunk))
+        conn.execute(f"UPDATE products SET last_seen = ? WHERE id IN ({marks})", [ts, *chunk])
+
+
+def latest_price_usd(conn: sqlite3.Connection, variant_id: int) -> float | None:
+    """The newest price recorded for one variant, or None if it has none."""
+    row = conn.execute(
+        """
+        SELECT price_usd FROM price_points
+         WHERE variant_id = ?
+         -- `rowid` breaks the tie, and there is one to break: a run that
+         -- collects a price and then confirms it before announcing writes both
+         -- points in the same second, and `ts DESC` alone may then answer with
+         -- the older of the two.
+         ORDER BY ts DESC, rowid DESC LIMIT 1
+        """,
+        (variant_id,),
+    ).fetchone()
+    return None if row is None else row[0]
+
+
+def offers_to_confirm(
+    conn: sqlite3.Connection, product_ids: Sequence[int], platforms: Sequence[str]
+) -> list[sqlite3.Row]:
+    """The same shape `stale_offers` returns, for named products.
+
+    What a notification is about has to be asked after the run has decided to
+    send it and before it arrives: the price it quotes was read from a catalogue
+    page that may be an hour old, and an hour is long enough for the shop to
+    have put it back up. Same columns as `stale_offers` so the one fetch path
+    serves both.
+    """
+    if not product_ids or not platforms:
         return []
+    pids = ",".join("?" * len(product_ids))
     marks = ",".join("?" * len(platforms))
     return conn.execute(
         f"""
@@ -785,13 +1163,142 @@ def stale_offers(conn: sqlite3.Connection, limit: int, platforms: Sequence[str])
           FROM offers o
           JOIN products p ON p.id = o.product_id
           JOIN stores   s ON s.id = p.store_id
-         WHERE p.missing_since IS NULL AND s.platform IN ({marks})
+         WHERE p.id IN ({pids}) AND s.platform IN ({marks})
          GROUP BY p.id
-         ORDER BY checked_at ASC, score DESC
-         LIMIT ?
         """,
-        [*platforms, limit],
+        [*product_ids, *platforms],
     ).fetchall()
+
+
+def excluded_store_ids(conn: sqlite3.Connection) -> list[int]:
+    """The shops in data/excluded.txt, by id.
+
+    get_stores is the door every read goes through, but a card is opened one
+    by one without it: a shop added to the list kept its cards, and the checks
+    kept opening its product pages (review 24.09).
+    """
+    excluded = load_excluded()
+    if not excluded:
+        return []
+    return [
+        row[0]
+        for row in conn.execute("SELECT id, domain FROM stores")
+        if same_host(row[1]) in excluded
+    ]
+
+
+# The share of one-by-one checks kept for cards the page hides because nobody
+# has seen their product for STALE_PRODUCT_DAYS. They are the oldest cards on
+# the shelf by construction, so in plain "oldest first" order they took every
+# check: after schema 16 gave back shop.simon.com's products beyond the 25,000
+# its catalogue pages through, 21,891 hidden cards stood at the front of the
+# queue — two weeks of checks during which no card anybody could see was
+# looked at. A check is still how a hidden card comes back, so they keep a
+# quarter.
+HIDDEN_CHECK_SHARE = 0.25
+
+
+def stale_offers(conn: sqlite3.Connection, limit: int, platforms: Sequence[str]) -> list[sqlite3.Row]:
+    """What is on the shelf and has gone longest without being looked at.
+
+    Ordered by how long ago, then by score: a dead card at -80% on the first
+    screen does more damage than a dead one at -31% on the fifth. One row per
+    product — the check opens a page, and a page is a product.
+
+    "How long ago" counts the last attempt as well as the last answer. Ordered
+    by the answer alone, a card whose page never loads stays the oldest thing
+    on the shelf for ever: 34 cards from www.kickz.com, whose pages stopped
+    carrying prices on 03.09, took 45 of every 60 checks for three weeks and
+    the rest of the shelf waited behind them.
+
+    Shops whose last read failed are left out. A shop that cannot serve its
+    catalogue will not serve one product either, and its cards are already off
+    the page once it has been silent long enough (see fresh_shop_clause).
+    """
+    if not platforms or limit <= 0:
+        return []
+    marks = ",".join("?" * len(platforms))
+    cutoff = (datetime.now(UTC) - timedelta(days=STALE_PRODUCT_DAYS)).isoformat(
+        timespec="seconds"
+    )
+    # Left out in the query, before the limit: an excluded shop is never read
+    # again, so its cards only grow older, and filtered after the LIMIT they
+    # would fill it and leave nothing to check at all.
+    skip = excluded_store_ids(conn)
+    not_skipped = f" AND s.id NOT IN ({','.join('?' * len(skip))})" if skip else ""
+
+    def oldest(hidden: bool) -> list[sqlite3.Row]:
+        seen = "p.last_seen < ?" if hidden else "(p.last_seen IS NULL OR p.last_seen >= ?)"
+        return conn.execute(
+            f"""
+            SELECT p.id AS product_id, p.url, p.external_id, p.store_id,
+                   s.domain, s.platform, s.currency,
+                   MIN(o.checked_at) AS checked_at, MAX(o.score) AS score,
+                   MIN(CASE WHEN o.tried_at > o.checked_at THEN o.tried_at
+                            ELSE o.checked_at END) AS due_at
+              FROM offers o
+              JOIN products p ON p.id = o.product_id
+              JOIN stores   s ON s.id = p.store_id
+             WHERE p.missing_since IS NULL AND s.platform IN ({marks})
+               AND s.status = 'ok' AND {seen}{not_skipped}
+             GROUP BY p.id
+             ORDER BY due_at ASC, score DESC
+             LIMIT ?
+            """,
+            [*platforms, cutoff, *skip, limit],
+        ).fetchall()
+
+    shown, hidden = oldest(hidden=False), oldest(hidden=True)
+    # A quarter for the hidden, unless there are fewer of either to check.
+    kept_back = min(len(hidden), max(1, int(limit * HIDDEN_CHECK_SHARE)))
+    first = shown[: limit - kept_back]
+    return first + hidden[: limit - len(first)]
+
+
+def note_attempt(conn: sqlite3.Connection, product_id: int, ts: str) -> None:
+    """Record that a one-by-one check asked about this product, answered or not."""
+    conn.execute("UPDATE offers SET tried_at = ? WHERE product_id = ?", (ts, product_id))
+
+
+# How long a shop may go without one successful read before its cards leave the
+# page. Three days is three of the slowest shops' daily turns: a shop that has
+# missed that many is not having a bad hour, and a price nobody could confirm
+# for three days is not one to show as current. www.kickz.com's 34 cards sat on
+# the shelf for 20 days after its pages stopped carrying prices, each saying
+# "проверено 20 дн назад" under a discount that may not have existed.
+STALE_SHOP_HOURS = 72
+
+
+# How long a product may go unseen before its card leaves the page. A large
+# shop is read a slice at a time, so a product can sit outside the slices it
+# reaches — shop.simon.com holds 77,000 products in the database and lists
+# 25,000 that its catalogue will page through. A week is several full reads of
+# any Shopify shop being read at all; a crawled (jsonld) shop can take two to
+# five weeks to come round to one page, and what keeps its cards seen is the
+# one-by-one check (stale_offers), not the crawl.
+STALE_PRODUCT_DAYS = 7
+
+
+def fresh_shop_clause(alias: str = "s", product: str | None = None) -> tuple[str, list[str]]:
+    """SQL and its parameters for "this shop — and this product — seen recently".
+
+    Hidden, not deleted: the moment the shop reads again its cards are back,
+    exactly as they were, and nothing has to be rescored for it.
+    """
+    now = datetime.now(UTC)
+    shop_cutoff = (now - timedelta(hours=STALE_SHOP_HOURS)).isoformat(timespec="seconds")
+    # A shop never read at all has no cards to hide, so NULL is let through
+    # rather than treated as ancient: it keeps a shelf built by hand — a test,
+    # an import — from coming up blank for no reason anyone could see.
+    sql = f"({alias}.last_ok IS NULL OR {alias}.last_ok >= ?)"
+    params = [shop_cutoff]
+    if product:
+        product_cutoff = (now - timedelta(days=STALE_PRODUCT_DAYS)).isoformat(
+            timespec="seconds"
+        )
+        sql += f" AND ({product}.last_seen IS NULL OR {product}.last_seen >= ?)"
+        params.append(product_cutoff)
+    return sql, params
 
 
 def drop_orphans(conn: sqlite3.Connection) -> dict[str, int]:
@@ -800,12 +1307,20 @@ def drop_orphans(conn: sqlite3.Connection) -> dict[str, int]:
     A shop that delists a product stops returning it, so its rows linger with
     no history behind them. They cost space and can never produce a deal.
     """
-    variants = conn.execute(
-        "DELETE FROM variants WHERE id NOT IN (SELECT DISTINCT variant_id FROM price_points)"
-    ).rowcount
-    products = conn.execute(
-        "DELETE FROM products WHERE id NOT IN (SELECT DISTINCT product_id FROM variants)"
-    ).rowcount
+    orphan_variants = [
+        row[0]
+        for row in conn.execute(
+            "SELECT id FROM variants WHERE id NOT IN (SELECT DISTINCT variant_id FROM price_points)"
+        )
+    ]
+    variants = _delete_in_batches(conn, "DELETE FROM variants WHERE id IN ({})", orphan_variants)
+    orphan_products = [
+        row[0]
+        for row in conn.execute(
+            "SELECT id FROM products WHERE id NOT IN (SELECT DISTINCT product_id FROM variants)"
+        )
+    ]
+    products = _delete_in_batches(conn, "DELETE FROM products WHERE id IN ({})", orphan_products)
     return {"variants": variants, "products": products}
 
 
@@ -816,6 +1331,19 @@ _PROFILE_FIELDS = ("genders", "kinds", "sizes", "brands")
 
 def get_bot_user(conn: sqlite3.Connection, user_id: int) -> sqlite3.Row | None:
     return conn.execute("SELECT * FROM bot_users WHERE id = ?", (user_id,)).fetchone()
+
+
+# Every column anything may write through `upsert_bot_user`. The union of what
+# the bot writes and what `comp` needs — narrower policies live closer to their
+# callers (see Bot.WRITABLE), but the SQL below is built from caller-supplied
+# keys, and that is the surface an allowlist has to cover. Until recently this
+# table held nothing but profile fields and the absence of a check here cost
+# nothing; the day it held `paid_until`, a forged button payload was a free
+# subscription. A future caller cannot forget to consult this one.
+BOT_USER_COLUMNS = frozenset(
+    {"chat_id", "username", "genders", "kinds", "sizes", "brands",
+     "wizard_step", "onboarded", "active"}
+)
 
 
 def upsert_bot_user(
@@ -837,11 +1365,361 @@ def upsert_bot_user(
         (user_id, chat_id, username, utcnow()),
     )
     if fields:
+        unknown = set(fields) - BOT_USER_COLUMNS
+        if unknown:
+            raise ValueError(f"not writable through upsert_bot_user: {sorted(unknown)}")
         assigns = ", ".join(f"{key} = :{key}" for key in fields)
         conn.execute(
             f"UPDATE bot_users SET {assigns} WHERE id = :id", {**fields, "id": user_id}
         )
     return get_bot_user(conn, user_id)
+
+
+# --- subscription -----------------------------------------------------------
+
+# How long a lapsed subscription keeps its feed after the date it was paid to.
+#
+# A card that fails once is the usual reason a subscription ends, and it is
+# almost never the reason the person wanted it to. Cutting everything at
+# midnight of the paid-to date turns a bank's hiccup into a lost reader, so the
+# feed keeps running for three more days while the shelf does not — enough to
+# notice the reminder, not enough to be a free month.
+SUBSCRIPTION_GRACE_DAYS = 3
+
+
+def _moment(stamp: str) -> datetime:
+    """A stored timestamp as an aware datetime, whatever shape it was written in.
+
+    `grant` writes `2026-09-05T12:56:00+00:00`, and everything in this project
+    that writes a timestamp writes that. A human comping a subscriber does not:
+    `UPDATE bot_users SET paid_until = datetime('now','+30 days')` is the obvious
+    thing to type, and SQLite answers it with a space instead of the T and no
+    offset at all.
+
+    Both shapes have to be read, and neither may be compared as a string. ' '
+    sorts below 'T', so the two forms of the same instant do not compare equal
+    or even consistently — a hand-written row reads as earlier than an ISO one
+    and gets swept out of a subscription up to a day early. And a naive datetime
+    raises against an aware one, which took down the whole hourly notification
+    pass for every reader, from one row.
+    """
+    parsed = datetime.fromisoformat(stamp.strip().replace(" ", "T", 1))
+    # SQLite's datetime() is UTC. So is everything this project writes.
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def _paid_until(
+    conn: sqlite3.Connection, only_active_plans: bool = False
+) -> list[tuple[int, datetime]]:
+    """Every reader with a paid-to date, parsed. The one place that reads them.
+
+    Readers are counted in the dozens, so filtering them in Python costs
+    nothing — and it buys the thing the SQL version could not have: exactly one
+    interpretation of a timestamp in the whole subscription module.
+
+    `only_active_plans` drops the long-lapsed, whose `plan` is already 'free'
+    and who therefore cannot be the answer to "who should be expired". Without
+    it the list grows with every reader who ever paid, forever, to build an
+    `IN (...)` that matches none of them.
+    """
+    sql = "SELECT id, paid_until FROM bot_users WHERE paid_until IS NOT NULL"
+    if only_active_plans:
+        sql += " AND plan != 'free'"
+    out = []
+    for row in conn.execute(sql):
+        try:
+            out.append((int(row["id"]), _moment(row["paid_until"])))
+        except ValueError:
+            log.warning(
+                "reader %s has an unreadable paid_until (%r) and is treated as "
+                "unsubscribed", row["id"], row["paid_until"],
+            )
+    return out
+
+
+def unreadable_dates(conn: sqlite3.Connection) -> int:
+    """How many readers have a paid_until nothing can parse.
+
+    Surfaced in the daily summary rather than only in the log. A row like this
+    logs a warning on every state check — hourly, forever — and a warning
+    nobody counts is a warning nobody acts on.
+    """
+    bad = 0
+    for row in conn.execute(
+        "SELECT paid_until FROM bot_users WHERE paid_until IS NOT NULL"
+    ):
+        try:
+            _moment(row["paid_until"])
+        except ValueError:
+            bad += 1
+    return bad
+
+
+def subscription_state(
+    conn: sqlite3.Connection, user_id: int, now: str | None = None
+) -> str:
+    """'paid', 'grace' or 'free' — the single answer to what this reader may see.
+
+    Three states, not a boolean, because the two things a subscription gates
+    stop at different moments: the shelf closes on the paid-to date, the feed
+    runs three days longer. One flag cannot say that, and every place that tried
+    would have to reinvent the same date arithmetic slightly differently.
+
+    The comparison is done here in Python rather than in SQL. Timestamps in this
+    database are `isoformat` — `2026-09-05T12:56:00+00:00` — and SQLite's own
+    `datetime('now')` produces a space instead of the T and no offset at all.
+    Comparing the two as strings is not an error; it silently matches nothing,
+    which would read as "nobody is subscribed" and never raise.
+    """
+    row = get_bot_user(conn, user_id)
+    if row is None or row["paid_until"] is None:
+        return "free"
+    moment = _moment(now) if now else datetime.now(UTC)
+    try:
+        until = _moment(row["paid_until"])
+    except ValueError:
+        log.warning(
+            "reader %s has an unreadable paid_until (%r) and is treated as "
+            "unsubscribed", user_id, row["paid_until"],
+        )
+        return "free"
+    if moment <= until:
+        return "paid"
+    if moment <= until + timedelta(days=SUBSCRIPTION_GRACE_DAYS):
+        return "grace"
+    return "free"
+
+
+def is_subscribed(conn: sqlite3.Connection, user_id: int, now: str | None = None) -> bool:
+    """Whether the shelf opens for this reader. Grace does not count.
+
+    Deliberately stricter than `subscription_state`: the grace period exists to
+    keep a feed running through a failed renewal, not to hand out the thing
+    being sold. Anything gating the shelf, the search or the article lookup asks
+    this; only the feed asks for the state itself.
+    """
+    return subscription_state(conn, user_id, now) == "paid"
+
+
+def grant(
+    conn: sqlite3.Connection,
+    user_id: int,
+    days: int = 30,
+    charge_id: str | None = None,
+    stars: int = 0,
+    recurring: bool = False,
+) -> sqlite3.Row:
+    """Extend a subscription, returning the reader.
+
+    Time is added to whichever is later, now or the date already paid to, so
+    that paying early adds a month instead of throwing away the rest of the one
+    already bought. Paying after a lapse starts from today, because the days in
+    between were not sold to anybody.
+
+    `stars_paid` accumulates and `plan_since` is set once and never moved: a
+    reader who leaves and comes back is not a new reader, and a refund of the
+    last month should not erase that the year before was paid for.
+
+    `recurring` says this charge is the one that renews itself, and only such a
+    charge is remembered as `sub_charge_id`. A monthly subscriber who also buys
+    a year would otherwise leave /cancel holding a one-off id, which Telegram
+    refuses to cancel while the monthly charge goes on firing.
+    """
+    moment = datetime.now(UTC)
+    # Read and write together. `--refund` clears four columns at once while this
+    # computes a date from a row it read earlier; interleaved, the write here
+    # would put back both the date and the charge id that were cleared to stop a
+    # second refund.
+    with transaction(conn):
+        row = get_bot_user(conn, user_id)
+        start = moment
+        if row is not None and row["paid_until"]:
+            start = max(moment, _moment(row["paid_until"]))
+        fields: dict[str, object] = {
+            "plan": "paid",
+            "paid_until": (start + timedelta(days=days)).isoformat(timespec="seconds"),
+            "plan_since": (
+                row["plan_since"] if row and row["plan_since"]
+                else moment.isoformat(timespec="seconds")
+            ),
+            "stars_paid": (row["stars_paid"] if row else 0) + stars,
+        }
+        if charge_id:
+            fields["charge_id"] = charge_id
+            if recurring:
+                fields["sub_charge_id"] = charge_id
+        assigns = ", ".join(f"{key} = :{key}" for key in fields)
+        cursor = conn.execute(
+            f"UPDATE bot_users SET {assigns} WHERE id = :id", {**fields, "id": user_id}
+        )
+    if cursor.rowcount != 1:
+        # An UPDATE against a reader who is not there matches nothing and says
+        # nothing, and the caller has already taken the money. Everywhere this
+        # is reached the row was upserted first, so this cannot happen — which
+        # is exactly why it must be loud if it ever does.
+        raise LookupError(f"no reader {user_id} to grant a subscription to")
+    return get_bot_user(conn, user_id)
+
+
+# What "access, indefinitely" is written as. A date rather than a null or a flag,
+# because every question this module answers is "until when?" — a second way of
+# saying yes would have to be handled in `subscription_state`, `expire_due`,
+# `expiring_soon`, the reminder and the summary, and the one that gets forgotten
+# is the bug.
+COMP_DAYS = 365 * 50
+
+
+def comp(
+    conn: sqlite3.Connection, user_id: int, days: int = COMP_DAYS
+) -> sqlite3.Row:
+    """Give somebody access without them paying for it.
+
+    Exists because the alternative is a hand-written UPDATE, and that is not a
+    hypothetical: `paid_until = datetime('now','+30 days')` is the obvious thing
+    to type, it stores a timestamp in a shape nothing else here writes, and it
+    used to take down the notification pass for every reader at once. A command
+    that writes the right shape is the fix that removes the reason to type it.
+
+    Creates the reader if they have never spoken to the bot, using their user id
+    as the chat id — in a private chat Telegram makes those the same number, so
+    the bot can write to them the moment they say /start, and the subscription
+    is already waiting.
+
+    No stars are recorded: nothing was paid, and the revenue line must not say
+    otherwise.
+    """
+    if user_id <= 0:
+        # Telegram gives groups and channels negative ids. Comping one makes it
+        # a subscriber with an empty profile — which means no filtering — and
+        # the next run publishes the whole discount feed into it. Refused here
+        # rather than only in the caller, because there are two callers.
+        raise ValueError(f"{user_id} is not a reader — group and channel ids are negative")
+    if get_bot_user(conn, user_id) is None:
+        upsert_bot_user(conn, user_id, chat_id=str(user_id))
+    return grant(conn, user_id, days=days)
+
+
+class StillRecurring(Exception):
+    """Raised when taking access away would not take it away."""
+
+
+def is_comped(row: sqlite3.Row | None) -> bool:
+    """Whether this access was given rather than bought.
+
+    Asked of the money, not of the date. A first attempt used "paid_until more
+    than five years out", and it was wrong in both directions at once: `grant`
+    is additive, so six yearly renewals cross five years and turn a customer who
+    paid 9,000 stars into a gift — subtracted from the very number the summary
+    exists to give — while a 90-day comp, which is what the panel's own help
+    text offers, was counted as a purchase. Duration was never the question.
+    `stars_paid == 0` beside a date is exactly "has access, paid nothing".
+
+    Reporting only. Nothing about access consults this: a comped reader is a
+    subscriber in every path that matters, which is the point of there being
+    one notion of access and one column holding it.
+    """
+    return bool(row is not None and row["paid_until"] and not row["stars_paid"])
+
+
+def is_open_ended(row: sqlite3.Row | None) -> bool:
+    """Whether to write "indefinitely" instead of a date.
+
+    What the date test is actually good at. A paid-to date in 2076 is correct
+    and reads as a bug, so it is shown as what it means rather than as what it
+    says; nothing decides anything from this.
+    """
+    if row is None or not row["paid_until"]:
+        return False
+    try:
+        return _moment(row["paid_until"]) > datetime.now(UTC) + timedelta(days=365 * 5)
+    except ValueError:
+        return False
+
+
+def revoke(conn: sqlite3.Connection, user_id: int, force: bool = False) -> bool:
+    """Take access away now, keeping the profile and the starred things.
+
+    Does not touch `stars_paid` or `charge_id`: this is not a refund, and
+    somebody comped by mistake never paid anything to give back. A reader whose
+    money must go back is `pi subscriptions --refund`.
+
+    Refuses outright while a recurring charge is live, because otherwise this
+    only appears to work: Telegram was never told to stop, so the next month's
+    charge fires, `on_paid` grants a fresh month, and the reader has access
+    again — silently, and still paying for it. Revoking worked permanently on
+    comped readers and temporarily on exactly the ones it mattered for.
+    """
+    row = get_bot_user(conn, user_id)
+    if row is not None and row["sub_charge_id"] and not force:
+        raise StillRecurring(
+            f"reader {user_id} has a live recurring subscription; "
+            "refund it instead, or pass force to take access anyway"
+        )
+    cursor = conn.execute(
+        "UPDATE bot_users SET plan = 'free', paid_until = NULL WHERE id = ?",
+        (user_id,),
+    )
+    return cursor.rowcount > 0
+
+
+def readers(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Everyone the bot knows, newest last. For the owner to look at."""
+    return conn.execute(
+        "SELECT * FROM bot_users ORDER BY created_at, id"
+    ).fetchall()
+
+
+def expire_due(conn: sqlite3.Connection, now: str | None = None) -> int:
+    """Return readers whose grace has run out to the free plan, and count them.
+
+    Only `plan` moves. The profile, the starred things and `plan_since` all stay
+    exactly where they were: somebody coming back after six months should find
+    their list, not an empty bot, and that is the cheapest subscriber there is
+    to win back.
+    """
+    moment = _moment(now) if now else datetime.now(UTC)
+    cutoff = moment - timedelta(days=SUBSCRIPTION_GRACE_DAYS)
+    due = [
+        user_id
+        for user_id, until in _paid_until(conn, only_active_plans=True)
+        if until < cutoff
+    ]
+    if not due:
+        return 0
+    marks = ",".join("?" * len(due))
+    cursor = conn.execute(
+        f"UPDATE bot_users SET plan = 'free' WHERE plan != 'free' AND id IN ({marks})",
+        due,
+    )
+    return cursor.rowcount
+
+
+def expiring_soon(
+    conn: sqlite3.Connection, within_days: int = 3, now: str | None = None
+) -> list[sqlite3.Row]:
+    """Paid readers whose subscription ends within the window.
+
+    What the reminder is sent from. Readers already past their date are not
+    here: they are in grace and have had the reminder already.
+    """
+    moment = _moment(now) if now else datetime.now(UTC)
+    horizon = moment + timedelta(days=within_days)
+    due = sorted(
+        (until, user_id)
+        for user_id, until in _paid_until(conn)
+        if moment <= until < horizon
+    )
+    if not due:
+        return []
+    ids = [user_id for _, user_id in due]
+    marks = ",".join("?" * len(ids))
+    rows = {
+        row["id"]: row
+        for row in conn.execute(
+            f"SELECT * FROM bot_users WHERE active = 1 AND id IN ({marks})", ids
+        )
+    }
+    return [rows[user_id] for user_id in ids if user_id in rows]
 
 
 def offers_for(
@@ -852,12 +1730,14 @@ def offers_for(
     brands: list[str] | None = None,
     limit: int = 10,
     offset: int = 0,
-    order_by: str = "o.score DESC, o.discount_pct DESC",
+    order_by: str = "o.score DESC, o.discount_pct DESC, o.variant_id DESC",
     search: str | None = None,
     min_price: float | None = None,
     max_price: float | None = None,
     min_discount: float | None = None,
     kids: bool = False,
+    women: bool = False,
+    all_discounts: bool = False,
 ) -> tuple[list[sqlite3.Row], int]:
     """What is on offer for one person, best first. Returns (page, total).
 
@@ -881,13 +1761,43 @@ def offers_for(
     """
     where = ["1 = 1"]
     params: list = []
+    # A shop nobody could read for days is not vouching for its prices today.
+    fresh, fresh_params = fresh_shop_clause("s", "p")
+    where.append(fresh)
+    params += fresh_params
     if not kids:
         where.append("(p.audience IS NULL OR p.audience <> 'kids')")
+    # This is a men's shop, so what is read as women's is not a filter the
+    # reader turns off — it is not stocked. The row is still written and still
+    # counts as a price witness for the same article elsewhere; it is simply
+    # never shown. `women=True` exists for the owner, because a misclassified
+    # men's item is otherwise invisible and therefore unreportable.
+    if not women:
+        where.append("(p.gender IS NULL OR p.gender <> 'women')")
+    # A discount only somebody other than the seller vouches for. Measured on
+    # the shelf: 20,908 of 26,013 visible cards — 80% — rest on nothing but the
+    # shop's own struck-through price, which is the one number a shop writes
+    # about itself and the one every free discount channel repeats. A page of
+    # those reads as a jumble sale whatever it is dressed in, which is what
+    # "выглядит дёшево" turned out to mean.
+    #
+    # A switch and not a deletion, the way children's clothing is: the full view
+    # is one click away, and somebody hunting a particular thing wants the weak
+    # evidence too, labelled as weak.
+    if not all_discounts:
+        where.append(
+            "(o.all_time_low = 1 OR o.reference_source IN ('history', 'market'))"
+        )
+    # What is left is "confirmed men" and "nobody said". Asking for men narrows
+    # to the confirmed half; 57% of the shelf says nothing, so this is a
+    # preference rather than the shop's own boundary. Asking for anything else
+    # answers "nothing", which is the truth: it is not that the filter found no
+    # match today, it is that the shop does not carry it.
     if genders:
-        if "women" in genders and "men" not in genders:
-            where.append("p.gender = 'women'")
-        elif "men" in genders and "women" not in genders:
-            where.append("(p.gender = 'men' OR p.gender IS NULL)")
+        if "men" in genders:
+            where.append("p.gender = 'men'")
+        else:
+            where.append("1 = 0")
     if kinds:
         where.append(f"p.kind IN ({','.join('?' * len(kinds))})")
         params += kinds
@@ -918,26 +1828,56 @@ def offers_for(
         params += [f"%{search}%"] * 3
     clause = " AND ".join(where)
 
-    total = conn.execute(
-        f"""
-        SELECT COUNT(*) FROM offers o
-          JOIN variants v ON v.id = o.variant_id
-          JOIN products p ON p.id = o.product_id
-         WHERE {clause}
-        """,
-        params,
-    ).fetchone()[0]
-
-    rows = conn.execute(
-        f"""
+    # A product's sizes are folded into one card only when they all cost the
+    # same. Measured on the live shelf: 1,539 products hold more than one card,
+    # but 910 of them are priced differently by size — one Salomon is $90 in
+    # US10 and $180 in US11 — and folding those would put a price on a card that
+    # is not the price of the size somebody wants. The other 629 are the same
+    # shoe listed three times at one price, which is the shelf repeating itself,
+    # and folding them removes 636 cards.
+    #
+    # So the count is neither offers nor products: it is cards, and it has to be
+    # counted the same way the page builds them.
+    # `KEEP` is the rule, written once and used by both queries so the count can
+    # never disagree with the page: keep the chosen row of a product whose sizes
+    # all cost the same, and keep every row of one whose sizes do not.
+    KEEP = "o.pick = 1 OR o.lo <> o.hi"
+    folded = f"""
         SELECT o.*, v.size_norm, v.size, v.sku,
-               p.title, p.url, p.image_url, p.brand, p.brand_norm, p.brand_family,
-               p.gender, p.kind, s.domain, s.name AS store_name, s.country, s.currency
+               p.title, p.url, p.image_url, p.brand, p.brand_norm,
+               p.brand_family, p.gender, p.kind, p.store_id,
+               s.domain, s.name AS store_name, s.country, s.currency,
+               ROW_NUMBER() OVER (
+                   PARTITION BY o.product_id
+                   ORDER BY o.score DESC, o.price_usd ASC, o.variant_id DESC
+               ) AS pick,
+               COUNT(*) OVER (PARTITION BY o.product_id) AS folded_sizes,
+               MIN(o.price_usd) OVER (PARTITION BY o.product_id) AS lo,
+               MAX(o.price_usd) OVER (PARTITION BY o.product_id) AS hi
           FROM offers o
           JOIN variants v ON v.id = o.variant_id
           JOIN products p ON p.id = o.product_id
           JOIN stores s   ON s.id = p.store_id
          WHERE {clause}
+    """
+
+    total = conn.execute(
+        f"SELECT COUNT(*) FROM ({folded}) o WHERE {KEEP}", params
+    ).fetchone()[0]
+
+    # Folding happens after the WHERE, which is what keeps a size filter
+    # meaningful: asking for EU44 narrows to the offers in EU44 and only then
+    # picks one per product, rather than picking first and then finding that the
+    # winner was a different size.
+    #
+    # `sizes_on_offer` is how many rows went into this card — 1 whenever nothing
+    # was folded, so the page can say "3 sizes at this price" and never imply it
+    # about a card that is only one of several prices.
+    rows = conn.execute(
+        f"""
+        SELECT *, CASE WHEN o.lo = o.hi THEN o.folded_sizes ELSE 1 END AS sizes_on_offer
+          FROM ({folded}) o
+         WHERE {KEEP}
          ORDER BY {order_by}
          LIMIT ? OFFSET ?
         """,
@@ -991,7 +1931,33 @@ def _size_order(label: str) -> tuple:
     return (2, 0.0, label)
 
 
-def shelf_facets(conn: sqlite3.Connection, kids: bool = False) -> dict:
+def shelf_freshness(conn: sqlite3.Connection, hours: int = 48) -> tuple[int, int]:
+    """(confirmed within `hours`, all) — cards the default shelf shows.
+
+    The one number that says whether the shelf is a shelf. docs/product.md set
+    the bar at no more than 5% of offers older than 48 hours; until this was in
+    the daily summary nobody could see whether it held.
+    """
+    cutoff = (datetime.now(UTC) - timedelta(hours=hours)).isoformat(timespec="seconds")
+    fresh, fresh_params = fresh_shop_clause("s", "p")
+    row = conn.execute(
+        f"""
+        SELECT COALESCE(SUM(o.checked_at >= ?), 0), COUNT(*)
+          FROM offers o
+          JOIN products p ON p.id = o.product_id
+          JOIN stores   s ON s.id = p.store_id
+         WHERE {fresh}
+           AND (p.audience IS NULL OR p.audience <> 'kids')
+           AND (p.gender IS NULL OR p.gender <> 'women')
+           AND (o.all_time_low = 1 OR o.reference_source IN ('history', 'market'))
+        """,
+        [cutoff, *fresh_params],
+    ).fetchone()
+    return int(row[0]), int(row[1])
+
+
+def shelf_facets(conn: sqlite3.Connection, kids: bool = False,
+                 women: bool = False, all_discounts: bool = False) -> dict:
     """What the shelf actually contains, for building filters out of.
 
     Offered rather than hardcoded because a filter listing a size nothing is on
@@ -1003,70 +1969,85 @@ def shelf_facets(conn: sqlite3.Connection, kids: bool = False) -> dict:
     counts are a promise about what a click returns, and the shelf hides
     children's clothing unless asked — so a facet counting it would be a
     promise the page then breaks.
+
+    Counted in products for the same reason, since `offers_for` folds a
+    product's sizes into one card. Counting offers here would promise 33,215
+    where the page then draws 31,653.
+
+    One read of the shelf, counted in Python. Six separate GROUP BYs each
+    scanned the whole shelf again, and with every discounted size on it — 131
+    thousand rows rather than 25 — the page waited five seconds for its filters.
     """
     hide = "" if kids else " AND (p.audience IS NULL OR p.audience <> 'kids')"
+    if not women:
+        hide += " AND (p.gender IS NULL OR p.gender <> 'women')"
+    if not all_discounts:
+        hide += " AND (o.all_time_low = 1 OR o.reference_source IN ('history', 'market'))"
+    # The same rule offers_for draws by, or a count would promise cards from a
+    # shop whose cards the page then leaves out.
+    fresh, fresh_params = fresh_shop_clause("s", "p")
+    rows = conn.execute(
+        f"""
+        SELECT o.product_id, o.price_usd, p.kind, p.gender, p.brand_family, v.size_norm
+          FROM offers o
+          JOIN products p ON p.id = o.product_id
+          JOIN variants v ON v.id = o.variant_id
+          JOIN stores   s ON s.id = p.store_id
+         WHERE {fresh}{hide}
+        """,
+        fresh_params,
+    ).fetchall()
 
-    def tally(sql: str) -> list[dict]:
-        return [
-            {"value": row[0], "count": row[1]}
-            for row in conn.execute(sql).fetchall()
-            if row[0]
-        ]
+    # Everything is counted in cards, by the rule offers_for folds by: a
+    # product whose offers all cost the same is one card, one whose offers
+    # differ is a card each. A chip promising products while the click draws
+    # cards said "Nike 1,813" and then showed 1,990.
+    def cards(prices: list[float]) -> int:
+        return 1 if min(prices) == max(prices) else len(prices)
 
+    prices: dict[int, list[float]] = {}
+    about: dict[int, tuple] = {}
+    by_size: dict[tuple[str, int], list[float]] = {}
+    for product_id, price, kind, gender, brand, size in rows:
+        prices.setdefault(product_id, []).append(price)
+        about[product_id] = (kind, gender, brand)
+        if size:
+            # Choosing a size narrows to that size first and folds afterwards.
+            by_size.setdefault((size, product_id), []).append(price)
+
+    kinds: Counter[str] = Counter()
+    genders: Counter[str] = Counter()
+    brands: Counter[str] = Counter()
+    for product_id, listed in prices.items():
+        kind, gender, brand = about[product_id]
+        for bucket, value in ((kinds, kind), (genders, gender), (brands, brand)):
+            if value:
+                bucket[value] += cards(listed)
+    sizes: Counter[str] = Counter()
+    for (size, _), listed in by_size.items():
+        sizes[size] += cards(listed)
+
+    def tally(bucket: Counter[str], limit: int | None = None) -> list[dict]:
+        ranked = sorted(bucket.items(), key=lambda item: (-item[1], item[0]))
+        return [{"value": value, "count": count} for value, count in ranked[:limit]]
+
+    total = sum(cards(listed) for listed in prices.values())
+    every_price = [price for listed in prices.values() for price in listed]
     return {
-        "kinds": tally(
-            f"""
-            SELECT p.kind, COUNT(*) FROM offers o
-              JOIN products p ON p.id = o.product_id
-             WHERE 1 = 1{hide}
-             GROUP BY p.kind ORDER BY 2 DESC
-            """
-        ),
-        "genders": tally(
-            f"""
-            SELECT p.gender, COUNT(*) FROM offers o
-              JOIN products p ON p.id = o.product_id
-             WHERE 1 = 1{hide}
-             GROUP BY p.gender ORDER BY 2 DESC
-            """
-        ),
+        "kinds": tally(kinds),
+        "genders": tally(genders),
         # Ordered by how much is on offer, not alphabetically: the sizes a
         # person scans for are the ones with anything behind them.
-        "sizes": tally(
-            f"""
-            SELECT v.size_norm, COUNT(*) FROM offers o
-              JOIN variants v ON v.id = o.variant_id
-              JOIN products p ON p.id = o.product_id
-             WHERE 1 = 1{hide}
-             GROUP BY v.size_norm ORDER BY 2 DESC LIMIT 60
-            """
-        ),
-        "brands": tally(
-            f"""
-            SELECT p.brand_family, COUNT(*) FROM offers o
-              JOIN products p ON p.id = o.product_id
-             WHERE 1 = 1{hide}
-             GROUP BY p.brand_family ORDER BY 2 DESC LIMIT 80
-            """
-        ),
-        "total": conn.execute(
-            f"SELECT COUNT(*) FROM offers o JOIN products p ON p.id = o.product_id"
-            f" WHERE 1 = 1{hide}"
-        ).fetchone()[0],
+        "sizes": tally(sizes, 60),
+        "brands": tally(brands, 80),
+        "total": total,
         # Where the prices actually start and stop, so a range control has ends
         # rather than guesses. Rounded outwards: a slider that cannot reach the
         # cheapest thing on the shelf is a bug people report as missing stock.
-        "price": dict(
-            zip(
-                ("min", "max"),
-                conn.execute(
-                    f"SELECT COALESCE(MIN(o.price_usd), 0), COALESCE(MAX(o.price_usd), 0)"
-                    f"  FROM offers o JOIN products p ON p.id = o.product_id"
-                    f" WHERE 1 = 1{hide}"
-                ).fetchone(),
-                strict=True,
-            )
-        ),
+        "price": {
+            "min": min(every_price) if every_price else 0,
+            "max": max(every_price) if every_price else 0,
+        },
         # The owner's own profile, so the page can open on their sizes instead
         # of on whatever the catalogue happens to have most of — which is
         # women's EU36, and is nobody's idea of a first screen.
@@ -1150,6 +2131,50 @@ def _cheapest_per_product(
     return conn.execute(sql, ids).fetchall()
 
 
+_LAST_ASKED_SQL = """
+    WITH latest AS (
+        SELECT variant_id, price_usd, currency, price_native
+          FROM (
+            SELECT variant_id, price_usd, currency, price_native,
+                   ROW_NUMBER() OVER (PARTITION BY variant_id ORDER BY ts DESC) AS rn
+              FROM price_points
+             WHERE variant_id IN (
+                 SELECT id FROM variants WHERE product_id IN ({placeholders})
+             )
+          )
+         WHERE rn = 1
+    )
+    SELECT s.domain, s.name AS store_name, s.country, s.last_ok,
+           p.title, p.url, p.id AS product_id, p.brand_norm, p.audience,
+           MIN(latest.price_usd) AS price_usd,
+           latest.currency, latest.price_native,
+           NULL AS discount_pct
+      FROM latest
+      JOIN variants v ON v.id = latest.variant_id
+      JOIN products p ON p.id = v.product_id
+      JOIN stores   s ON s.id = p.store_id
+     WHERE p.missing_since IS NULL
+     GROUP BY p.id
+     ORDER BY price_usd
+"""
+
+
+def _last_asked_per_product(
+    conn: sqlite3.Connection, product_ids: Sequence[int]
+) -> list[sqlite3.Row]:
+    """What each of these products last cost, sold out or not, cheapest first.
+
+    For the answer that has nothing in stock: a thing sold out everywhere is
+    the thing somebody waiting for their size wants to follow, and "nothing
+    found" would leave them nothing to press.
+    """
+    ids = list(product_ids)[:MAX_LOOKUP_PRODUCTS]
+    if not ids:
+        return []
+    sql = _LAST_ASKED_SQL.format(placeholders=",".join("?" * len(ids)))
+    return conn.execute(sql, ids).fetchall()
+
+
 def _one_row_per_merchant(
     rows: list[sqlite3.Row], exclude: str | None = None
 ) -> list[sqlite3.Row]:
@@ -1169,17 +2194,42 @@ def _one_row_per_merchant(
     return sorted(best.values(), key=lambda row: row["price_usd"])
 
 
+# Two rows may share a key and still be different things, and the shapes that
+# invite it are the loose ones: `\d{6}-\d{2}` was taken for Puma and also
+# matches a shop's own id with a European size stuck on the end, so `103134-40`
+# claimed a Hey Dude and a Nike are the same article. Measured across the
+# catalogue, 733 of the 18,617 style keys that link two shops — 3.9% — join
+# products whose brands are both known and different. One of them offered a
+# $30 Jordan cap as the cheaper version of a $200 adidas Yeezy.
+#
+# Dropping the pattern is the wrong cure: 998 of its 1,185 cross-shop keys are
+# right. The brands are the cure. A disagreement is only believed when both
+# sides actually name a brand — 78% of the catalogue names none, and silence is
+# not a contradiction.
+#
+# This matters beyond the product card. `build_market_index` groups by the same
+# keys to decide what the market charges, so a cap in a group of sneakers drags
+# the median down and invents a discount below a market price that never
+# existed — under `require_real_reference` that invention is now trusted.
+_BRANDS_AGREE = """
+    (   me.brand_family IS NULL OR TRIM(me.brand_family) = ''
+     OR other.brand_family IS NULL OR TRIM(other.brand_family) = ''
+     OR LOWER(me.brand_family) = LOWER(other.brand_family))
+"""
+
+
 def _sibling_product_ids(conn: sqlite3.Connection, product_id: int) -> list[int]:
     """Products other rows describe as the same article as this one.
 
     Keys carried by an implausible number of products are dropped rather than
     followed: a shop that writes its brand into the SKU field turns `DIME` into
-    a claim about 413 unrelated products.
+    a claim about 413 unrelated products. And a key is not followed across two
+    products that name different brands — see `_BRANDS_AGREE`.
     """
     return [
         row[0]
         for row in conn.execute(
-            """
+            f"""
             WITH mine AS (
                 SELECT key_type, key FROM product_keys WHERE product_id = :pid
             ),
@@ -1193,11 +2243,25 @@ def _sibling_product_ids(conn: sqlite3.Connection, product_id: int) -> list[int]
             SELECT DISTINCT pk.product_id
               FROM product_keys pk
               JOIN usable u ON u.key_type = pk.key_type AND u.key = pk.key
+              JOIN products other ON other.id = pk.product_id
+              JOIN products me    ON me.id = :pid
              WHERE pk.product_id <> :pid
+               AND {_BRANDS_AGREE}
             """,
             {"pid": product_id, "fanout": MAX_KEY_FANOUT},
         ).fetchall()
     ]
+
+
+def article_products(conn: sqlite3.Connection, product_id: int) -> list[int]:
+    """This product and every other one carrying its article number, any shop.
+
+    What "follow this article everywhere" follows. In stock or not — a sold-out
+    listing is exactly the one worth following — and never more than
+    MAX_KEY_FANOUT, the size past which a key stops being an article number.
+    """
+    others = [pid for pid in _sibling_product_ids(conn, product_id) if pid != product_id]
+    return [product_id, *others[: MAX_KEY_FANOUT - 1]]
 
 
 def same_article(conn: sqlite3.Connection, product_id: int) -> list[sqlite3.Row]:
@@ -1245,8 +2309,13 @@ def _products_by_key(
     return found, None
 
 
-def _products_by_name(conn: sqlite3.Connection, text: str) -> list[int]:
-    """Products whose title or brand contains what was typed."""
+def products_by_name(conn: sqlite3.Connection, text: str) -> list[int]:
+    """Products whose title or brand contains what was typed.
+
+    Public because the watchlist searches by the same words the shelf does:
+    a name typed into `pi price` and the same name put on the watchlist must
+    mean the same thing.
+    """
     like = f"%{text}%"
     return [
         row[0]
@@ -1294,7 +2363,7 @@ def lookup_article(conn: sqlite3.Connection, query: str, limit: int = 25) -> dic
     text = (query or "").strip()
     result: dict = {
         "query": text, "matched_by": None, "key": None, "same_thing": False,
-        "products": 0, "shops": [], "found": 0, "too_common": None,
+        "products": 0, "shops": [], "found": 0, "too_common": None, "sold_out": [],
     }
     if len(text) < 3:
         return result
@@ -1329,7 +2398,7 @@ def lookup_article(conn: sqlite3.Connection, query: str, limit: int = 25) -> dic
             result["matched_by"], result["key"] = reference.SKU, text.upper()
 
     if not ids:
-        ids = _products_by_name(conn, text)
+        ids = products_by_name(conn, text)
         if ids:
             result["matched_by"], result["key"] = reference.TITLE, text
 
@@ -1345,6 +2414,11 @@ def lookup_article(conn: sqlite3.Connection, query: str, limit: int = 25) -> dic
     # only sees the truncated list reports the limit as the answer.
     result["found"] = len(rows)
     result["shops"] = rows[:limit]
+    if not rows:
+        # Known, and in stock nowhere. `shops` stays empty — nothing here can
+        # be bought — but what it last cost is kept, so it can be followed.
+        last = _last_asked_per_product(conn, ids)
+        result["sold_out"] = (_one_row_per_merchant(last) if same_thing else last)[:limit]
     return result
 
 
@@ -1420,13 +2494,24 @@ def following(conn: sqlite3.Connection) -> dict[int, set[int]]:
     a followed product must be judged before anyone can be told about it, and
     scoring is the half that is shared — while the per-reader sets decide who
     actually hears.
+
+    Nobody who blocked the bot: they cannot be told, so there is nothing to
+    judge on their behalf.
     """
     out: dict[int, set[int]] = {}
     for row in conn.execute(
         "SELECT user_id, product_id FROM favorites WHERE notify = 1"
+        " AND user_id NOT IN (SELECT id FROM bot_users WHERE active = 0)"
     ):
         out.setdefault(row[0], set()).add(row[1])
     return out
+
+
+# How many products one reader may follow. Far above what a person watches —
+# the owner follows eight — and low enough that nobody pressing ⭐ under
+# article after article (forty shops a press) can make every run score
+# thousands of products on their behalf.
+MAX_FOLLOWED = 200
 
 
 def favorite_prices(conn: sqlite3.Connection, user_id: int) -> dict[int, float | None]:

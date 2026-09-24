@@ -42,6 +42,7 @@ pi = ["schema.sql"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+markers = ["asks_meta: run the real /meta.json re-check for an answer naming no currency"]
 filterwarnings = ["error::DeprecationWarning"]
 
 [tool.ruff]

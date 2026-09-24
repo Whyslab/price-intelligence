@@ -128,3 +128,79 @@ class TestWhoTheReaderIs:
         dbm.upsert_bot_user(conn, 7, "42", "u")
         reader = personal.reader_for(conn, "42", Filters(sizes=("EU44",)))
         assert reader.sizes == frozenset({"EU44"})
+
+
+class TestWhatIsWorthInterrupting:
+    """The difference between a feed and a firehose, measured on the live shelf:
+    28,307 of 33,277 standing offers rest on nothing but the shop's own
+    struck-through price, and a quarter of a week's alerts named no brand."""
+
+    def _deal(self, **kw):
+        from pi import deals as dealm
+        base = dict(
+            variant_id=1, product_id=1, price_usd=100.0, reference_usd=200.0,
+            reference_source="tag", discount_pct=50.0, saving_usd=100.0, score=80,
+            all_time_low=False, fake_sale=False, dropped_hours_ago=None,
+            history_points=2,
+        )
+        return dealm.Deal(**{**base, **kw})
+
+    def _row(self, brand="Nike", kind="shoes"):
+        return {"brand_family": brand, "brand_norm": brand, "kind": kind,
+                "gender": "men", "size_norm": "US10", "domain": "s.example",
+                "country": "US", "sizes": None, "brands": None, "kinds": None,
+                "genders": None}
+
+    def test_the_shops_own_struck_through_price_is_not_evidence(self):
+        f = Filters()
+        assert not f.worth_interrupting("tag", False, "Nike", "shoes", "men")
+
+    def test_an_all_time_low_is_evidence_even_without_other_shops(self):
+        f = Filters()
+        assert f.worth_interrupting("tag", True, "Nike", "shoes", "men")
+
+    def test_history_and_market_are_evidence(self):
+        f = Filters()
+        assert f.worth_interrupting("history", False, "Nike", "shoes", "men")
+        assert f.worth_interrupting("market", False, "Nike", "shoes", "men")
+
+    def test_no_brand_and_no_type_are_both_we_do_not_know_what_this_is(self):
+        f = Filters()
+        assert not f.worth_interrupting("market", False, "", "shoes", "men")
+        assert not f.worth_interrupting("market", False, None, "shoes", "men")
+        assert not f.worth_interrupting("market", False, "Nike", None, "men")
+        assert not f.worth_interrupting("market", False, "Nike", "homeware", "men")
+
+    def test_every_rule_can_be_switched_off(self):
+        f = Filters(require_real_reference=False, require_brand=False,
+                    require_kind=False, notify_genders=())
+        assert f.worth_interrupting("tag", False, None, None, None)
+
+    def test_the_ranker_drops_what_is_not_worth_interrupting(self):
+        reader = personal.Reader()
+        rank = personal.ranker(reader, min_score=10, filters=Filters())
+        assert rank(self._deal(), self._row()) is None
+        assert rank(self._deal(reference_source="market"), self._row()) is not None
+
+    def test_a_starred_product_passes_anyway(self):
+        """A star is the person saying it, not an inference about them."""
+        reader = personal.Reader()
+        rank = personal.ranker(reader, min_score=10, filters=Filters(),
+                               following={1})
+        assert rank(self._deal(), self._row()) is not None
+
+    def test_without_filters_nothing_is_curated(self):
+        """`find_deals`, `pi find` and `pi seed` pass no filters and must not
+        start losing rows because the notification path grew a rule."""
+        reader = personal.Reader()
+        rank = personal.ranker(reader, min_score=10)
+        assert rank(self._deal(), self._row()) is not None
+
+    def test_only_confirmed_men_are_worth_interrupting_about(self):
+        """The shelf shows the 2,977 offers nobody labelled; the bot does not.
+        A notification arrives uninvited, so a wrong one costs more than a
+        missed right one."""
+        f = Filters()
+        assert f.worth_interrupting("market", False, "Nike", "shoes", "men")
+        assert not f.worth_interrupting("market", False, "Nike", "shoes", None)
+        assert not f.worth_interrupting("market", False, "Nike", "shoes", "women")
