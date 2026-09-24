@@ -325,3 +325,47 @@ class TestSizesAboutSomethingElse:
         back = _restock(conn, variants["S"])
 
         assert watch.restock_notices(conn, back, [_reader(7, sizes=("M",))]) == []
+
+
+class TestSizesOfTheSameFamily:
+    """Review 24.09 (fifth pass): EU46 on a shoe made in EU40–43 was taken as
+    sizes about another kind of thing, and its EU42 coming back was told."""
+
+    @staticmethod
+    def _shoe_in(conn, sizes):
+        store = dbm.upsert_store(conn, "shop.example", platform="shopify", currency="USD",
+                                 name="Shop", last_ok=ts(0))
+        product = dbm.upsert_product(conn, store, "s1", "Runner", "/products/runner")
+        variants = {}
+        for size in sizes:
+            variant = dbm.upsert_variant(conn, product, size, size=size, size_norm=size)
+            dbm.record_price(conn, variant, 100.0, None, False, "USD", 100.0, 1.0, ts=ts(3))
+            variants[size] = variant
+        return product, variants
+
+    def test_a_shoe_not_made_in_their_size_stays_quiet(self, conn):
+        product, variants = self._shoe_in(conn, ("EU40", "EU41", "EU42", "EU43"))
+        dbm.add_favorite(conn, 7, product)
+
+        back = _restock(conn, variants["EU42"])
+
+        assert watch.restock_notices(conn, back, [_reader(7, sizes=("EU46",))]) == []
+
+    def test_their_own_size_in_another_system_is_still_the_shoe_family(self, conn):
+        product, variants = self._shoe_in(conn, ("US9", "US10"))
+        dbm.add_favorite(conn, 7, product)
+
+        back = _restock(conn, variants["US9"])
+
+        assert watch.restock_notices(conn, back, [_reader(7, sizes=("EU44",))]) == [], (
+            "shoe sizes speak about a shoe; no guessing EU44 is US9"
+        )
+
+    def test_letter_sizes_on_a_reader_speak_about_a_hoodie(self, conn):
+        product, variants = self._shoe_in(conn, ("S", "M", "L"))
+        dbm.add_favorite(conn, 7, product)
+
+        back = _restock(conn, variants["S"])
+
+        assert watch.restock_notices(conn, back, [_reader(7, sizes=("EU44", "L"))]) == []
+        assert len(watch.restock_notices(conn, back, [_reader(7, sizes=("EU44",))])) == 1

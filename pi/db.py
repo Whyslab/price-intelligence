@@ -993,7 +993,7 @@ def withdrawal_candidates(
     try:
         return conn.execute(
             """
-            SELECT id, url FROM products
+            SELECT id, url, external_id, last_seen FROM products
              WHERE store_id = ? AND missing_since IS NULL
                AND id NOT IN (SELECT id FROM pi_seen)
              ORDER BY id
@@ -1002,6 +1002,17 @@ def withdrawal_candidates(
         ).fetchall()
     finally:
         conn.execute("DROP TABLE IF EXISTS temp.pi_seen")
+
+
+def missing_external_ids(conn: sqlite3.Connection, store_id: int) -> set[str]:
+    """The shop's own ids for what is marked as withdrawn there."""
+    return {
+        row[0]
+        for row in conn.execute(
+            "SELECT external_id FROM products WHERE store_id = ? AND missing_since IS NOT NULL",
+            (store_id,),
+        )
+    }
 
 
 def live_external_ids(conn: sqlite3.Connection, store_id: int) -> set[str]:

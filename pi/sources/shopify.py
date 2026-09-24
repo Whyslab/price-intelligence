@@ -455,21 +455,45 @@ async def fetch(
     if page_number > 1:
         url += f"&page={page_number}"
     exhausted = False
+    read = 0
 
-    for _ in range(max_pages):
+    def past_the_end() -> FetchResult:
+        # A page past an empty one that does not answer as a page: the pass
+        # read what there was up to the empty page and cannot say whether the
+        # catalogue ends there. Nothing is claimed, and the next pass starts at
+        # the beginning — left pointing past the end, the cursor failed every
+        # run after it (www.natterjacks.com, stuck at page 3 from 15.09).
+        log.info("%s: the page after an empty one did not answer; starting over next run",
+                 domain)
+        return FetchResult(domain=domain, products=products, currency=currency)
+
+    # The pages looked at past an empty one do not count against max_pages: a
+    # pass meeting its first empty page on the last page it may read would
+    # otherwise never finish looking, and never withdraw anything again.
+    while read < max_pages or empties:
+        read += 1
         resp = await _get_page(client, url, limiter, domain)
         if resp is None:
+            if empties:
+                return past_the_end()
             if not products:
                 return FetchResult(
                     domain=domain, currency=currency,
-                    error="products.json unreachable", next_cursor=cursor,
+                    error="products.json unreachable",
+                    # A resumed pass that cannot read even its first page starts
+                    # over next time rather than asking the same page for ever.
+                    next_cursor=0 if cursor > 1 else cursor,
                 )
             break
         try:
             payload = resp.json()
         except ValueError:
+            if empties:
+                return past_the_end()
             break
         if not isinstance(payload, dict) or "products" not in payload:
+            if empties:
+                return past_the_end()
             if products:
                 break  # pages already read are still a result; resume from here
             return FetchResult(domain=domain, currency=currency, error="not a Shopify catalogue")

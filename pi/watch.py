@@ -20,6 +20,7 @@ decided per reader, the same split the rest of the pipeline keeps.
 """
 from __future__ import annotations
 
+import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -80,22 +81,43 @@ def _restock_text(first: sqlite3.Row, sizes: list[str]) -> str:
     return "\n".join(lines)
 
 
+_SHOE_SIZE = re.compile(r"^(EU|US|UK)\d")
+_LETTER_SIZE = re.compile(r"^\d?X*[SML]$")
+
+
+def _size_family(size: str) -> str | None:
+    """Shoe sizes (EU44, US10.5), letter sizes (S, XL, 2XL), or neither."""
+    if _SHOE_SIZE.match(size):
+        return "shoe"
+    if _LETTER_SIZE.match(size):
+        return "letter"
+    return None
+
+
 def _sizes_speak(conn: sqlite3.Connection, product_id: int, sizes: frozenset[str]) -> bool:
     """Whether a reader's sizes say anything about this product at all.
 
-    Somebody with shoe sizes following a hoodie has none of its sizes, and
-    read literally, nothing about it would ever be in their size: its S back
-    in stock was never told, and it coming back on sale was "нет в наличии"
-    while S and M were there (review 24.09). Sizes that match none of a
-    product's are sizes about something else.
+    Somebody with only shoe sizes following a hoodie has none of its sizes,
+    and read literally, nothing about it would ever be in their size: its S
+    back in stock was never told, and it coming back on sale was "нет в
+    наличии" while S and M were there (review 24.09). Their sizes are about
+    another kind of thing. But EU46 on a shoe made in EU40–43 is about this
+    very thing — it is not made in their size — and says so by staying quiet.
+    So sizes speak when one of them is the product's, or of the same family.
     """
     if not sizes:
         return False
-    marks = ",".join("?" * len(sizes))
-    return conn.execute(
-        f"SELECT 1 FROM variants WHERE product_id = ? AND size_norm IN ({marks}) LIMIT 1",
-        (product_id, *sorted(sizes)),
-    ).fetchone() is not None
+    listed = {
+        row[0]
+        for row in conn.execute(
+            "SELECT DISTINCT size_norm FROM variants WHERE product_id = ? AND size_norm IS NOT NULL",
+            (product_id,),
+        )
+    }
+    if listed & sizes:
+        return True
+    families = {_size_family(size) for size in sizes} - {None}
+    return bool(families & ({_size_family(size) for size in listed} - {None}))
 
 
 def restock_notices(

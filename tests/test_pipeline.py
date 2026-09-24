@@ -1829,6 +1829,70 @@ async def test_a_run_reads_past_an_empty_page_to_products_it_knows(config, shopi
     assert stats.products_seen == 260, "the twenty after the gap were read"
 
 
+@respx.mock
+async def test_a_shop_stuck_past_its_end_is_read_from_the_beginning_again(config):
+    """www.natterjacks.com: cursor 3, page 3 answering 404, FAILED every run
+    from 15.09 to 24.09. The failed pass now puts the cursor back."""
+    _mock_rates()
+    _mock_telegram()
+    respx.get("https://shop.example/products.json?limit=250&page=3").mock(
+        return_value=httpx.Response(404)
+    )
+    conn = dbm.connect(config.db_path)
+    known_store(conn, sitemap_cursor=3)
+
+    await pipeline.run(config, conn)
+
+    status, cursor = conn.execute(
+        "SELECT status, sitemap_cursor FROM stores WHERE domain = 'shop.example'"
+    ).fetchone()
+    assert status == "error" and cursor == 0
+
+
+@respx.mock
+async def test_a_card_comes_back_with_its_product(config, shopify_payload):
+    """Review 24.09: a withdrawal takes the card off the shelf, and a product
+    back at the same price writes no price point — so nothing scored it again,
+    and a product one read skipped came back to the catalogue, not the shelf."""
+    _mock_rates()
+    _mock_telegram()
+    pages = _mock_product_pages(shopify_payload)
+    end_of_catalogue()
+    full = respx.get("https://shop.example/products.json?limit=250").mock(
+        return_value=httpx.Response(200, json=shopify_payload)
+    )
+    conn = dbm.connect(config.db_path)
+    known_store(conn)
+    await pipeline.run(config, conn)
+    shelved = conn.execute(
+        "SELECT product_id, COUNT(*) FROM offers GROUP BY product_id"
+    ).fetchall()
+    assert shelved, "precondition: something is on the shelf"
+    product_id, cards = shelved[0]
+    external = conn.execute(
+        "SELECT external_id FROM products WHERE id = ?", (product_id,)
+    ).fetchone()[0]
+
+    without = json.loads(json.dumps(shopify_payload))
+    without["products"] = [p for p in without["products"] if str(p["id"]) != external]
+    pages["payload"] = without
+    full.mock(return_value=httpx.Response(200, json=without))
+    make_due(conn)
+    await pipeline.run(config, conn)
+    assert conn.execute(
+        "SELECT COUNT(*) FROM offers WHERE product_id = ?", (product_id,)
+    ).fetchone()[0] == 0, "withdrawn, so off the shelf"
+
+    pages["payload"] = shopify_payload
+    full.mock(return_value=httpx.Response(200, json=shopify_payload))
+    make_due(conn)
+    await pipeline.run(config, conn)
+
+    assert conn.execute(
+        "SELECT COUNT(*) FROM offers WHERE product_id = ?", (product_id,)
+    ).fetchone()[0] == cards, "back in the catalogue at the same price, back on the shelf"
+
+
 def _answering(monkeypatch, answer_for):
     """Stand in for a shop's product pages; returns the urls opened, in order."""
     opened: list[str] = []
@@ -1883,28 +1947,47 @@ class TestWhatAWithdrawalIsCheckedAgainst:
             assert len(opened) <= pipeline.WITHDRAWAL_TRIES
             conn.execute("UPDATE products SET missing_since = NULL")
 
-    async def test_the_oldest_are_always_among_those_asked(self, conn, monkeypatch):
-        """What a walk that stopped early misses: /products.json lists newest
-        first. 40 old products still for sale and 300 newer ones really gone —
-        the shape schema 16 left in shops like footdistrict.com (review 24.09:
-        the newest-first order withdrew the live ones in 76% of reads)."""
-        store, ids = self._shop(conn, 350)
-        seen = ids[340:]
+    @staticmethod
+    def _listing(conn, products):
+        """Products as (the shop's own id, last seen), stored in shuffled order:
+        our row ids say only when this collector came across each one."""
+        store_id = dbm.upsert_store(
+            conn, "shop.example", platform="shopify", currency="USD",
+            last_ok=ts(0), status="ok",
+        )
+        shuffled = list(products)
+        random.Random(5).shuffle(shuffled)
+        for shop_id, seen in shuffled:
+            product = dbm.upsert_product(
+                conn, store_id, str(shop_id), f"Product {shop_id}",
+                f"https://shop.example/products/p{shop_id}",
+            )
+            conn.execute("UPDATE products SET last_seen = ? WHERE id = ?", (seen, product))
+        return dbm.get_stores(conn, domains=("shop.example",))[0]
+
+    async def _held_every_time(self, conn, monkeypatch, store, live):
         for seed in range(20):
             monkeypatch.setattr(pipeline, "_sampler", random.Random(seed))
-            _answering(monkeypatch, lambda url: "ok" if self._index(url) < 40 else "gone")
-            marked, held = await pipeline.withdraw_missing(conn, None, store, seen, None)
+            _answering(monkeypatch, lambda url: "ok" if self._index(url) in live else "gone")
+            marked, held = await pipeline.withdraw_missing(conn, None, store, [], None)
             assert marked == 0 and held, f"seed {seed}: live products would have been marked"
 
-    async def test_the_newest_are_asked_too(self, conn, monkeypatch):
-        """100 old products really gone and 40 new ones the read missed."""
-        store, ids = self._shop(conn, 150)
-        seen = ids[:10]
-        for seed in range(20):
-            monkeypatch.setattr(pipeline, "_sampler", random.Random(seed))
-            _answering(monkeypatch, lambda url: "ok" if self._index(url) >= 110 else "gone")
-            marked, held = await pipeline.withdraw_missing(conn, None, store, seen, None)
-            assert marked == 0 and held, f"seed {seed}: live products would have been marked"
+    async def test_the_tail_of_the_listing_is_asked_first(self, conn, monkeypatch):
+        """/products.json lists newest first, so a pass that stopped early
+        misses the oldest products — by the shop's ids, not ours (review 24.09:
+        ours run against the shop's on 63 of 73 large shops). 40 of the oldest
+        still for sale among 300 others really gone, all seen yesterday."""
+        store = self._listing(conn, [(1000 + n, ts(1)) for n in range(340)])
+        await self._held_every_time(conn, monkeypatch, store, live=set(range(1000, 1040)))
+
+    async def test_products_long_gone_do_not_vouch_for_this_pass(self, conn, monkeypatch):
+        """Schema 16 gave back thousands really gone and unseen for weeks — and
+        old, so first by the shop's ids. A sample spent on one of them says
+        nothing about the pass; what this pass missed was seen lately."""
+        long_gone = [(1000 + n, ts(30)) for n in range(300)]
+        missed = [(5000 + n, ts(0.5)) for n in range(40)]
+        store = self._listing(conn, long_gone + missed)
+        await self._held_every_time(conn, monkeypatch, store, live=set(range(5000, 5040)))
 
     async def test_a_large_withdrawal_nobody_can_confirm_is_held(self, conn, monkeypatch):
         store, ids = self._shop(conn, 60)

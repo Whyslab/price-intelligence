@@ -212,6 +212,63 @@ async def test_the_look_past_empty_pages_is_bounded(shopify_payload):
 
 
 @respx.mock
+async def test_a_page_past_the_end_that_fails_claims_nothing_and_starts_over(
+    shopify_payload
+):
+    """Review 24.09: a page after an empty one answering 404 left the cursor
+    past the end, and every pass after it failed — www.natterjacks.com, stuck
+    at page 3 since 15.09."""
+    base = "https://shop.example"
+    respx.get(f"{base}/products.json?limit=250").mock(
+        return_value=httpx.Response(200, json=numbered_products(shopify_payload, 1, count=240))
+    )
+    respx.get(f"{base}/products.json?limit=250&page=2").mock(
+        return_value=httpx.Response(200, json={"products": []})
+    )
+    respx.get(f"{base}/products.json?limit=250&page=3").mock(return_value=httpx.Response(404))
+
+    async with httpx.AsyncClient() as client:
+        result = await shopify.fetch(
+            client, "shop.example", currency="USD", known={"delisted"}
+        )
+
+    assert result.ok and len(result.products) == 240
+    assert not result.enumerated, "nobody could say the catalogue ended there"
+    assert result.next_cursor == 0, "and the next pass starts at the beginning"
+
+
+@respx.mock
+async def test_a_resumed_pass_whose_first_page_fails_starts_over(shopify_payload):
+    base = "https://shop.example"
+    respx.get(f"{base}/products.json?limit=250&page=3").mock(return_value=httpx.Response(404))
+
+    async with httpx.AsyncClient() as client:
+        result = await shopify.fetch(client, "shop.example", currency="USD", cursor=3)
+
+    assert result.error == "products.json unreachable" and result.next_cursor == 0
+
+
+@respx.mock
+async def test_looking_past_an_empty_page_does_not_count_against_the_page_cap(
+    shopify_payload
+):
+    """Review 24.09: a pass meeting its first empty page on the last page it
+    may read never finished looking, so it never withdrew anything again."""
+    base = "https://shop.example"
+    respx.get(f"{base}/products.json?limit=250").mock(
+        return_value=httpx.Response(200, json=numbered_products(shopify_payload, 1))
+    )
+    end_of_catalogue(base, page=2)
+
+    async with httpx.AsyncClient() as client:
+        result = await shopify.fetch(
+            client, "shop.example", currency="USD", max_pages=2, known={"delisted"}
+        )
+
+    assert result.enumerated and len(result.products) == 250
+
+
+@respx.mock
 async def test_nothing_unlisted_means_no_extra_page(shopify_payload):
     base = "https://shop.example"
     first = numbered_products(shopify_payload, 1, count=240)

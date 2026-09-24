@@ -433,25 +433,45 @@ CHURN_TRIES = 2
 _sampler = random.Random()
 
 
-def _sample_order(rows: list, *, ends_first: bool) -> list:
-    """The order to open withdrawal candidates in (they come ordered by id).
+# A product this pass should have listed was listed by one of the last few:
+# a shop read hourly saw it an hour ago, a quiet one within a day or two.
+RECENTLY_SEEN_DAYS = 3
 
-    For a large withdrawal, one of the oldest tenth is opened first and one of
-    the newest tenth second; the rest follow at random. /products.json lists
-    newest first — on the pages saved from shop.simon.com and Sneakersnstuff
-    not one neighbouring pair goes the other way — so a read that stopped early
-    misses the oldest products, which are the lowest ids here. The newest end
-    is for a list reordered some other way. Not simply the two ends: one
-    product answering the same way every time would then decide every read.
+
+def _listing_age(row) -> tuple:
+    """Oldest first by the shop's own product id, which rises as products are
+    created; ours only says in what order this collector came across them."""
+    external = str(row["external_id"] or "")
+    return (0, int(external), 0) if external.isdigit() else (1, 0, row["id"])
+
+
+def _sample_order(rows: list, *, tail_first: bool) -> list:
+    """The order to open withdrawal candidates in.
+
+    For a large withdrawal one candidate is picked first on purpose, the rest
+    follow at random. A pass that stopped early misses the end of the listing,
+    and /products.json lists by publication, newest first — so the products it
+    missed are among the oldest the shop still sells, and were listed by the
+    passes before this one. The first pick is therefore one of the oldest tenth
+    (by the shop's own id) of the candidates seen in the last few days. Not our
+    row id: products.id is the order this collector discovered products in, and
+    on 63 of 73 large shops it runs against the shop's (review 24.09). Not the
+    products gone long ago either: schema 16 gave back thousands, really gone
+    and unseen for weeks, and every sample spent on one of those vouches for
+    nothing about this pass. Not a fixed product: one answering the same way
+    every time would decide every read of its shop.
     """
     order = list(rows)
     _sampler.shuffle(order)
-    if ends_first and order:
-        tenth = max(1, len(rows) // 10)
-        firsts = [_sampler.choice(rows[:tenth]), _sampler.choice(rows[-tenth:])]
-        for row in reversed(list(dict.fromkeys(firsts))):
-            order.remove(row)
-            order.insert(0, row)
+    if tail_first and order:
+        cutoff = (datetime.now(UTC) - timedelta(days=RECENTLY_SEEN_DAYS)).isoformat(
+            timespec="seconds"
+        )
+        recent = [row for row in rows if (row["last_seen"] or "") >= cutoff] or list(rows)
+        recent.sort(key=_listing_age)
+        first = _sampler.choice(recent[: max(1, len(recent) // 10)])
+        order.remove(first)
+        order.insert(0, first)
     return order
 
 
@@ -482,7 +502,7 @@ async def withdraw_missing(
     wanted = WITHDRAWAL_SAMPLE if alarm else 1
     tries = WITHDRAWAL_TRIES if alarm else CHURN_TRIES
     answers: list[str] = []
-    for row in _sample_order(candidates, ends_first=alarm)[:tries]:
+    for row in _sample_order(candidates, tail_first=alarm)[:tries]:
         status, _ = await _fetch_one(
             client,
             {"platform": store["platform"], "domain": store["domain"], "url": row["url"]},
@@ -566,6 +586,12 @@ def store_result(
     ceilings = price_ceilings(result.products)
     impossible = 0
     seen: list[int] = []
+    # Marked as withdrawn until this read listed them. Their cards left the
+    # shelf with the mark, and a price that did not move writes no point, so
+    # nothing would score them again: a product one read skipped came back to
+    # the catalogue and not to the shelf (review 24.09). They are scored as if
+    # their price had moved.
+    returning = dbm.missing_external_ids(conn, store_id)
 
     for product in result.products:
         # A product that named its own currency is priced in that one. Only a
@@ -611,6 +637,8 @@ def store_result(
                 compare_at_native=variant.compare_at, restocked=restocked,
             ):
                 written += 1
+                changed.append(variant_id)
+            elif product.external_id in returning:
                 changed.append(variant_id)
     if touched:
         # Listed just now, which is what a card's «проверено» claims.
@@ -1320,14 +1348,15 @@ async def run(
         async def one(store: sqlite3.Row):
             pool = pools.get(store["platform"], pools["jsonld"])
             async with pool:
-                # Only for a pass that starts at the beginning: nothing else can
-                # withdraw anything, so nothing else has to know.
-                known = (
-                    dbm.live_external_ids(conn, store["id"])
-                    if store["platform"] == "shopify" and (store["sitemap_cursor"] or 0) <= 1
-                    else None
-                )
                 try:
+                    # Only for a pass that starts at the beginning: nothing else
+                    # can withdraw anything, so nothing else has to know.
+                    known = (
+                        dbm.live_external_ids(conn, store["id"])
+                        if store["platform"] == "shopify"
+                        and (store["sitemap_cursor"] or 0) <= 1
+                        else None
+                    )
                     # A handful of shops answer only a browser's TLS fingerprint.
                     # They get their own client; everyone else shares the pooled one.
                     if store["impersonate"] and impersonate.available():
@@ -1367,10 +1396,15 @@ async def run(
                         dbm.upsert_store(conn, store["domain"], last_error=result.error)
                         log.info("%-38s skipped: %s", store["domain"], result.error)
                         continue
-                    dbm.upsert_store(
-                        conn, store["domain"], status="error",
-                        last_error=result.error, last_checked=dbm.utcnow(),
-                    )
+                    failed = {
+                        "status": "error", "last_error": result.error,
+                        "last_checked": dbm.utcnow(),
+                    }
+                    if store["platform"] == "shopify":
+                        # Where the failed pass says to carry on: a resumed pass
+                        # that could not read its first page starts over.
+                        failed["sitemap_cursor"] = result.next_cursor
+                    dbm.upsert_store(conn, store["domain"], **failed)
                     log.warning("%-38s FAILED: %s", store["domain"], result.error)
                     continue
 
