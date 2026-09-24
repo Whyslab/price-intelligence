@@ -2201,3 +2201,96 @@ async def test_a_followed_size_back_in_stock_is_told_to_its_follower(config, sho
     assert conn.execute(
         "SELECT restock_notified_at FROM favorites WHERE user_id = 42"
     ).fetchone()[0], "and it is written down, so the next run does not repeat it"
+
+
+@respx.mock
+async def test_a_followed_product_that_goes_and_comes_back_is_told_both_ways(
+    config, shopify_payload
+):
+    """The gone notice promises to say if it comes back, and a product back at
+    its old price and stock is no price news — so only pi.watch can keep it."""
+    _mock_rates()
+    photo, text = _mock_telegram()
+    pages = _mock_product_pages(shopify_payload)
+    end_of_catalogue()
+    full = respx.get("https://shop.example/products.json?limit=250").mock(
+        return_value=httpx.Response(200, json=shopify_payload)
+    )
+    conn = dbm.connect(config.db_path)
+    known_store(conn)
+    await pipeline.run(config, conn)
+
+    dbm.upsert_bot_user(conn, 42, "42", "owner")
+    target = shopify_payload["products"][0]
+    (product_id,) = conn.execute(
+        "SELECT id FROM products WHERE external_id = ?", (str(target["id"]),)
+    ).fetchone()
+    dbm.add_favorite(conn, 42, product_id)
+
+    without = json.loads(json.dumps(shopify_payload))
+    without["products"] = without["products"][1:]
+    pages["payload"] = without
+    full.mock(return_value=httpx.Response(200, json=without))
+    make_due(conn)
+    text.reset()
+    await pipeline.run(config, conn)
+
+    said = [json.loads(call.request.content)["text"] for call in text.calls]
+    assert any("Снято с продажи" in message for message in said)
+
+    pages["payload"] = shopify_payload
+    full.mock(return_value=httpx.Response(200, json=shopify_payload))
+    make_due(conn)
+    photo.reset()
+    stats = await pipeline.run(config, conn)
+
+    captions = [json.loads(call.request.content)["caption"] for call in photo.calls]
+    assert sum("Снова в продаже" in caption for caption in captions) == 1
+    assert stats.notices_sent == 1
+    assert conn.execute(
+        "SELECT gone_notified_at FROM favorites WHERE user_id = 42"
+    ).fetchone()[0] is None, "spent, so the next disappearance is news again"
+
+
+@respx.mock
+async def test_back_on_sale_with_a_size_back_in_stock_is_one_message(config, shopify_payload):
+    _mock_rates()
+    photo, _ = _mock_telegram()
+    sold_out = json.loads(json.dumps(shopify_payload))
+    for variant in sold_out["products"][0]["variants"]:
+        variant["available"] = False
+    pages = _mock_product_pages(sold_out)
+    end_of_catalogue()
+    full = respx.get("https://shop.example/products.json?limit=250").mock(
+        return_value=httpx.Response(200, json=sold_out)
+    )
+    conn = dbm.connect(config.db_path)
+    known_store(conn)
+    await pipeline.run(config, conn)
+
+    dbm.upsert_bot_user(conn, 42, "42", "owner")
+    (product_id,) = conn.execute(
+        "SELECT id FROM products WHERE external_id = ?",
+        (str(sold_out["products"][0]["id"]),),
+    ).fetchone()
+    dbm.add_favorite(conn, 42, product_id)
+
+    without = json.loads(json.dumps(sold_out))
+    without["products"] = without["products"][1:]
+    pages["payload"] = without
+    full.mock(return_value=httpx.Response(200, json=without))
+    make_due(conn)
+    await pipeline.run(config, conn)
+
+    back = json.loads(json.dumps(sold_out))
+    back["products"][0]["variants"][0]["available"] = True
+    pages["payload"] = back
+    full.mock(return_value=httpx.Response(200, json=back))
+    make_due(conn)
+    photo.reset()
+    stats = await pipeline.run(config, conn)
+
+    captions = [json.loads(call.request.content)["caption"] for call in photo.calls]
+    assert sum("Снова в продаже" in caption for caption in captions) == 1
+    assert not any("Снова в наличии" in caption for caption in captions)
+    assert stats.notices_sent == 1

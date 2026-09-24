@@ -1495,11 +1495,16 @@ async def run(
         if capped_anyone:
             conn.execute("UPDATE runs SET capped = 1 WHERE id = ?", (run_id,))
 
-        # What a price never shows: a followed size back in stock, and a
-        # followed product the shop took down. See pi.watch.
-        notices = watch.restock_notices(conn, restocked, readers) + watch.gone_notices(
-            conn, readers, config.filters.delisted_grace_days
-        )
+        # What a price never shows: a followed size back in stock, a followed
+        # product the shop took down, and one it put back. See pi.watch.
+        returned = watch.returned_notices(conn, readers)
+        back_again = {(notice.user_id, notice.product_id) for notice in returned}
+        notices = [
+            # A product back on sale whose size also came back is one piece
+            # of news, not two messages.
+            notice for notice in watch.restock_notices(conn, restocked, readers)
+            if (notice.user_id, notice.product_id) not in back_again
+        ] + returned + watch.gone_notices(conn, readers, config.filters.delisted_grace_days)
 
         if dry_run:
             for notice in notices:
@@ -1719,7 +1724,7 @@ async def _send_notices(
     sent = 0
     for notice in notices:
         async with Telegram(config.bot_token, notice.chat_id, client) as telegram:
-            if notice.kind == "restock":
+            if notice.kind in ("restock", "back"):
                 ok = await telegram.send_deal(notice.text, notice.image_url)
             else:
                 ok = await telegram.send_text(notice.text)

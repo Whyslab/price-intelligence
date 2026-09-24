@@ -11,6 +11,9 @@ worth telling. Two events never show up as a price at all:
   stopped producing news, which from the outside looks exactly like a price
   that did not move. Two weeks later `pi prune` deletes it, and the star goes
   with it without anybody having been told.
+* **It coming back after that.** The notice about it going promises to say so,
+  and nothing else would: a product back at its old price and stock is no
+  price news at all.
 
 Both are facts about a product, so they are found once per run; who hears is
 decided per reader, the same split the rest of the pipeline keeps.
@@ -35,7 +38,7 @@ class Notice:
     user_id: int
     chat_id: str
     product_id: int
-    kind: str            # "restock" | "gone"
+    kind: str            # "restock" | "gone" | "back"
     text: str
     image_url: str | None = None
 
@@ -144,7 +147,9 @@ def restock_notices(
     return notices
 
 
-def gone_notices(conn: sqlite3.Connection, readers: list, grace_days: int) -> list[Notice]:
+def gone_notices(
+    conn: sqlite3.Connection, readers: list, grace_days: int, now: datetime | None = None
+) -> list[Notice]:
     """One notice per reader for each followed product the shop took down.
 
     Compared with the product's own mark, so a product that disappears, comes
@@ -153,6 +158,7 @@ def gone_notices(conn: sqlite3.Connection, readers: list, grace_days: int) -> li
     """
     if not readers:
         return []
+    now = now or datetime.now(UTC)
     by_user = {reader.user_id: reader for reader in readers}
     rows = conn.execute(
         """
@@ -176,7 +182,8 @@ def gone_notices(conn: sqlite3.Connection, readers: list, grace_days: int) -> li
         lines = ["🪦 <b>Снято с продажи</b>", "", *_name(row), f"🏪 {_where(row)}", ""]
         lines.append(
             "Магазин больше не показывает эту вещь. Если она вернётся в ближайшие "
-            f"{grace_days} дн, я напишу; если нет — она уйдёт из избранного."
+            f"{_days_left(row['missing_since'], grace_days, now)} дн, я напишу; "
+            "если нет — она уйдёт из избранного."
         )
         link = shop_link(row["url"], row["domain"])
         if link:
@@ -193,8 +200,100 @@ def gone_notices(conn: sqlite3.Connection, readers: list, grace_days: int) -> li
     return notices
 
 
+def _days_left(missing_since: str, grace_days: int, now: datetime) -> int:
+    """Days until `pi prune` may delete a product marked at `missing_since`.
+
+    A mark made long before anybody could be told — this notice is new, the
+    marks are not — has less of the fortnight left than the whole of it.
+    """
+    try:
+        marked = datetime.fromisoformat(missing_since)
+    except (TypeError, ValueError):
+        return grace_days
+    if marked.tzinfo is None:
+        marked = marked.replace(tzinfo=UTC)
+    return max(1, grace_days - (now - marked).days)
+
+
+def returned_notices(conn: sqlite3.Connection, readers: list) -> list[Notice]:
+    """One notice per reader for a followed product they were told had gone and
+    that is back on sale.
+
+    Keyed on the gone notice itself: it was sent, and the product is no longer
+    marked. Hearing that it is back clears it, so the next disappearance is
+    news again.
+    """
+    if not readers:
+        return []
+    by_user = {reader.user_id: reader for reader in readers}
+    rows = conn.execute(
+        """
+        SELECT f.user_id, f.product_id,
+               p.title, p.brand, p.brand_family, p.url, p.image_url,
+               s.domain, s.name AS store_name, s.country
+          FROM favorites f
+          JOIN products p ON p.id = f.product_id
+          JOIN stores   s ON s.id = p.store_id
+         WHERE f.notify = 1
+           AND f.gone_notified_at IS NOT NULL
+           AND p.missing_since IS NULL
+         ORDER BY f.user_id, f.product_id
+        """
+    ).fetchall()
+    notices = []
+    for row in rows:
+        reader = by_user.get(row["user_id"])
+        if reader is None:
+            continue
+        lines = ["🔔 <b>Снова в продаже</b>", "", *_name(row)]
+        cheapest = conn.execute(
+            """
+            SELECT pp.price_usd, pp.price_native, pp.currency
+              FROM variants v
+              JOIN price_points pp ON pp.variant_id = v.id
+                   AND pp.ts = (SELECT MAX(ts) FROM price_points WHERE variant_id = v.id)
+             WHERE v.product_id = ? AND pp.in_stock = 1
+             ORDER BY pp.price_usd
+             LIMIT 1
+            """,
+            (row["product_id"],),
+        ).fetchone()
+        if cheapest is not None:
+            native = (
+                f" · в магазине {_money(cheapest['price_native'], cheapest['currency'])}"
+                if cheapest["currency"] and cheapest["currency"].upper() != "USD" else ""
+            )
+            lines.append(f"💰 <b>{_money(cheapest['price_usd'])}</b>{native}")
+        lines += [
+            f"🏪 {_where(row)}",
+            "⭐ Магазин снова её показывает — она остаётся в избранном",
+        ]
+        link = shop_link(row["url"], row["domain"])
+        if link:
+            lines += ["", f"🔗 {escape(link)}"]
+        notices.append(
+            Notice(
+                user_id=row["user_id"],
+                chat_id=reader.chat_id,
+                product_id=row["product_id"],
+                kind="back",
+                text="\n".join(lines),
+                image_url=row["image_url"],
+            )
+        )
+    return notices
+
+
 def mark_told(conn: sqlite3.Connection, notice: Notice, ts: str) -> None:
     """Write down that this reader heard it, so the next run does not repeat it."""
+    if notice.kind == "back":
+        # Told it is back, so the gone notice is spent: should it disappear
+        # again, that is news again.
+        conn.execute(
+            "UPDATE favorites SET gone_notified_at = NULL WHERE user_id = ? AND product_id = ?",
+            (notice.user_id, notice.product_id),
+        )
+        return
     column = "restock_notified_at" if notice.kind == "restock" else "gone_notified_at"
     conn.execute(
         f"UPDATE favorites SET {column} = ? WHERE user_id = ? AND product_id = ?",
