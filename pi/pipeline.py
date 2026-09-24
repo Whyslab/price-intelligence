@@ -521,6 +521,7 @@ async def withdraw_missing(
     wanted = WITHDRAWAL_SAMPLE if alarm else 1
     tries = WITHDRAWAL_TRIES if alarm else CHURN_TRIES
     answers: list[str] = []
+    gone: list[int] = []
     for row in _sample_order(candidates, tail_first=alarm)[:tries]:
         status, _ = await _fetch_one(
             client,
@@ -528,20 +529,30 @@ async def withdraw_missing(
             limiter,
         )
         answers.append(status)
+        if status == "gone":
+            gone.append(row["id"])
         if status == "ok" or answers.count("gone") >= wanted:
             break
     believed = "ok" not in answers and (answers.count("gone") >= wanted or not alarm)
     if not believed:
         live = dbm.live_products(conn, store["id"])
         held = f"{dbm.utcnow()} · {len(candidates)} из {live}"
+        # The read is not believed, but a product whose own page said 404 is
+        # gone whatever the read was — the one-by-one check marks on the same
+        # answer. Without this a shop that keeps a few pages open for products
+        # it no longer lists here (footdistrict.com, 12pulgadasbcn.com: held
+        # every read) would never be cleaned at all.
+        marked = 0
         with dbm.transaction(conn):
             dbm.upsert_store(conn, store["domain"], withdrawal_held=held)
+            for product_id in gone:
+                marked += bool(dbm.mark_product_missing(conn, product_id, dbm.utcnow()))
         log.warning(
             "%-38s a full read left out %d of %d products, but opening them gave "
-            "%s — not marking any of them as withdrawn",
+            "%s — not marking the rest as withdrawn",
             store["domain"], len(candidates), live, ", ".join(answers),
         )
-        return 0, held
+        return marked, held
     with dbm.transaction(conn):
         marked = dbm.mark_missing(conn, store["id"], seen, dbm.utcnow())
         if _col(store, "withdrawal_held"):

@@ -2010,6 +2010,26 @@ class TestWhatAWithdrawalIsCheckedAgainst:
         store = self._listing(conn, long_gone + missed)
         await self._held_every_time(conn, monkeypatch, store, live=set(range(5000, 5040)))
 
+    async def test_held_but_what_answered_404_is_marked_one_by_one(self, conn, monkeypatch):
+        """A shop keeping pages open for products it no longer lists here was
+        held on every read (footdistrict.com, 24.09) and never cleaned. A 404 is
+        proof for its own product whatever the read was — the one-by-one check
+        marks on the same answer."""
+        store, ids = self._shop(conn, 60)
+        answers = iter(["gone", "gone", "ok"])
+        monkeypatch.setattr(pipeline, "_sampler", random.Random(1))
+        opened = _answering(monkeypatch, lambda url: next(answers))
+
+        marked, held = await pipeline.withdraw_missing(conn, None, store, ids[:20], None)
+
+        assert held and marked == 2
+        gone = {url for url in opened[:2]}
+        assert {
+            row[0] for row in conn.execute(
+                "SELECT url FROM products WHERE missing_since IS NOT NULL"
+            )
+        } == gone, "exactly the two that said 404"
+
     async def test_a_large_withdrawal_nobody_can_confirm_is_held(self, conn, monkeypatch):
         store, ids = self._shop(conn, 60)
         opened = _answering(monkeypatch, lambda url: "unreachable")

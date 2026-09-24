@@ -89,12 +89,15 @@ def _size_family(size: str, kind: str | None = "shoes") -> str | None:
     """Shoe sizes (EU44, US10.5), letter sizes (S, XL, 2XL), or neither.
 
     A bare number is normalised to EU between 35 and 50 and to US otherwise,
-    so a trouser's waist 32 arrives as US32: on anything not known to be a
-    shoe, only an EU size is taken for a shoe size.
+    so a trouser's waist 32 arrives as US32 and its 36 as EU36. On clothing
+    and accessories no number is a shoe size; on a product not classified at
+    all, an EU size is the likelier shoe.
     """
     if _LETTER_SIZE.match(size):
         return "letter"
-    if _SHOE_SIZE.match(size) and (kind == "shoes" or size.startswith("EU")):
+    if _SHOE_SIZE.match(size) and (
+        kind == "shoes" or (kind is None and size.startswith("EU"))
+    ):
         return "shoe"
     return None
 

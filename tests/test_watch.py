@@ -372,6 +372,18 @@ class TestSizesOfTheSameFamily:
 
         assert len(watch.restock_notices(conn, back, [_reader(7, sizes=("EU44",))])) == 1
 
+    def test_nor_is_a_waist_36_normalised_to_eu(self, conn):
+        """Review 24.09 (seventh pass): a bare 36 becomes EU36, and one such
+        size made a pair of trousers a shoe again."""
+        product, variants = self._shoe_in(
+            conn, ("US30", "US32", "US34", "EU36"), kind="clothing"
+        )
+        dbm.add_favorite(conn, 7, product)
+
+        back = _restock(conn, variants["US32"])
+
+        assert len(watch.restock_notices(conn, back, [_reader(7, sizes=("EU44",))])) == 1
+
     def test_letter_sizes_on_a_reader_speak_about_a_hoodie(self, conn):
         product, variants = self._shoe_in(conn, ("S", "M", "L"), kind="clothing")
         dbm.add_favorite(conn, 7, product)
