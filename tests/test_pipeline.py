@@ -2424,3 +2424,42 @@ async def test_back_on_sale_with_a_size_back_in_stock_is_one_message(config, sho
     assert sum("Снова в продаже" in caption for caption in captions) == 1
     assert not any("Снова в наличии" in caption for caption in captions)
     assert stats.notices_sent == 1
+
+
+@respx.mock
+async def test_a_size_back_that_a_card_check_sees_first_is_still_told(config, shopify_payload):
+    """Review 24.09: the hourly check of shelf cards writes what a product's own
+    page says, so the next catalogue read saw no change and the follower never
+    heard. A followed product on the shelf is exactly the one checked."""
+    _mock_rates()
+    photo, _ = _mock_telegram()
+    one_size_out = json.loads(json.dumps(shopify_payload))
+    target = one_size_out["products"][0]
+    target["variants"][0]["available"] = False
+    pages = _mock_product_pages(one_size_out)
+    end_of_catalogue()
+    respx.get("https://shop.example/products.json?limit=250").mock(
+        return_value=httpx.Response(200, json=one_size_out)
+    )
+    conn = dbm.connect(config.db_path)
+    known_store(conn)
+    await pipeline.run(config, conn)
+    (product_id,) = conn.execute(
+        "SELECT id FROM products WHERE external_id = ?", (str(target["id"]),)
+    ).fetchone()
+    assert conn.execute(
+        "SELECT COUNT(*) FROM offers WHERE product_id = ?", (product_id,)
+    ).fetchone()[0], "precondition: it is on the shelf, so its card gets checked"
+    dbm.upsert_bot_user(conn, 42, "42", "owner")
+    dbm.add_favorite(conn, 42, product_id)
+
+    back = json.loads(json.dumps(one_size_out))
+    back["products"][0]["variants"][0]["available"] = True
+    pages["payload"] = back  # only its own page knows: `pi verify` reads no catalogue
+    photo.reset()
+    stats = await pipeline.run(config, conn, collect=False)
+
+    assert stats.verified >= 1
+    captions = [json.loads(call.request.content)["caption"] for call in photo.calls]
+    assert any("Снова в наличии" in caption for caption in captions)
+    assert stats.notices_sent == 1

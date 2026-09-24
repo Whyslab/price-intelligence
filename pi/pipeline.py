@@ -339,6 +339,7 @@ async def verify_offers(
     rates: Rates,
     limiter: RateLimiter | None = None,
     limit: int = VERIFY_BUDGET,
+    restocked: list[int] | None = None,
 ) -> dict:
     """Open the least recently checked cards on the shelf and see if they exist.
 
@@ -383,6 +384,10 @@ async def verify_offers(
                     domain=row["domain"], products=[product], currency=row["currency"]
                 ),
                 rates,
+                # A size back in stock is news however it was found: a card
+                # opened here is written first, and the next catalogue read
+                # would see no change at all.
+                restocked,
             )
             # The one place allowed to say a *product* was checked rather than
             # its shop. Everywhere else that would be a lie, and it was.
@@ -1415,7 +1420,9 @@ async def run(
         # by opening a product's own page is judged in the same run. At the end
         # it would sit unscored until the price moved again.
         if verify_budget:
-            checks = await verify_offers(conn, client, rates, limiter, verify_budget)
+            checks = await verify_offers(
+                conn, client, rates, limiter, verify_budget, restocked
+            )
             changed.extend(checks["changed"])
             stats.verified += checks["checked"]
             stats.withdrawn += checks["gone"]
@@ -1525,19 +1532,8 @@ async def run(
         if capped_anyone:
             conn.execute("UPDATE runs SET capped = 1 WHERE id = ?", (run_id,))
 
-        # What a price never shows: a followed size back in stock, a followed
-        # product the shop took down, and one it put back. See pi.watch.
-        returned = watch.returned_notices(conn, readers)
-        back_again = {(notice.user_id, notice.product_id) for notice in returned}
-        notices = [
-            # A product back on sale whose size also came back is one piece
-            # of news, not two messages.
-            notice for notice in watch.restock_notices(conn, restocked, readers)
-            if (notice.user_id, notice.product_id) not in back_again
-        ] + returned + watch.gone_notices(conn, readers, config.filters.delisted_grace_days)
-
         if dry_run:
-            for notice in notices:
+            for notice in _watch_notices(conn, config, restocked, readers):
                 print("-" * 60)
                 print(f"[{notice.kind} → {notice.chat_id}]")
                 print(notice.text)
@@ -1565,7 +1561,7 @@ async def run(
 
         # Last gate before a message leaves: is this still true?
         queues, confirmed = await confirm_before_announcing(
-            conn, client, rates, limiter, queues
+            conn, client, rates, limiter, queues, restocked
         )
         if confirmed["checked"]:
             log.info(
@@ -1579,6 +1575,9 @@ async def run(
                 conn, config, client, reader, selected, shipping, eur_usd,
                 since.get(reader.user_id, {}),
             )
+        # After the gate, which opens product pages too and may be the first
+        # to see a size come back.
+        notices = _watch_notices(conn, config, restocked, readers)
         stats.notices_sent += await _send_notices(conn, config, client, notices)
 
     if rates.dropped:
@@ -1607,6 +1606,7 @@ async def confirm_before_announcing(
     rates: dict,
     limiter: RateLimiter | None,
     queues: list[tuple[personal.Subscriber, list]],
+    restocked: list[int] | None = None,
 ) -> tuple[list[tuple[personal.Subscriber, list]], dict]:
     """Ask each shop about the finds about to be announced, and drop what moved.
 
@@ -1663,6 +1663,7 @@ async def confirm_before_announcing(
                     domain=row["domain"], products=[product], currency=row["currency"]
                 ),
                 rates,
+                restocked,
             )
             dbm.confirm_offer(conn, product_id, dbm.utcnow())
         verdict[product_id] = True
@@ -1742,6 +1743,21 @@ async def _send_to(
                     break
             await asyncio.sleep(1.0)  # Telegram allows ~30 messages/second; be calm
     return sent
+
+
+def _watch_notices(
+    conn: sqlite3.Connection, config: Config, restocked: list[int], readers: list
+) -> list[watch.Notice]:
+    """What a price never shows: a followed size back in stock, a followed
+    product the shop took down, and one it put back. See pi.watch."""
+    returned = watch.returned_notices(conn, readers)
+    back_again = {(notice.user_id, notice.product_id) for notice in returned}
+    return [
+        # A product back on sale whose size also came back is one piece of
+        # news, not two messages.
+        notice for notice in watch.restock_notices(conn, restocked, readers)
+        if (notice.user_id, notice.product_id) not in back_again
+    ] + returned + watch.gone_notices(conn, readers, config.filters.delisted_grace_days)
 
 
 async def _send_notices(
