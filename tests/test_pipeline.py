@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 from dataclasses import replace
 from datetime import UTC, datetime
 
@@ -1539,7 +1540,7 @@ class TestAProductThatStoppedBeingSold:
     ):
         _mock_rates()
         _mock_telegram()
-        _mock_product_pages(shopify_payload)
+        pages = _mock_product_pages(shopify_payload)
         end_of_catalogue()
         respx.get("https://shop.example/products.json?limit=250").mock(
             return_value=httpx.Response(200, json=shopify_payload)
@@ -1557,7 +1558,7 @@ class TestAProductThatStoppedBeingSold:
         respx.get("https://shop.example/products.json?limit=250").mock(
             return_value=httpx.Response(200, json=short)
         )
-        _mock_product_pages(short)
+        pages["payload"] = short  # and its own page answers 404
         make_due(conn)
         stats = await pipeline.run(config, conn)
 
@@ -1728,13 +1729,14 @@ class TestAReadThatLosesMostOfAShop:
     async def test_a_held_read_is_forgotten_once_a_read_is_believed(
         self, config, shopify_payload
     ):
-        conn, whole, _ = await self._first_read(config, shopify_payload)
+        conn, whole, pages = await self._first_read(config, shopify_payload)
         await self._collect(config, conn, {"products": whole["products"][:10]})
         assert conn.execute(
             "SELECT withdrawal_held FROM stores WHERE domain = 'shop.example'"
         ).fetchone()[0]
 
         make_due(conn)
+        pages["payload"] = {"products": whole["products"][:58]}  # two really went
         await self._collect(config, conn, {"products": whole["products"][:58]})
 
         assert conn.execute(
@@ -1742,22 +1744,150 @@ class TestAReadThatLosesMostOfAShop:
         ).fetchone()[0] is None
 
     @respx.mock
-    async def test_a_few_missing_products_are_not_worth_asking_about(
+    async def test_ordinary_churn_costs_one_product_page(
         self, config, shopify_payload, monkeypatch
     ):
-        """Ordinary churn is marked from the read alone: no product page opened."""
+        """Five of sixty is a shop selling things: one page opened, then marked."""
         conn, _, _ = await self._first_read(config, shopify_payload)
         store = dbm.get_stores(conn, domains=("shop.example",))[0]
         ids = [row[0] for row in conn.execute("SELECT id FROM products ORDER BY id")]
+        opened = _answering(monkeypatch, lambda url: "gone")
 
-        async def must_not_ask(*args):
-            raise AssertionError("a product page was opened for ordinary churn")
-
-        monkeypatch.setattr(pipeline, "_fetch_one", must_not_ask)
         marked, held = await pipeline.withdraw_missing(conn, None, store, ids[:55], None)
 
-        assert marked == 5, "five of sixty is a shop selling things, not a bad read"
-        assert held is None
+        assert marked == 5 and held is None
+        assert len(opened) == 1, "one product page, not one per product"
+
+    @respx.mock
+    async def test_the_tail_of_a_walk_that_stopped_early_is_not_withdrawn(
+        self, config, shopify_payload
+    ):
+        """Review 24.09: an empty page right after a short one ended the walk,
+        and what it missed — under the alarm floor — went unchecked. 250
+        products in a row not sold to this visitor make exactly that page."""
+        _mock_rates()
+        _mock_telegram()
+        first = numbered_products(shopify_payload, 1, count=240)
+        tail = numbered_products(shopify_payload, 3, count=20)
+        # Every product still answers on its own page: nothing was withdrawn.
+        _mock_product_pages({"products": first["products"] + tail["products"]})
+        conn = dbm.connect(config.db_path)
+        known_store(conn)
+        respx.get("https://shop.example/products.json?limit=250").mock(
+            return_value=httpx.Response(200, json=first)
+        )
+        page2 = respx.get("https://shop.example/products.json?limit=250&page=2").mock(
+            return_value=httpx.Response(200, json=tail)
+        )
+        end_of_catalogue(page=3)
+        await pipeline.run(config, conn)
+        assert conn.execute("SELECT COUNT(*) FROM products").fetchone()[0] == 260
+
+        # Now page two is a block this visitor may not buy, and the walk ends there.
+        page2.mock(return_value=httpx.Response(200, json={"products": []}))
+        make_due(conn)
+        stats = await pipeline.run(config, conn)
+
+        assert stats.withdrawn == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM products WHERE missing_since IS NOT NULL"
+        ).fetchone()[0] == 0, "the twenty still for sale are not marked"
+        assert stats.held and stats.held[0][0] == "shop.example"
+
+
+def _answering(monkeypatch, answer_for):
+    """Stand in for a shop's product pages; returns the urls opened, in order."""
+    opened: list[str] = []
+
+    async def fake(client, row, limiter):
+        opened.append(row["url"])
+        return answer_for(row["url"]), None
+
+    monkeypatch.setattr(pipeline, "_fetch_one", fake)
+    return opened
+
+
+class TestWhatAWithdrawalIsCheckedAgainst:
+    """Review 24.09: the check opened the same three products on every read.
+
+    One of them that never answers held its shop forever, and a read that
+    missed the newest products could be vouched for by old ones that really
+    had gone. The same seed runs each case twenty ways.
+    """
+
+    @staticmethod
+    def _shop(conn, count):
+        store_id = dbm.upsert_store(
+            conn, "shop.example", platform="shopify", currency="USD",
+            last_ok=ts(0), status="ok",
+        )
+        ids = [
+            dbm.upsert_product(
+                conn, store_id, f"p{n}", f"Product {n}", f"https://shop.example/products/p{n}"
+            )
+            for n in range(count)
+        ]
+        return dbm.get_stores(conn, domains=("shop.example",))[0], ids
+
+    @staticmethod
+    def _index(url):
+        return int(url.rsplit("/p", 1)[1])
+
+    async def test_one_product_that_never_answers_does_not_hold_a_shop(
+        self, conn, monkeypatch
+    ):
+        store, ids = self._shop(conn, 60)
+        seen = ids[:20]
+        sticky = f"https://shop.example/products/p{20}"
+        for seed in range(20):
+            monkeypatch.setattr(pipeline, "_sampler", random.Random(seed))
+            opened = _answering(
+                monkeypatch, lambda url: "unreachable" if url == sticky else "gone"
+            )
+            marked, held = await pipeline.withdraw_missing(conn, None, store, seen, None)
+            assert (marked, held) == (40, None), f"seed {seed}"
+            assert len(opened) <= pipeline.WITHDRAWAL_TRIES
+            conn.execute("UPDATE products SET missing_since = NULL")
+
+    async def test_the_newest_are_always_among_those_asked(self, conn, monkeypatch):
+        """100 old products really gone and 40 new ones the read missed."""
+        store, ids = self._shop(conn, 150)
+        seen = ids[:10]
+        for seed in range(20):
+            monkeypatch.setattr(pipeline, "_sampler", random.Random(seed))
+            _answering(monkeypatch, lambda url: "ok" if self._index(url) >= 110 else "gone")
+            marked, held = await pipeline.withdraw_missing(conn, None, store, seen, None)
+            assert marked == 0 and held, f"seed {seed}: live products would have been marked"
+
+    async def test_a_large_withdrawal_nobody_can_confirm_is_held(self, conn, monkeypatch):
+        store, ids = self._shop(conn, 60)
+        opened = _answering(monkeypatch, lambda url: "unreachable")
+
+        marked, held = await pipeline.withdraw_missing(conn, None, store, ids[:20], None)
+
+        assert marked == 0 and held
+        assert len(opened) == pipeline.WITHDRAWAL_TRIES, "and it gave up after a few pages"
+
+    async def test_churn_nobody_can_confirm_still_goes_through(self, conn, monkeypatch):
+        """A shop whose product pages never answer still gets its routine clean-up."""
+        store, ids = self._shop(conn, 60)
+        opened = _answering(monkeypatch, lambda url: "unreachable")
+
+        marked, held = await pipeline.withdraw_missing(conn, None, store, ids[:55], None)
+
+        assert (marked, held) == (5, None)
+        assert len(opened) == pipeline.CHURN_TRIES
+
+    async def test_churn_with_one_product_still_for_sale_is_held(self, conn, monkeypatch):
+        store, ids = self._shop(conn, 60)
+        _answering(monkeypatch, lambda url: "ok")
+
+        marked, held = await pipeline.withdraw_missing(conn, None, store, ids[:55], None)
+
+        assert marked == 0 and held
+        assert conn.execute(
+            "SELECT COUNT(*) FROM products WHERE missing_since IS NOT NULL"
+        ).fetchone()[0] == 0
 
 
 class TestReviewFindings:

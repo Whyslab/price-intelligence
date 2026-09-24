@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import sqlite3
 import statistics
 from collections import Counter
@@ -391,27 +392,52 @@ async def verify_offers(
     return report
 
 
-# When a full read is not taken at its word. A shop does lose a few products
-# between two reads — measured on ordinary days, a handful to a few dozen —
-# but a read claiming more than that is as likely to be a read that stopped
-# early, and believing one wrongly deletes a shop's history two weeks later.
-# That is not hypothetical: a short page on 22.09.2026 marked 76,062 of
-# shop.simon.com's 77,329 products as withdrawn, and every one sampled was
-# still for sale. Asked in absolute numbers rather than as a share of the shop:
-# a fifth of a 15,000-product shop is 3,000 products, and letting that many
-# through unchecked is exactly the damage the check exists to stop.
+# When a full read is not taken at its word. Believing a read that stopped
+# early deletes a shop's history two weeks later, and that is not
+# hypothetical: a short page on 22.09.2026 marked 76,062 of shop.simon.com's
+# 77,329 products as withdrawn, and every one sampled was still for sale. So a
+# read is checked against the products it claims have gone, by opening some of
+# them — as many as it takes to believe it, never more than a few pages of the
+# same per-IP quota the collector lives on.
+#
+# Past this many, a withdrawal needs positive proof: WITHDRAWAL_SAMPLE of the
+# products opened must answer "gone". Asked in absolute numbers rather than as
+# a share of the shop: a fifth of a 15,000-product shop is 3,000 products.
 WITHDRAWAL_ALARM_FLOOR = 25
-# How many of the supposedly withdrawn products are opened to check. All of
-# them must answer "gone": one still for sale means the read was wrong.
 WITHDRAWAL_SAMPLE = 3
+# Up to this many are opened per read. "Unreachable" is no answer either way —
+# an old handle that redirects, a page that always says 429 — so the next is
+# tried rather than letting one such product decide every read of its shop.
+WITHDRAWAL_TRIES = 6
+# Under the floor it is ordinary churn, which a shop has every day. One product
+# is opened (a second if the first does not answer), and only an answer that it
+# is still for sale holds the read back: a product page that never answers must
+# not stop a shop's routine clean-up for good. That one page is what catches a
+# walk that stopped a page early — an empty page after a short one can be the
+# middle of a catalogue, when 250 products in a row are not sold to this
+# visitor — because what such a read misses is still for sale.
+CHURN_TRIES = 2
+
+# Random, so that no single product is opened on every read of its shop.
+_sampler = random.Random()
 
 
-def _spread(rows: list, count: int) -> list:
-    """`count` rows taken evenly across the list, first included."""
-    if len(rows) <= count:
-        return list(rows)
-    step = len(rows) / count
-    return [rows[int(i * step)] for i in range(count)]
+def _sample_order(rows: list, *, newest_first: bool) -> list:
+    """The order to open withdrawal candidates in (they come ordered by id).
+
+    A read that stopped early misses the end of what it was listing, which is
+    where the newest products are, so for a large withdrawal one of the newest
+    tenth is opened first; the rest follow at random. Not simply the newest:
+    one product always answering the same way would then decide every read.
+    """
+    order = list(rows)
+    _sampler.shuffle(order)
+    if newest_first and order:
+        tail = rows[-max(1, len(rows) // 10):]
+        first = _sampler.choice(tail)
+        order.remove(first)
+        order.insert(0, first)
+    return order
 
 
 async def withdraw_missing(
@@ -423,12 +449,11 @@ async def withdraw_missing(
 ) -> tuple[int, str | None]:
     """Mark what a full read of this shop did not list. Returns (marked, held).
 
-    `held` is None normally. When the read would withdraw more than
-    WITHDRAWAL_ALARM_FLOOR products, a few of them are opened first, the way
-    any such claim should be checked: open some of what was marked and see. If
-    any of them is still for sale, nothing is marked, the shop row says why,
-    and the daily summary shows it. A genuine clearance still goes through —
-    its sampled products answer 404.
+    `held` is None normally. When a product the read left out is still for
+    sale, or when more than WITHDRAWAL_ALARM_FLOOR are left out and the check
+    cannot prove WITHDRAWAL_SAMPLE of them gone, nothing is marked, the shop
+    row says why, and the daily summary shows it. A genuine clearance still
+    goes through — its products answer 404.
     """
     candidates = dbm.withdrawal_candidates(conn, store["id"], seen)
     if not candidates:
@@ -437,27 +462,32 @@ async def withdraw_missing(
             with dbm.transaction(conn):
                 dbm.upsert_store(conn, store["domain"], withdrawal_held=None)
         return 0, None
-    live = dbm.live_products(conn, store["id"])
-    if len(candidates) > WITHDRAWAL_ALARM_FLOOR:
-        answers = []
-        for row in _spread(candidates, WITHDRAWAL_SAMPLE):
-            status, _ = await _fetch_one(
-                client,
-                {"platform": store["platform"], "domain": store["domain"], "url": row["url"]},
-                limiter,
-            )
-            answers.append(status)
-        if any(answer != "gone" for answer in answers):
-            held = f"{dbm.utcnow()} · {len(candidates)} из {live}"
-            with dbm.transaction(conn):
-                dbm.upsert_store(conn, store["domain"], withdrawal_held=held)
-            log.warning(
-                "%-38s a full read left out %d of %d products, but %s — "
-                "not marking any of them as withdrawn",
-                store["domain"], len(candidates), live,
-                ", ".join(answers),
-            )
-            return 0, held
+
+    alarm = len(candidates) > WITHDRAWAL_ALARM_FLOOR
+    wanted = WITHDRAWAL_SAMPLE if alarm else 1
+    tries = WITHDRAWAL_TRIES if alarm else CHURN_TRIES
+    answers: list[str] = []
+    for row in _sample_order(candidates, newest_first=alarm)[:tries]:
+        status, _ = await _fetch_one(
+            client,
+            {"platform": store["platform"], "domain": store["domain"], "url": row["url"]},
+            limiter,
+        )
+        answers.append(status)
+        if status == "ok" or answers.count("gone") >= wanted:
+            break
+    believed = "ok" not in answers and (answers.count("gone") >= wanted or not alarm)
+    if not believed:
+        live = dbm.live_products(conn, store["id"])
+        held = f"{dbm.utcnow()} · {len(candidates)} из {live}"
+        with dbm.transaction(conn):
+            dbm.upsert_store(conn, store["domain"], withdrawal_held=held)
+        log.warning(
+            "%-38s a full read left out %d of %d products, but opening them gave "
+            "%s — not marking any of them as withdrawn",
+            store["domain"], len(candidates), live, ", ".join(answers),
+        )
+        return 0, held
     with dbm.transaction(conn):
         marked = dbm.mark_missing(conn, store["id"], seen, dbm.utcnow())
         if _col(store, "withdrawal_held"):
