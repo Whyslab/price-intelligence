@@ -1148,6 +1148,17 @@ def offers_to_confirm(
     ).fetchall()
 
 
+# The share of one-by-one checks kept for cards the page hides because nobody
+# has seen their product for STALE_PRODUCT_DAYS. They are the oldest cards on
+# the shelf by construction, so in plain "oldest first" order they took every
+# check: after schema 16 gave back shop.simon.com's products beyond the 25,000
+# its catalogue pages through, 21,891 hidden cards stood at the front of the
+# queue — two weeks of checks during which no card anybody could see was
+# looked at. A check is still how a hidden card comes back, so they keep a
+# quarter.
+HIDDEN_CHECK_SHARE = 0.25
+
+
 def stale_offers(conn: sqlite3.Connection, limit: int, platforms: Sequence[str]) -> list[sqlite3.Row]:
     """What is on the shelf and has gone longest without being looked at.
 
@@ -1165,27 +1176,39 @@ def stale_offers(conn: sqlite3.Connection, limit: int, platforms: Sequence[str])
     catalogue will not serve one product either, and its cards are already off
     the page once it has been silent long enough (see fresh_shop_clause).
     """
-    if not platforms:
+    if not platforms or limit <= 0:
         return []
     marks = ",".join("?" * len(platforms))
-    return conn.execute(
-        f"""
-        SELECT p.id AS product_id, p.url, p.external_id, p.store_id,
-               s.domain, s.platform, s.currency,
-               MIN(o.checked_at) AS checked_at, MAX(o.score) AS score,
-               MIN(CASE WHEN o.tried_at > o.checked_at THEN o.tried_at
-                        ELSE o.checked_at END) AS due_at
-          FROM offers o
-          JOIN products p ON p.id = o.product_id
-          JOIN stores   s ON s.id = p.store_id
-         WHERE p.missing_since IS NULL AND s.platform IN ({marks})
-           AND s.status = 'ok'
-         GROUP BY p.id
-         ORDER BY due_at ASC, score DESC
-         LIMIT ?
-        """,
-        [*platforms, limit],
-    ).fetchall()
+    cutoff = (datetime.now(UTC) - timedelta(days=STALE_PRODUCT_DAYS)).isoformat(
+        timespec="seconds"
+    )
+
+    def oldest(hidden: bool) -> list[sqlite3.Row]:
+        seen = "p.last_seen < ?" if hidden else "(p.last_seen IS NULL OR p.last_seen >= ?)"
+        return conn.execute(
+            f"""
+            SELECT p.id AS product_id, p.url, p.external_id, p.store_id,
+                   s.domain, s.platform, s.currency,
+                   MIN(o.checked_at) AS checked_at, MAX(o.score) AS score,
+                   MIN(CASE WHEN o.tried_at > o.checked_at THEN o.tried_at
+                            ELSE o.checked_at END) AS due_at
+              FROM offers o
+              JOIN products p ON p.id = o.product_id
+              JOIN stores   s ON s.id = p.store_id
+             WHERE p.missing_since IS NULL AND s.platform IN ({marks})
+               AND s.status = 'ok' AND {seen}
+             GROUP BY p.id
+             ORDER BY due_at ASC, score DESC
+             LIMIT ?
+            """,
+            [*platforms, cutoff, limit],
+        ).fetchall()
+
+    shown, hidden = oldest(hidden=False), oldest(hidden=True)
+    # A quarter for the hidden, unless there are fewer of either to check.
+    kept_back = min(len(hidden), max(1, int(limit * HIDDEN_CHECK_SHARE)))
+    first = shown[: limit - kept_back]
+    return first + hidden[: limit - len(first)]
 
 
 def note_attempt(conn: sqlite3.Connection, product_id: int, ts: str) -> None:
@@ -1205,8 +1228,10 @@ STALE_SHOP_HOURS = 72
 # How long a product may go unseen before its card leaves the page. A large
 # shop is read a slice at a time, so a product can sit outside the slices it
 # reaches — shop.simon.com holds 77,000 products in the database and lists
-# 25,000 that its catalogue will page through. A week is several full cycles of
-# every shop that is being read at all.
+# 25,000 that its catalogue will page through. A week is several full reads of
+# any Shopify shop being read at all; a crawled (jsonld) shop can take two to
+# five weeks to come round to one page, and what keeps its cards seen is the
+# one-by-one check (stale_offers), not the crawl.
 STALE_PRODUCT_DAYS = 7
 
 

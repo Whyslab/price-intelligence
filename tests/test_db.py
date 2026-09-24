@@ -408,6 +408,48 @@ class TestTheCheckingQueue:
         assert dbm.stale_offers(conn, 10, ("jsonld",)) == []
 
 
+class TestHiddenCardsDoNotTakeEveryCheck:
+    """Review 24.09: cards hidden because nobody has seen their product for a
+    week are the oldest on the shelf by construction, and took every check —
+    after schema 16, two weeks of them before a visible card was looked at."""
+
+    def _cards(self, conn, store, prefix, count, seen_days):
+        cards = []
+        for n in range(count):
+            card = _a_card(conn, store, f"{prefix}{n}", checked=ts(seen_days))
+            conn.execute("UPDATE products SET last_seen = ? WHERE id = ?", (ts(seen_days), card))
+            cards.append(card)
+        return set(cards)
+
+    def test_the_hidden_get_a_quarter(self, conn):
+        store = dbm.upsert_store(conn, "shop.example", platform="shopify", status="ok")
+        hidden = self._cards(conn, store, "old", 20, seen_days=30)
+        shown = self._cards(conn, store, "new", 20, seen_days=2)
+
+        rows = {row["product_id"] for row in dbm.stale_offers(conn, 8, ("shopify",))}
+
+        assert len(rows & shown) == 6 and len(rows & hidden) == 2
+
+    def test_what_one_side_does_not_need_goes_to_the_other(self, conn):
+        store = dbm.upsert_store(conn, "shop.example", platform="shopify", status="ok")
+        hidden = self._cards(conn, store, "old", 20, seen_days=30)
+        shown = self._cards(conn, store, "new", 2, seen_days=2)
+
+        rows = {row["product_id"] for row in dbm.stale_offers(conn, 8, ("shopify",))}
+        assert shown <= rows and len(rows & hidden) == 6
+
+        conn.executemany("DELETE FROM offers WHERE product_id = ?", [(c,) for c in hidden])
+        more = self._cards(conn, store, "more", 20, seen_days=2)
+        rows = {row["product_id"] for row in dbm.stale_offers(conn, 8, ("shopify",))}
+        assert len(rows) == 8 and rows <= shown | more, "nothing hidden: every check is theirs"
+
+    def test_a_product_nobody_recorded_seeing_counts_as_shown(self, conn):
+        store = dbm.upsert_store(conn, "shop.example", platform="shopify", status="ok")
+        card = _a_card(conn, store, "card", checked=ts(30))
+
+        assert [row["product_id"] for row in dbm.stale_offers(conn, 4, ("shopify",))] == [card]
+
+
 class TestAShopNobodyCouldReadLeavesThePage:
     """Cards stay in the table and come back the moment the shop reads again;
     they are only kept off the page while nobody can vouch for them."""
