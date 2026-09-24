@@ -30,6 +30,14 @@ def _shoe(conn, sizes=("US9", "US10")):
     return product, variants
 
 
+def _in_stock(conn, product, size, price):
+    """A fresh reading of one size, in stock at `price`."""
+    (variant,) = conn.execute(
+        "SELECT id FROM variants WHERE product_id = ? AND size = ?", (product, size)
+    ).fetchone()
+    dbm.record_price(conn, variant, price, None, True, "USD", price, 1.0, ts=ts(0))
+
+
 def _restock(conn, variant) -> list[int]:
     back: list[int] = []
     dbm.record_price(conn, variant, 120.0, None, True, "USD", 120.0, 1.0, ts=ts(0),
@@ -92,11 +100,11 @@ class TestTheShopTakesItDown:
     def test_a_follower_is_told_once_per_disappearance(self, conn):
         product, _ = _shoe(conn)
         dbm.add_favorite(conn, 7, product)
-        dbm.mark_product_missing(conn, product, ts(0))
+        dbm.mark_product_missing(conn, product, ts(2))
 
         [notice] = watch.gone_notices(conn, [_reader(7)], grace_days=14)
         assert notice.kind == "gone" and "Снято с продажи" in notice.text
-        assert "14 дн" in notice.text
+        assert "ближайшие 12 дн" in notice.text, "two of the fourteen days are gone"
 
         watch.mark_told(conn, notice, dbm.utcnow())
         assert watch.gone_notices(conn, [_reader(7)], grace_days=14) == []
@@ -104,28 +112,55 @@ class TestTheShopTakesItDown:
     def test_gone_again_after_coming_back_is_news_again(self, conn):
         product, _ = _shoe(conn)
         dbm.add_favorite(conn, 7, product)
-        dbm.mark_product_missing(conn, product, ts(3))
+        dbm.mark_product_missing(conn, product, ts(4))
         [notice] = watch.gone_notices(conn, [_reader(7)], grace_days=14)
-        watch.mark_told(conn, notice, ts(2))
+        watch.mark_told(conn, notice, ts(3))
 
         conn.execute("UPDATE products SET missing_since = NULL WHERE id = ?", (product,))
-        dbm.mark_product_missing(conn, product, ts(0))
+        dbm.mark_product_missing(conn, product, ts(1.5))
 
         assert len(watch.gone_notices(conn, [_reader(7)], grace_days=14)) == 1
 
     def test_nobody_who_is_not_a_reader_is_written_to(self, conn):
         product, _ = _shoe(conn)
         dbm.add_favorite(conn, 7, product)
-        dbm.mark_product_missing(conn, product, ts(0))
+        dbm.mark_product_missing(conn, product, ts(2))
 
         assert watch.gone_notices(conn, [_reader(9)], grace_days=14) == []
+
+    def test_a_product_missed_by_one_read_is_not_news(self, conn):
+        """Review 24.09: a product a read skipped and the next read lists again
+        cost a follower "снято" and "снова в продаже" for every flicker."""
+        product, _ = _shoe(conn)
+        dbm.add_favorite(conn, 7, product)
+        sent = []
+        for _ in range(3):
+            dbm.mark_product_missing(conn, product, dbm.utcnow())
+            for notice in watch.gone_notices(conn, [_reader(7)], grace_days=14):
+                sent.append(notice.kind)
+                watch.mark_told(conn, notice, dbm.utcnow())
+            conn.execute("UPDATE products SET missing_since = NULL WHERE id = ?", (product,))
+            for notice in watch.returned_notices(conn, [_reader(7)]):
+                sent.append(notice.kind)
+                watch.mark_told(conn, notice, dbm.utcnow())
+
+        assert sent == []
+
+    def test_a_day_later_it_is(self, conn):
+        product, _ = _shoe(conn)
+        dbm.add_favorite(conn, 7, product)
+        dbm.mark_product_missing(conn, product, dbm.utcnow())
+        assert watch.gone_notices(conn, [_reader(7)], grace_days=14) == []
+
+        later = datetime.now(UTC) + timedelta(hours=watch.GONE_NOTICE_AFTER_HOURS, minutes=1)
+        assert len(watch.gone_notices(conn, [_reader(7)], grace_days=14, now=later)) == 1
 
 
 class TestItComesBack:
     def _told_it_went(self, conn, missing_since=None):
         product, _ = _shoe(conn)
         dbm.add_favorite(conn, 7, product)
-        dbm.mark_product_missing(conn, product, missing_since or ts(1))
+        dbm.mark_product_missing(conn, product, missing_since or ts(2))
         [notice] = watch.gone_notices(conn, [_reader(7)], grace_days=14)
         watch.mark_told(conn, notice, dbm.utcnow())
         return product
@@ -135,6 +170,7 @@ class TestItComesBack:
         assert watch.returned_notices(conn, [_reader(7)]) == [], "still gone"
 
         conn.execute("UPDATE products SET missing_since = NULL WHERE id = ?", (product,))
+        _in_stock(conn, product, "US10", 120.0)
         [notice] = watch.returned_notices(conn, [_reader(7)])
 
         assert (notice.user_id, notice.product_id, notice.kind) == (7, product, "back")
@@ -142,12 +178,50 @@ class TestItComesBack:
         assert "https://shop.example/products/air-thing" in notice.text
         assert notice.image_url == "https://img.example/a.jpg"
 
+    def test_back_but_sold_out_is_not_called_on_sale(self, conn):
+        product = self._told_it_went(conn)
+        conn.execute("UPDATE products SET missing_since = NULL WHERE id = ?", (product,))
+
+        [notice] = watch.returned_notices(conn, [_reader(7)])
+
+        assert notice.kind == "back", "still news: it is no longer about to be deleted"
+        assert "Снова в продаже" not in notice.text and "Снова в каталоге" in notice.text
+        assert "$" not in notice.text, "no price for something nobody can buy"
+
+    def test_back_in_another_size_says_theirs_is_still_sold_out(self, conn):
+        """Review 24.09: a reader following US10 was told "снова в продаже · $90"
+        — the price of a US9 — with US10 still sold out."""
+        product, variants = _shoe(conn)
+        dbm.add_favorite(conn, 7, product, variant_id=variants["US10"])
+        dbm.mark_product_missing(conn, product, ts(2))
+        [gone] = watch.gone_notices(conn, [_reader(7)], grace_days=14)
+        watch.mark_told(conn, gone, dbm.utcnow())
+        conn.execute("UPDATE products SET missing_since = NULL WHERE id = ?", (product,))
+        _in_stock(conn, product, "US9", 90.0)
+
+        [notice] = watch.returned_notices(conn, [_reader(7)])
+
+        assert "Снова в продаже" not in notice.text
+        assert "US10" in notice.text and "$90" not in notice.text
+
+    def test_back_in_their_size_names_it_and_its_price(self, conn):
+        product, _ = _shoe(conn)
+        dbm.add_favorite(conn, 7, product)
+        dbm.mark_product_missing(conn, product, ts(2))
+        [gone] = watch.gone_notices(conn, [_reader(7, sizes=("US10",))], grace_days=14)
+        watch.mark_told(conn, gone, dbm.utcnow())
+        conn.execute("UPDATE products SET missing_since = NULL WHERE id = ?", (product,))
+        _in_stock(conn, product, "US9", 90.0)
+        _in_stock(conn, product, "US10", 125.0)
+
+        [notice] = watch.returned_notices(conn, [_reader(7, sizes=("US10",))])
+
+        assert "Снова в продаже" in notice.text and "Размер: US10" in notice.text
+        assert "$125" in notice.text and "$90" not in notice.text
+
     def test_the_price_is_the_cheapest_size_in_stock(self, conn):
         product = self._told_it_went(conn)
-        variants = dict(conn.execute(
-            "SELECT size, id FROM variants WHERE product_id = ?", (product,)
-        ).fetchall())
-        dbm.record_price(conn, variants["US10"], 95.0, None, True, "USD", 95.0, 1.0, ts=ts(0))
+        _in_stock(conn, product, "US10", 95.0)
         conn.execute("UPDATE products SET missing_since = NULL WHERE id = ?", (product,))
 
         [notice] = watch.returned_notices(conn, [_reader(7)])
@@ -160,7 +234,7 @@ class TestItComesBack:
         watch.mark_told(conn, notice, dbm.utcnow())
 
         assert watch.returned_notices(conn, [_reader(7)]) == []
-        dbm.mark_product_missing(conn, product, ts(0))
+        dbm.mark_product_missing(conn, product, ts(1.5))
         assert len(watch.gone_notices(conn, [_reader(7)], grace_days=14)) == 1
 
     def test_nobody_is_told_it_is_back_who_was_not_told_it_went(self, conn):
@@ -179,13 +253,13 @@ class TestItComesBack:
 
 
 class TestTheFortnightLeft:
-    def test_a_fresh_mark_has_the_whole_of_it(self, conn):
+    def test_a_mark_a_day_old_has_the_rest_of_it(self, conn):
         product, _ = _shoe(conn)
         dbm.add_favorite(conn, 7, product)
-        dbm.mark_product_missing(conn, product, ts(0))
+        dbm.mark_product_missing(conn, product, ts(1.2))
 
         [notice] = watch.gone_notices(conn, [_reader(7)], grace_days=14)
-        assert "ближайшие 14 дн" in notice.text
+        assert "ближайшие 13 дн" in notice.text
 
     def test_an_old_mark_has_what_is_left_of_it(self, conn):
         product, _ = _shoe(conn)

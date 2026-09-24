@@ -32,6 +32,13 @@ from .notify import _money
 # every hour. One word a day about the same product is plenty.
 RESTOCK_QUIET_HOURS = 24
 
+# How long a product has to stay unlisted before a follower hears it went.
+# A read can miss a live product — a page shifting under the walk skips one at
+# the boundary — and it is back the next hour: told at once, that is "снято"
+# and "снова в продаже" for nothing, twice for every flicker (review 24.09).
+# The product is kept for a fortnight either way; a day's delay costs nothing.
+GONE_NOTICE_AFTER_HOURS = 24
+
 
 @dataclass(frozen=True)
 class Notice:
@@ -159,6 +166,7 @@ def gone_notices(
     if not readers:
         return []
     now = now or datetime.now(UTC)
+    settled = (now - timedelta(hours=GONE_NOTICE_AFTER_HOURS)).isoformat(timespec="seconds")
     by_user = {reader.user_id: reader for reader in readers}
     rows = conn.execute(
         """
@@ -170,9 +178,11 @@ def gone_notices(
           JOIN stores   s ON s.id = p.store_id
          WHERE f.notify = 1
            AND p.missing_since IS NOT NULL
+           AND p.missing_since <= ?
            AND (f.gone_notified_at IS NULL OR f.gone_notified_at < p.missing_since)
          ORDER BY f.user_id, f.product_id
-        """
+        """,
+        (settled,),
     ).fetchall()
     notices = []
     for row in rows:
@@ -228,7 +238,7 @@ def returned_notices(conn: sqlite3.Connection, readers: list) -> list[Notice]:
     by_user = {reader.user_id: reader for reader in readers}
     rows = conn.execute(
         """
-        SELECT f.user_id, f.product_id,
+        SELECT f.user_id, f.product_id, f.variant_id AS followed,
                p.title, p.brand, p.brand_family, p.url, p.image_url,
                s.domain, s.name AS store_name, s.country
           FROM favorites f
@@ -245,25 +255,51 @@ def returned_notices(conn: sqlite3.Connection, readers: list) -> list[Notice]:
         reader = by_user.get(row["user_id"])
         if reader is None:
             continue
-        lines = ["🔔 <b>Снова в продаже</b>", "", *_name(row)]
-        cheapest = conn.execute(
+        sizes = conn.execute(
             """
-            SELECT pp.price_usd, pp.price_native, pp.currency
+            SELECT v.id, v.size, v.size_norm,
+                   pp.price_usd, pp.price_native, pp.currency, pp.in_stock
               FROM variants v
               JOIN price_points pp ON pp.variant_id = v.id
                    AND pp.ts = (SELECT MAX(ts) FROM price_points WHERE variant_id = v.id)
-             WHERE v.product_id = ? AND pp.in_stock = 1
+             WHERE v.product_id = ?
              ORDER BY pp.price_usd
-             LIMIT 1
             """,
             (row["product_id"],),
-        ).fetchone()
-        if cheapest is not None:
+        ).fetchall()
+        # The sizes this reader waits for: the one starred, or their own, or any.
+        if row["followed"] is not None:
+            theirs = [size for size in sizes if size["id"] == row["followed"]]
+        elif reader.reader.sizes:
+            theirs = [size for size in sizes if (size["size_norm"] or "") in reader.reader.sizes]
+        else:
+            theirs = list(sizes)
+        on_sale = [size for size in theirs if size["in_stock"]]
+        if on_sale:
+            lines = ["🔔 <b>Снова в продаже</b>", "", *_name(row)]
+            labels = [size["size_norm"] or size["size"] for size in on_sale]
+            named = list(dict.fromkeys(label for label in labels if label))
+            if named and (row["followed"] is not None or reader.reader.sizes):
+                lines.append("Размер: " + ", ".join(escape(label) for label in named))
+            cheapest = on_sale[0]
             native = (
                 f" · в магазине {_money(cheapest['price_native'], cheapest['currency'])}"
                 if cheapest["currency"] and cheapest["currency"].upper() != "USD" else ""
             )
             lines.append(f"💰 <b>{_money(cheapest['price_usd'])}</b>{native}")
+        else:
+            # Back in the catalogue, but not in anything they can buy: worth
+            # saying — it is no longer about to be deleted — without calling
+            # it on sale at the price of a size they do not take.
+            lines = ["🔔 <b>Снова в каталоге</b>", "", *_name(row)]
+            waiting = [size["size_norm"] or size["size"] for size in theirs]
+            waiting = list(dict.fromkeys(label for label in waiting if label))
+            if waiting and (row["followed"] is not None or reader.reader.sizes):
+                lines.append(
+                    "Ваш размер пока распродан: " + ", ".join(escape(label) for label in waiting)
+                )
+            else:
+                lines.append("Пока нет в наличии — напишу, когда появится.")
         lines += [
             f"🏪 {_where(row)}",
             "⭐ Магазин снова её показывает — она остаётся в избранном",
