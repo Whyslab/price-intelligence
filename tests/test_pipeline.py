@@ -1795,6 +1795,40 @@ class TestAReadThatLosesMostOfAShop:
         assert stats.held and stats.held[0][0] == "shop.example"
 
 
+@respx.mock
+async def test_a_run_reads_past_an_empty_page_to_products_it_knows(config, shopify_payload):
+    """www.italist.com, 24.09.2026: a pass ended on an empty page after 2,841 of
+    44,342 products. The run tells the walk what the shop was selling, so a
+    gap in the middle is read past instead of held or, worse, believed."""
+    _mock_rates()
+    _mock_telegram()
+    first = numbered_products(shopify_payload, 1, count=240)
+    tail = numbered_products(shopify_payload, 3, count=20)
+    _mock_product_pages({"products": first["products"] + tail["products"]})
+    conn = dbm.connect(config.db_path)
+    known_store(conn)
+    respx.get("https://shop.example/products.json?limit=250").mock(
+        return_value=httpx.Response(200, json=first)
+    )
+    page2 = respx.get("https://shop.example/products.json?limit=250&page=2").mock(
+        return_value=httpx.Response(200, json=tail)
+    )
+    end_of_catalogue(page=3)
+    await pipeline.run(config, conn)
+
+    # The tail is now past a page of products this visitor may not buy.
+    page2.mock(return_value=httpx.Response(200, json={"products": []}))
+    respx.get("https://shop.example/products.json?limit=250&page=3").mock(
+        return_value=httpx.Response(200, json=tail)
+    )
+    end_of_catalogue(page=4)
+    make_due(conn)
+    stats = await pipeline.run(config, conn)
+
+    assert stats.withdrawn == 0 and not stats.held
+    assert stats.products_seen == 260, "the twenty after the gap were read"
+
+
 def _answering(monkeypatch, answer_for):
     """Stand in for a shop's product pages; returns the urls opened, in order."""
     opened: list[str] = []
@@ -1849,7 +1883,20 @@ class TestWhatAWithdrawalIsCheckedAgainst:
             assert len(opened) <= pipeline.WITHDRAWAL_TRIES
             conn.execute("UPDATE products SET missing_since = NULL")
 
-    async def test_the_newest_are_always_among_those_asked(self, conn, monkeypatch):
+    async def test_the_oldest_are_always_among_those_asked(self, conn, monkeypatch):
+        """What a walk that stopped early misses: /products.json lists newest
+        first. 40 old products still for sale and 300 newer ones really gone —
+        the shape schema 16 left in shops like footdistrict.com (review 24.09:
+        the newest-first order withdrew the live ones in 76% of reads)."""
+        store, ids = self._shop(conn, 350)
+        seen = ids[340:]
+        for seed in range(20):
+            monkeypatch.setattr(pipeline, "_sampler", random.Random(seed))
+            _answering(monkeypatch, lambda url: "ok" if self._index(url) < 40 else "gone")
+            marked, held = await pipeline.withdraw_missing(conn, None, store, seen, None)
+            assert marked == 0 and held, f"seed {seed}: live products would have been marked"
+
+    async def test_the_newest_are_asked_too(self, conn, monkeypatch):
         """100 old products really gone and 40 new ones the read missed."""
         store, ids = self._shop(conn, 150)
         seen = ids[:10]

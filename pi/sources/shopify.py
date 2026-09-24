@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections.abc import Collection
 from urllib.parse import urlparse
 
 import httpx
@@ -401,6 +402,7 @@ async def fetch(
     max_pages: int = MAX_PAGES,
     limiter: RateLimiter | NullLimiter | None = None,
     cursor: int = 0,
+    known: Collection[str] | None = None,
 ) -> FetchResult:
     """Read a slice of a Shopify catalogue, paginating with ?page=N.
 
@@ -408,6 +410,10 @@ async def fetch(
     `next_cursor` where to carry on, so a catalogue larger than one pass — or a
     pass that Shopify cut short — is finished by the following run instead of
     being quietly truncated to whatever arrived first.
+
+    `known` is the ids of the products the database holds as on sale here. A
+    pass from the beginning that meets an empty page while some of them are
+    still unlisted asks one page further before calling it the end (see below).
     """
     limiter = limiter or NullLimiter()
     # Waits out a suspected block rather than giving up on the spot. A store
@@ -515,10 +521,19 @@ async def fetch(
             # pass stops without claiming it read everything.
             break
         if not raw:
-            if previous_full and not probed:
-                # Empty after a full page is either the end of a catalogue that
-                # happens to be a multiple of 250 long, or a page whose every
-                # product this visitor may not buy. One more page tells which.
+            unlisted = cursor <= 1 and known is not None and any(
+                product_id not in listed_ids for product_id in known
+            )
+            if (previous_full or unlisted) and not probed:
+                # An empty page is either the end of the catalogue or a page
+                # whose every product this visitor may not buy — 250 in a row
+                # filtered out after the cut. After a full page either is as
+                # likely. After a short one it is usually the end, and asking
+                # every time would cost a request per pass; but when products
+                # the shop was selling have not come up yet, calling it the end
+                # marks them withdrawn. www.italist.com on 24.09.2026: a pass
+                # ended on an empty page after 2,841 of its 44,342 products.
+                # One more page tells which.
                 probed = True
                 page_number += 1
                 if page_number > LAST_PAGE:

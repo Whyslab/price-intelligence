@@ -1004,6 +1004,17 @@ def withdrawal_candidates(
         conn.execute("DROP TABLE IF EXISTS temp.pi_seen")
 
 
+def live_external_ids(conn: sqlite3.Connection, store_id: int) -> set[str]:
+    """The shop's own ids for everything it is held to be selling."""
+    return {
+        row[0]
+        for row in conn.execute(
+            "SELECT external_id FROM products WHERE store_id = ? AND missing_since IS NULL",
+            (store_id,),
+        )
+    }
+
+
 def live_products(conn: sqlite3.Connection, store_id: int) -> int:
     """How many of this shop's products are not marked as withdrawn."""
     return conn.execute(

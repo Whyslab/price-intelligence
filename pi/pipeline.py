@@ -271,18 +271,24 @@ def _drop_hopeless(stores: list[sqlite3.Row]) -> tuple[list[sqlite3.Row], int]:
 
 
 async def collect_store(
-    client: httpx.AsyncClient, store: sqlite3.Row, jsonld_budget: int, limiter: RateLimiter
+    client: httpx.AsyncClient,
+    store: sqlite3.Row,
+    jsonld_budget: int,
+    limiter: RateLimiter,
+    known: set[str] | None = None,
 ) -> FetchResult:
     """Fetch one store with the adapter its platform calls for.
 
     Both adapters read a slice and say where to resume, so a large catalogue is
     covered over successive runs rather than truncated to whatever one pass got.
+    `known` is what the database holds as on sale there, for a Shopify pass
+    that has to decide where the catalogue ends.
     """
     platform = store["platform"]
     if platform == "shopify":
         return await shopify.fetch(
             client, store["domain"], store["currency"],
-            limiter=limiter, cursor=store["sitemap_cursor"],
+            limiter=limiter, cursor=store["sitemap_cursor"], known=known,
         )
     if platform == "jsonld":
         return await jsonld.fetch(
@@ -427,21 +433,25 @@ CHURN_TRIES = 2
 _sampler = random.Random()
 
 
-def _sample_order(rows: list, *, newest_first: bool) -> list:
+def _sample_order(rows: list, *, ends_first: bool) -> list:
     """The order to open withdrawal candidates in (they come ordered by id).
 
-    A read that stopped early misses the end of what it was listing, which is
-    where the newest products are, so for a large withdrawal one of the newest
-    tenth is opened first; the rest follow at random. Not simply the newest:
-    one product always answering the same way would then decide every read.
+    For a large withdrawal, one of the oldest tenth is opened first and one of
+    the newest tenth second; the rest follow at random. /products.json lists
+    newest first — on the pages saved from shop.simon.com and Sneakersnstuff
+    not one neighbouring pair goes the other way — so a read that stopped early
+    misses the oldest products, which are the lowest ids here. The newest end
+    is for a list reordered some other way. Not simply the two ends: one
+    product answering the same way every time would then decide every read.
     """
     order = list(rows)
     _sampler.shuffle(order)
-    if newest_first and order:
-        tail = rows[-max(1, len(rows) // 10):]
-        first = _sampler.choice(tail)
-        order.remove(first)
-        order.insert(0, first)
+    if ends_first and order:
+        tenth = max(1, len(rows) // 10)
+        firsts = [_sampler.choice(rows[:tenth]), _sampler.choice(rows[-tenth:])]
+        for row in reversed(list(dict.fromkeys(firsts))):
+            order.remove(row)
+            order.insert(0, row)
     return order
 
 
@@ -472,7 +482,7 @@ async def withdraw_missing(
     wanted = WITHDRAWAL_SAMPLE if alarm else 1
     tries = WITHDRAWAL_TRIES if alarm else CHURN_TRIES
     answers: list[str] = []
-    for row in _sample_order(candidates, newest_first=alarm)[:tries]:
+    for row in _sample_order(candidates, ends_first=alarm)[:tries]:
         status, _ = await _fetch_one(
             client,
             {"platform": store["platform"], "domain": store["domain"], "url": row["url"]},
@@ -1310,15 +1320,24 @@ async def run(
         async def one(store: sqlite3.Row):
             pool = pools.get(store["platform"], pools["jsonld"])
             async with pool:
+                # Only for a pass that starts at the beginning: nothing else can
+                # withdraw anything, so nothing else has to know.
+                known = (
+                    dbm.live_external_ids(conn, store["id"])
+                    if store["platform"] == "shopify" and (store["sitemap_cursor"] or 0) <= 1
+                    else None
+                )
                 try:
                     # A handful of shops answer only a browser's TLS fingerprint.
                     # They get their own client; everyone else shares the pooled one.
                     if store["impersonate"] and impersonate.available():
                         async with impersonate.ImpersonatingClient(timeout=30.0) as browser:
                             return store, await collect_store(
-                                browser, store, jsonld_budget, limiter
+                                browser, store, jsonld_budget, limiter, known
                             )
-                    return store, await collect_store(client, store, jsonld_budget, limiter)
+                    return store, await collect_store(
+                        client, store, jsonld_budget, limiter, known
+                    )
                 except Exception as exc:
                     # One shop's surprise is that shop's failure, not the hour's.
                     # Raised out of here it ended the whole run and threw away

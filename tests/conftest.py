@@ -16,14 +16,18 @@ FIXTURES = Path(__file__).parent / "fixtures"
 
 
 def end_of_catalogue(base: str = "https://shop.example", page: int = 2):
-    """The empty page a Shopify catalogue ends with.
+    """The empty pages a Shopify catalogue ends with.
 
     A short page is not the end — Shopify filters a page after cutting it, so
     one comes back short in the middle of a catalogue — and the walk only stops
-    when a page lists nothing. A test standing in a whole shop therefore ends
-    it the way a real shop does. A test that mocks this page itself afterwards
-    replaces it: respx keeps one route per pattern.
+    when a page lists nothing. When products the shop was selling have not come
+    up by then, it asks one page further, so the page after is empty too, as it
+    is past the end of any real catalogue. A test that mocks either page itself
+    afterwards replaces it: respx keeps one route per pattern.
     """
+    respx.get(f"{base}/products.json?limit=250&page={page + 1}").mock(
+        return_value=httpx.Response(200, json={"products": []})
+    )
     return respx.get(f"{base}/products.json?limit=250&page={page}").mock(
         return_value=httpx.Response(200, json={"products": []})
     )

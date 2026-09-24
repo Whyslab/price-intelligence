@@ -136,6 +136,71 @@ async def test_an_empty_page_after_a_full_one_is_asked_about_again(shopify_paylo
 
 
 @respx.mock
+async def test_an_empty_page_is_asked_past_while_products_it_sells_are_unlisted(
+    shopify_payload
+):
+    """Review 24.09, then www.italist.com the same day: a short page, an empty
+    one, and the catalogue going on after it. Asking past every empty page
+    would cost a request per pass; asking when products the shop was selling
+    have not come up yet costs one only where the pass would withdraw them."""
+    base = "https://shop.example"
+    first = numbered_products(shopify_payload, 1, count=240)
+    tail = numbered_products(shopify_payload, 3, count=20)
+    respx.get(f"{base}/products.json?limit=250").mock(
+        return_value=httpx.Response(200, json=first)
+    )
+    end_of_catalogue(base, page=2)  # a page this visitor may buy nothing from
+    page3 = respx.get(f"{base}/products.json?limit=250&page=3").mock(
+        return_value=httpx.Response(200, json=tail)
+    )
+    end_of_catalogue(base, page=4)
+    known = {str(product["id"]) for product in first["products"] + tail["products"]}
+
+    async with httpx.AsyncClient() as client:
+        result = await shopify.fetch(client, "shop.example", currency="USD", known=known)
+
+    assert page3.called and len(result.products) == 260
+    assert result.enumerated
+
+
+@respx.mock
+async def test_nothing_unlisted_means_no_extra_page(shopify_payload):
+    base = "https://shop.example"
+    first = numbered_products(shopify_payload, 1, count=240)
+    respx.get(f"{base}/products.json?limit=250").mock(
+        return_value=httpx.Response(200, json=first)
+    )
+    end_of_catalogue(base, page=2)
+    page3 = respx.get(f"{base}/products.json?limit=250&page=3")
+    known = {str(product["id"]) for product in first["products"]}
+
+    async with httpx.AsyncClient() as client:
+        result = await shopify.fetch(client, "shop.example", currency="USD", known=known)
+
+    assert not page3.called, "the whole shop came up: one empty page is the end"
+    assert result.enumerated and len(result.products) == 240
+
+
+@respx.mock
+async def test_a_pass_resumed_part_way_does_not_ask_past_the_end(shopify_payload):
+    """Only a pass from the beginning can withdraw anything; a resumed one reads
+    a tail and must not spend a request on the page past it."""
+    base = "https://shop.example"
+    respx.get(f"{base}/products.json?limit=250&page=3").mock(
+        return_value=httpx.Response(200, json=numbered_products(shopify_payload, 3, count=40))
+    )
+    end_of_catalogue(base, page=4)
+    page5 = respx.get(f"{base}/products.json?limit=250&page=5")
+
+    async with httpx.AsyncClient() as client:
+        result = await shopify.fetch(
+            client, "shop.example", currency="USD", cursor=3, known={"not-listed"}
+        )
+
+    assert not page5.called and not result.enumerated
+
+
+@respx.mock
 async def test_an_empty_page_after_a_short_one_is_the_end(shopify_payload):
     base = "https://shop.example"
     respx.get(f"{base}/products.json?limit=250").mock(
