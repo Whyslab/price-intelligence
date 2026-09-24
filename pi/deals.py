@@ -237,6 +237,12 @@ def evaluate(
     tag_native = (
         compare_native if compare_native and not rule_priced and not inflated_tag else None
     )
+    if unrelated:
+        # With the market judged a different thing there is nothing left to
+        # hold the shop's own tag against: the inflated-tag test needs the
+        # recommended price just dropped. Only the shop's history may speak
+        # (review 24.09: $55.98 "was $300" made −81%, score 100).
+        tag_native = None
 
     floor = prior_floor(history, filters.reference_window_days)
     if floor is not None and floor.covered_days < MIN_HISTORY_DAYS:

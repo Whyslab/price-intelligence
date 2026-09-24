@@ -868,6 +868,20 @@ class TestAShopThatAskedNotToBeVisited:
 
         assert dbm.get_stores(conn) == []
 
+    def test_its_cards_are_not_opened_one_by_one_either(self, conn, monkeypatch):
+        """Review 24.09: the checks never read the list, so an excluded shop's
+        cards kept having their product pages opened."""
+        keep = dbm.upsert_store(conn, "keep.example", platform="shopify", status="ok")
+        gone = dbm.upsert_store(conn, "www.gone.example", platform="shopify", status="ok")
+        kept = _a_card(conn, keep, "kept", checked=ts(3))
+        dropped = _a_card(conn, gone, "dropped", checked=ts(5))
+        monkeypatch.setattr(dbm, "load_excluded", lambda: frozenset({"gone.example"}))
+
+        assert [row["product_id"] for row in dbm.stale_offers(conn, 10, ("shopify",))] == [kept]
+        assert [
+            row["product_id"] for row in dbm.offers_to_confirm(conn, [kept, dropped], ("shopify",))
+        ] == [kept]
+
     def test_an_empty_list_changes_nothing(self, conn, monkeypatch):
         dbm.upsert_store(conn, "keep.example", platform="shopify")
         monkeypatch.setattr(dbm, "load_excluded", lambda: frozenset())

@@ -1144,7 +1144,7 @@ def offers_to_confirm(
         return []
     pids = ",".join("?" * len(product_ids))
     marks = ",".join("?" * len(platforms))
-    return conn.execute(
+    return _not_excluded(conn.execute(
         f"""
         SELECT p.id AS product_id, p.url, p.external_id, p.store_id,
                s.domain, s.platform, s.currency,
@@ -1156,7 +1156,20 @@ def offers_to_confirm(
          GROUP BY p.id
         """,
         [*product_ids, *platforms],
-    ).fetchall()
+    ).fetchall())
+
+
+def _not_excluded(rows: list[sqlite3.Row]) -> list[sqlite3.Row]:
+    """Rows whose shop is not in data/excluded.txt.
+
+    get_stores is the door every read goes through, but a card is opened one
+    by one without it: a shop added to the list kept its cards, and the checks
+    kept opening its product pages (review 24.09).
+    """
+    excluded = load_excluded()
+    if not excluded:
+        return rows
+    return [row for row in rows if same_host(row["domain"]) not in excluded]
 
 
 # The share of one-by-one checks kept for cards the page hides because nobody
@@ -1215,7 +1228,7 @@ def stale_offers(conn: sqlite3.Connection, limit: int, platforms: Sequence[str])
             [*platforms, cutoff, limit],
         ).fetchall()
 
-    shown, hidden = oldest(hidden=False), oldest(hidden=True)
+    shown, hidden = _not_excluded(oldest(hidden=False)), _not_excluded(oldest(hidden=True))
     # A quarter for the hidden, unless there are fewer of either to check.
     kept_back = min(len(hidden), max(1, int(limit * HIDDEN_CHECK_SHARE)))
     first = shown[: limit - kept_back]

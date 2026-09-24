@@ -276,6 +276,13 @@ class TestAnInflatedReferencePrice:
         assert deal.market_shops == 0 and deal.market_median_usd is None
         assert deal.msrp_usd is None
 
+    def test_nor_does_the_shops_own_tag_speak_then(self, filters):
+        """Dropping the msrp also switched off the inflated-tag test, which
+        compares the tag with it — so the shop's "was $300" became the reference."""
+        history = make_history([(60.0, 300.0, 1), (55.98, 300.0, 0)])
+        market = Market(median_usd=1099.88, low_usd=700.0, shops=5, msrp_usd=180.0, msrp_shops=3)
+        assert deals.evaluate(1, 1, 55.98, 300.0, True, history, filters, market=market) is None
+
     def test_a_deep_but_believable_cut_against_the_market_still_counts(self, filters):
         history = make_history([(80.0, None, 0)])
         market = Market(median_usd=300.0, low_usd=260.0, shops=5)
