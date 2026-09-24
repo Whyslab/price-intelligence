@@ -479,10 +479,7 @@ async def fetch(
             if not products:
                 return FetchResult(
                     domain=domain, currency=currency,
-                    error="products.json unreachable",
-                    # A resumed pass that cannot read even its first page starts
-                    # over next time rather than asking the same page for ever.
-                    next_cursor=0 if cursor > 1 else cursor,
+                    error="products.json unreachable", next_cursor=cursor,
                 )
             break
         try:

@@ -332,10 +332,11 @@ class TestSizesOfTheSameFamily:
     sizes about another kind of thing, and its EU42 coming back was told."""
 
     @staticmethod
-    def _shoe_in(conn, sizes):
+    def _shoe_in(conn, sizes, kind="shoes"):
         store = dbm.upsert_store(conn, "shop.example", platform="shopify", currency="USD",
                                  name="Shop", last_ok=ts(0))
         product = dbm.upsert_product(conn, store, "s1", "Runner", "/products/runner")
+        conn.execute("UPDATE products SET kind = ? WHERE id = ?", (kind, product))
         variants = {}
         for size in sizes:
             variant = dbm.upsert_variant(conn, product, size, size=size, size_norm=size)
@@ -361,8 +362,18 @@ class TestSizesOfTheSameFamily:
             "shoe sizes speak about a shoe; no guessing EU44 is US9"
         )
 
+    def test_a_waist_size_is_not_a_shoe_size(self, conn):
+        """Review 24.09 (sixth pass): a bare 32 is normalised to US32, so shoe
+        sizes on a reader silenced trousers the way they had silenced hoodies."""
+        product, variants = self._shoe_in(conn, ("US30", "US32", "US34"), kind="clothing")
+        dbm.add_favorite(conn, 7, product)
+
+        back = _restock(conn, variants["US32"])
+
+        assert len(watch.restock_notices(conn, back, [_reader(7, sizes=("EU44",))])) == 1
+
     def test_letter_sizes_on_a_reader_speak_about_a_hoodie(self, conn):
-        product, variants = self._shoe_in(conn, ("S", "M", "L"))
+        product, variants = self._shoe_in(conn, ("S", "M", "L"), kind="clothing")
         dbm.add_favorite(conn, 7, product)
 
         back = _restock(conn, variants["S"])

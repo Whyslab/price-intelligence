@@ -238,14 +238,16 @@ async def test_a_page_past_the_end_that_fails_claims_nothing_and_starts_over(
 
 
 @respx.mock
-async def test_a_resumed_pass_whose_first_page_fails_starts_over(shopify_payload):
+async def test_a_resumed_pass_whose_first_page_fails_keeps_its_place(shopify_payload):
+    """Whether a cursor is stuck is the run's to judge (pipeline._stuck_cursor):
+    one failure is usually a deep page being slow."""
     base = "https://shop.example"
     respx.get(f"{base}/products.json?limit=250&page=3").mock(return_value=httpx.Response(404))
 
     async with httpx.AsyncClient() as client:
         result = await shopify.fetch(client, "shop.example", currency="USD", cursor=3)
 
-    assert result.error == "products.json unreachable" and result.next_cursor == 0
+    assert result.error == "products.json unreachable" and result.next_cursor == 3
 
 
 @respx.mock

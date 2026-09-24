@@ -110,6 +110,24 @@ def _hours(since: str | None, now: datetime) -> float:
     return (now - datetime.fromisoformat(since)).total_seconds() / 3600
 
 
+# How long a resumed Shopify pass may keep failing before its cursor is given
+# up. A deep page timing out now and then — www.dtlr.com's page 61, three runs
+# running on 18.09 — is worth resuming at; starting over would re-read sixty
+# pages and never reach the rest. A cursor that has produced no successful read
+# for two days is pointing somewhere that does not answer: www.natterjacks.com
+# sat at page 3, past the end of its catalogue, and failed every run from 15.09.
+STUCK_CURSOR_HOURS = 48
+
+
+def _stuck_cursor(store: sqlite3.Row) -> bool:
+    """Whether a failing shop's cursor should go back to the beginning."""
+    return (
+        store["platform"] == "shopify"
+        and (store["sitemap_cursor"] or 0) > 1
+        and _hours(store["last_ok"], datetime.now(UTC)) > STUCK_CURSOR_HOURS
+    )
+
+
 def _retry_interval(failing_hours: float) -> float:
     """How long a failing shop waits before it is tried again, in hours.
 
@@ -469,7 +487,8 @@ def _sample_order(rows: list, *, tail_first: bool) -> list:
         )
         recent = [row for row in rows if (row["last_seen"] or "") >= cutoff] or list(rows)
         recent.sort(key=_listing_age)
-        first = _sampler.choice(recent[: max(1, len(recent) // 10)])
+        window = max(min(3, len(recent)), len(recent) // 10)
+        first = _sampler.choice(recent[:window])
         order.remove(first)
         order.insert(0, first)
     return order
@@ -1400,10 +1419,8 @@ async def run(
                         "status": "error", "last_error": result.error,
                         "last_checked": dbm.utcnow(),
                     }
-                    if store["platform"] == "shopify":
-                        # Where the failed pass says to carry on: a resumed pass
-                        # that could not read its first page starts over.
-                        failed["sitemap_cursor"] = result.next_cursor
+                    if _stuck_cursor(store):
+                        failed["sitemap_cursor"] = 0
                     dbm.upsert_store(conn, store["domain"], **failed)
                     log.warning("%-38s FAILED: %s", store["domain"], result.error)
                     continue

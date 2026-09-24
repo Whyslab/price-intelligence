@@ -1832,14 +1832,14 @@ async def test_a_run_reads_past_an_empty_page_to_products_it_knows(config, shopi
 @respx.mock
 async def test_a_shop_stuck_past_its_end_is_read_from_the_beginning_again(config):
     """www.natterjacks.com: cursor 3, page 3 answering 404, FAILED every run
-    from 15.09 to 24.09. The failed pass now puts the cursor back."""
+    from 15.09 to 24.09. A cursor with no successful read for two days goes back."""
     _mock_rates()
     _mock_telegram()
     respx.get("https://shop.example/products.json?limit=250&page=3").mock(
         return_value=httpx.Response(404)
     )
     conn = dbm.connect(config.db_path)
-    known_store(conn, sitemap_cursor=3)
+    known_store(conn, sitemap_cursor=3, last_ok=ts(3))
 
     await pipeline.run(config, conn)
 
@@ -1847,6 +1847,27 @@ async def test_a_shop_stuck_past_its_end_is_read_from_the_beginning_again(config
         "SELECT status, sitemap_cursor FROM stores WHERE domain = 'shop.example'"
     ).fetchone()
     assert status == "error" and cursor == 0
+
+
+@respx.mock
+async def test_a_deep_page_timing_out_once_keeps_its_place(config):
+    """Review 24.09: www.dtlr.com's page 61 timed out three runs running on
+    18.09. Starting over would re-read sixty pages and never reach the rest."""
+    _mock_rates()
+    _mock_telegram()
+    respx.get("https://shop.example/products.json?limit=250&page=61").mock(
+        side_effect=httpx.ReadTimeout("slow")
+    )
+    conn = dbm.connect(config.db_path)
+    known_store(conn, sitemap_cursor=61, last_ok=ts(0.1))
+    conn.execute("UPDATE stores SET last_ok = ? WHERE domain = 'shop.example'", (ts(0.1),))
+
+    await pipeline.run(config, conn, domains=("shop.example",))
+
+    status, cursor = conn.execute(
+        "SELECT status, sitemap_cursor FROM stores WHERE domain = 'shop.example'"
+    ).fetchone()
+    assert status == "error" and cursor == 61
 
 
 @respx.mock

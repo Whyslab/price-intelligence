@@ -85,12 +85,17 @@ _SHOE_SIZE = re.compile(r"^(EU|US|UK)\d")
 _LETTER_SIZE = re.compile(r"^\d?X*[SML]$")
 
 
-def _size_family(size: str) -> str | None:
-    """Shoe sizes (EU44, US10.5), letter sizes (S, XL, 2XL), or neither."""
-    if _SHOE_SIZE.match(size):
-        return "shoe"
+def _size_family(size: str, kind: str | None = "shoes") -> str | None:
+    """Shoe sizes (EU44, US10.5), letter sizes (S, XL, 2XL), or neither.
+
+    A bare number is normalised to EU between 35 and 50 and to US otherwise,
+    so a trouser's waist 32 arrives as US32: on anything not known to be a
+    shoe, only an EU size is taken for a shoe size.
+    """
     if _LETTER_SIZE.match(size):
         return "letter"
+    if _SHOE_SIZE.match(size) and (kind == "shoes" or size.startswith("EU")):
+        return "shoe"
     return None
 
 
@@ -116,8 +121,11 @@ def _sizes_speak(conn: sqlite3.Connection, product_id: int, sizes: frozenset[str
     }
     if listed & sizes:
         return True
+    kind = conn.execute("SELECT kind FROM products WHERE id = ?", (product_id,)).fetchone()
+    kind = kind[0] if kind else None
+    # A reader's own sizes are what they wear: US10.5 on a reader is a shoe.
     families = {_size_family(size) for size in sizes} - {None}
-    return bool(families & ({_size_family(size) for size in listed} - {None}))
+    return bool(families & ({_size_family(size, kind) for size in listed} - {None}))
 
 
 def restock_notices(
