@@ -1657,9 +1657,15 @@ async def confirm_before_announcing(
         return queues, report
 
     rows = {row["product_id"]: row for row in dbm.offers_to_confirm(conn, wanted, VERIFIABLE)}
+    excluded = set(dbm.excluded_store_ids(conn))
     verdict: dict[int, bool] = {}
     for product_id in wanted:
         row = rows.get(product_id)
+        if row is not None and row["store_id"] in excluded:
+            # A shop that asked not to be visited is not visited to confirm a
+            # find either, and a find nobody could confirm is not sent.
+            verdict[product_id] = False
+            continue
         if row is None:
             # Not a platform that can be asked about one product — ASOS reads
             # sale sections and has no per-product page. Nothing to confirm

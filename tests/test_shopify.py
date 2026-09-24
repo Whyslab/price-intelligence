@@ -164,6 +164,54 @@ async def test_an_empty_page_is_asked_past_while_products_it_sells_are_unlisted(
 
 
 @respx.mock
+async def test_a_gap_of_two_empty_pages_is_read_past_too(shopify_payload):
+    """Review 24.09: 500 products in a row this visitor may not buy make two
+    empty pages, and one probe stopped at the second."""
+    base = "https://shop.example"
+    first = numbered_products(shopify_payload, 1, count=240)
+    tail = numbered_products(shopify_payload, 4, count=20)
+    respx.get(f"{base}/products.json?limit=250").mock(
+        return_value=httpx.Response(200, json=first)
+    )
+    for empty in (2, 3):
+        respx.get(f"{base}/products.json?limit=250&page={empty}").mock(
+            return_value=httpx.Response(200, json={"products": []})
+        )
+    respx.get(f"{base}/products.json?limit=250&page=4").mock(
+        return_value=httpx.Response(200, json=tail)
+    )
+    end_of_catalogue(base, page=5)
+    known = {str(product["id"]) for product in first["products"] + tail["products"]}
+
+    async with httpx.AsyncClient() as client:
+        result = await shopify.fetch(client, "shop.example", currency="USD", known=known)
+
+    assert len(result.products) == 260 and result.enumerated
+
+
+@respx.mock
+async def test_the_look_past_empty_pages_is_bounded(shopify_payload):
+    """Products really gone are unlisted too; the pass asks GAP_PAGES past the
+    empty page for them and stops, rather than walking to page 100."""
+    base = "https://shop.example"
+    first = numbered_products(shopify_payload, 1, count=240)
+    respx.get(f"{base}/products.json?limit=250").mock(
+        return_value=httpx.Response(200, json=first)
+    )
+    end_of_catalogue(base, page=2)
+    beyond = respx.get(
+        f"{base}/products.json?limit=250&page={2 + shopify.GAP_PAGES + 1}"
+    )
+
+    async with httpx.AsyncClient() as client:
+        result = await shopify.fetch(
+            client, "shop.example", currency="USD", known={"gone-for-real"}
+        )
+
+    assert not beyond.called and result.enumerated and len(result.products) == 240
+
+
+@respx.mock
 async def test_nothing_unlisted_means_no_extra_page(shopify_payload):
     base = "https://shop.example"
     first = numbered_products(shopify_payload, 1, count=240)

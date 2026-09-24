@@ -1144,7 +1144,7 @@ def offers_to_confirm(
         return []
     pids = ",".join("?" * len(product_ids))
     marks = ",".join("?" * len(platforms))
-    return _not_excluded(conn.execute(
+    return conn.execute(
         f"""
         SELECT p.id AS product_id, p.url, p.external_id, p.store_id,
                s.domain, s.platform, s.currency,
@@ -1156,11 +1156,11 @@ def offers_to_confirm(
          GROUP BY p.id
         """,
         [*product_ids, *platforms],
-    ).fetchall())
+    ).fetchall()
 
 
-def _not_excluded(rows: list[sqlite3.Row]) -> list[sqlite3.Row]:
-    """Rows whose shop is not in data/excluded.txt.
+def excluded_store_ids(conn: sqlite3.Connection) -> list[int]:
+    """The shops in data/excluded.txt, by id.
 
     get_stores is the door every read goes through, but a card is opened one
     by one without it: a shop added to the list kept its cards, and the checks
@@ -1168,8 +1168,12 @@ def _not_excluded(rows: list[sqlite3.Row]) -> list[sqlite3.Row]:
     """
     excluded = load_excluded()
     if not excluded:
-        return rows
-    return [row for row in rows if same_host(row["domain"]) not in excluded]
+        return []
+    return [
+        row[0]
+        for row in conn.execute("SELECT id, domain FROM stores")
+        if same_host(row[1]) in excluded
+    ]
 
 
 # The share of one-by-one checks kept for cards the page hides because nobody
@@ -1206,6 +1210,11 @@ def stale_offers(conn: sqlite3.Connection, limit: int, platforms: Sequence[str])
     cutoff = (datetime.now(UTC) - timedelta(days=STALE_PRODUCT_DAYS)).isoformat(
         timespec="seconds"
     )
+    # Left out in the query, before the limit: an excluded shop is never read
+    # again, so its cards only grow older, and filtered after the LIMIT they
+    # would fill it and leave nothing to check at all.
+    skip = excluded_store_ids(conn)
+    not_skipped = f" AND s.id NOT IN ({','.join('?' * len(skip))})" if skip else ""
 
     def oldest(hidden: bool) -> list[sqlite3.Row]:
         seen = "p.last_seen < ?" if hidden else "(p.last_seen IS NULL OR p.last_seen >= ?)"
@@ -1220,15 +1229,15 @@ def stale_offers(conn: sqlite3.Connection, limit: int, platforms: Sequence[str])
               JOIN products p ON p.id = o.product_id
               JOIN stores   s ON s.id = p.store_id
              WHERE p.missing_since IS NULL AND s.platform IN ({marks})
-               AND s.status = 'ok' AND {seen}
+               AND s.status = 'ok' AND {seen}{not_skipped}
              GROUP BY p.id
              ORDER BY due_at ASC, score DESC
              LIMIT ?
             """,
-            [*platforms, cutoff, limit],
+            [*platforms, cutoff, *skip, limit],
         ).fetchall()
 
-    shown, hidden = _not_excluded(oldest(hidden=False)), _not_excluded(oldest(hidden=True))
+    shown, hidden = oldest(hidden=False), oldest(hidden=True)
     # A quarter for the hidden, unless there are fewer of either to check.
     kept_back = min(len(hidden), max(1, int(limit * HIDDEN_CHECK_SHARE)))
     first = shown[: limit - kept_back]

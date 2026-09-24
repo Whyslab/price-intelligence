@@ -11,6 +11,7 @@ import respx
 
 from pi import db as dbm
 from pi.config import Filters
+from pi.sources import shopify
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -21,13 +22,15 @@ def end_of_catalogue(base: str = "https://shop.example", page: int = 2):
     A short page is not the end — Shopify filters a page after cutting it, so
     one comes back short in the middle of a catalogue — and the walk only stops
     when a page lists nothing. When products the shop was selling have not come
-    up by then, it asks one page further, so the page after is empty too, as it
-    is past the end of any real catalogue. A test that mocks either page itself
-    afterwards replaces it: respx keeps one route per pattern.
+    up by then, it asks up to shopify.GAP_PAGES further, so those are empty
+    too, as every page past the end of a real catalogue is. A test that mocks
+    one of these pages itself afterwards replaces it: respx keeps one route per
+    pattern.
     """
-    respx.get(f"{base}/products.json?limit=250&page={page + 1}").mock(
-        return_value=httpx.Response(200, json={"products": []})
-    )
+    for later in range(page + shopify.GAP_PAGES, page, -1):
+        respx.get(f"{base}/products.json?limit=250&page={later}").mock(
+            return_value=httpx.Response(200, json={"products": []})
+        )
     return respx.get(f"{base}/products.json?limit=250&page={page}").mock(
         return_value=httpx.Response(200, json={"products": []})
     )

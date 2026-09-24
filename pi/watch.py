@@ -34,10 +34,12 @@ RESTOCK_QUIET_HOURS = 24
 
 # How long a product has to stay unlisted before a follower hears it went.
 # A read can miss a live product — a page shifting under the walk skips one at
-# the boundary — and it is back the next hour: told at once, that is "снято"
-# and "снова в продаже" for nothing, twice for every flicker (review 24.09).
-# The product is kept for a fortnight either way; a day's delay costs nothing.
-GONE_NOTICE_AFTER_HOURS = 24
+# the boundary — and it is back at the next read: told at once, that is
+# "снято" and "снова в продаже" for nothing, twice for every flicker (review
+# 24.09). Two days rather than one because a quiet shop is read about once a
+# day, and a read that slips a little past its day must not decide it. The
+# product is kept for a fortnight either way.
+GONE_NOTICE_AFTER_HOURS = 48
 
 
 @dataclass(frozen=True)
@@ -76,6 +78,24 @@ def _restock_text(first: sqlite3.Row, sizes: list[str]) -> str:
     if link:
         lines += ["", f"🔗 {escape(link)}"]
     return "\n".join(lines)
+
+
+def _sizes_speak(conn: sqlite3.Connection, product_id: int, sizes: frozenset[str]) -> bool:
+    """Whether a reader's sizes say anything about this product at all.
+
+    Somebody with shoe sizes following a hoodie has none of its sizes, and
+    read literally, nothing about it would ever be in their size: its S back
+    in stock was never told, and it coming back on sale was "нет в наличии"
+    while S and M were there (review 24.09). Sizes that match none of a
+    product's are sizes about something else.
+    """
+    if not sizes:
+        return False
+    marks = ",".join("?" * len(sizes))
+    return conn.execute(
+        f"SELECT 1 FROM variants WHERE product_id = ? AND size_norm IN ({marks}) LIMIT 1",
+        (product_id, *sorted(sizes)),
+    ).fetchone() is not None
 
 
 def restock_notices(
@@ -124,18 +144,23 @@ def restock_notices(
         conn.execute("DROP TABLE IF EXISTS temp.pi_restocked")
 
     wanted: dict[tuple[int, int], list[sqlite3.Row]] = {}
+    speaks: dict[tuple[int, int], bool] = {}
     for row in rows:
         reader = by_user.get(row["user_id"])
         if reader is None or not row["in_stock"]:
             continue
         if row["restock_notified_at"] and row["restock_notified_at"] > quiet_since:
             continue
+        key = (row["user_id"], row["product_id"])
         if row["followed"] is not None:
             if row["variant_id"] != row["followed"]:
                 continue
-        elif reader.reader.sizes and (row["size_norm"] or "") not in reader.reader.sizes:
-            continue
-        wanted.setdefault((row["user_id"], row["product_id"]), []).append(row)
+        else:
+            if key not in speaks:
+                speaks[key] = _sizes_speak(conn, row["product_id"], reader.reader.sizes)
+            if speaks[key] and (row["size_norm"] or "") not in reader.reader.sizes:
+                continue
+        wanted.setdefault(key, []).append(row)
 
     notices = []
     for (user_id, product_id), found in wanted.items():
@@ -268,9 +293,10 @@ def returned_notices(conn: sqlite3.Connection, readers: list) -> list[Notice]:
             (row["product_id"],),
         ).fetchall()
         # The sizes this reader waits for: the one starred, or their own, or any.
+        own = _sizes_speak(conn, row["product_id"], reader.reader.sizes)
         if row["followed"] is not None:
             theirs = [size for size in sizes if size["id"] == row["followed"]]
-        elif reader.reader.sizes:
+        elif own:
             theirs = [size for size in sizes if (size["size_norm"] or "") in reader.reader.sizes]
         else:
             theirs = list(sizes)
@@ -279,7 +305,7 @@ def returned_notices(conn: sqlite3.Connection, readers: list) -> list[Notice]:
             lines = ["🔔 <b>Снова в продаже</b>", "", *_name(row)]
             labels = [size["size_norm"] or size["size"] for size in on_sale]
             named = list(dict.fromkeys(label for label in labels if label))
-            if named and (row["followed"] is not None or reader.reader.sizes):
+            if named and (row["followed"] is not None or own):
                 lines.append("Размер: " + ", ".join(escape(label) for label in named))
             cheapest = on_sale[0]
             native = (
@@ -294,7 +320,7 @@ def returned_notices(conn: sqlite3.Connection, readers: list) -> list[Notice]:
             lines = ["🔔 <b>Снова в каталоге</b>", "", *_name(row)]
             waiting = [size["size_norm"] or size["size"] for size in theirs]
             waiting = list(dict.fromkeys(label for label in waiting if label))
-            if waiting and (row["followed"] is not None or reader.reader.sizes):
+            if waiting and (row["followed"] is not None or own):
                 lines.append(
                     "Ваш размер пока распродан: " + ", ".join(escape(label) for label in waiting)
                 )

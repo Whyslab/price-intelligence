@@ -533,3 +533,40 @@ class TestTheFeedIsWhatIsSold:
         readers = personal.subscribers(conn, OWNER_CHAT, Filters(), subscription=True)
 
         assert [r.chat_id for r in readers] == [OWNER_CHAT]
+
+
+class TestAFindFromAShopThatAskedNotToBeVisited:
+    async def test_is_not_confirmed_by_visiting_nor_sent_unconfirmed(self, conn, monkeypatch):
+        """Review 24.09: left out of the rows to confirm, its find read as "a
+        platform nobody can ask" and went out as it stood."""
+        product = a_product(conn)
+        conn.execute(
+            "UPDATE stores SET status = 'ok' WHERE domain = 'shop.example'"
+        )
+        (variant,) = conn.execute(
+            "SELECT id FROM variants WHERE product_id = ?", (product,)
+        ).fetchone()
+        conn.execute(
+            """
+            INSERT INTO offers (variant_id, product_id, found_at, checked_at, price_usd,
+                                reference_usd, reference_source, discount_pct, saving_usd,
+                                score, all_time_low)
+            VALUES (?, ?, ?, ?, 100, 200, 'market', 50, 100, 80, 0)
+            """,
+            (variant, product, dbm.utcnow(), dbm.utcnow()),
+        )
+        monkeypatch.setattr(dbm, "load_excluded", lambda: frozenset({"shop.example"}))
+
+        async def must_not_visit(*args):
+            raise AssertionError("an excluded shop was visited")
+
+        monkeypatch.setattr(pipeline, "_fetch_one", must_not_visit)
+        reader = personal.Subscriber(
+            user_id=7, chat_id="7", reader=personal.Reader(), label="r"
+        )
+        queues = [(reader, [(a_deal(product_id=product), {"product_id": product})])]
+
+        kept, report = await pipeline.confirm_before_announcing(conn, None, {}, None, queues)
+
+        assert kept == [], "nothing left to send"
+        assert report["dropped"] == 1

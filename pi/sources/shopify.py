@@ -394,6 +394,11 @@ async def fetch_product(
 SHOPIFY_PAGE_WINDOW = 25_000
 LAST_PAGE = SHOPIFY_PAGE_WINDOW // PAGE_SIZE
 
+# How many empty pages in a row a pass from the beginning looks past while
+# products the shop was selling have not come up yet. A gap is a run of 250
+# products this visitor may not buy; two such pages in a row are 500.
+GAP_PAGES = 2
+
 
 async def fetch(
     client: httpx.AsyncClient,
@@ -435,7 +440,8 @@ async def fetch(
     # Ids as the pages listed them, before parsing drops the unpriced: a page
     # of products that all fail to parse is still a page of the catalogue.
     listed_ids: set[str] = set()
-    followed_link = previous_full = probed = False
+    followed_link = previous_full = False
+    empties = 0  # empty pages in a row
     page_number = max(1, cursor)
     # Shopify refuses `page * limit` beyond 25,000 — the 101st page of 250
     # answers HTTP 400 "Page * Limit exceeds the 25000 limit" — and a cursor
@@ -521,20 +527,21 @@ async def fetch(
             # pass stops without claiming it read everything.
             break
         if not raw:
+            empties += 1
             unlisted = cursor <= 1 and known is not None and any(
                 product_id not in listed_ids for product_id in known
             )
-            if (previous_full or unlisted) and not probed:
-                # An empty page is either the end of the catalogue or a page
-                # whose every product this visitor may not buy — 250 in a row
-                # filtered out after the cut. After a full page either is as
-                # likely. After a short one it is usually the end, and asking
-                # every time would cost a request per pass; but when products
-                # the shop was selling have not come up yet, calling it the end
-                # marks them withdrawn. www.italist.com on 24.09.2026: a pass
-                # ended on an empty page after 2,841 of its 44,342 products.
-                # One more page tells which.
-                probed = True
+            # An empty page is either the end of the catalogue or a page whose
+            # every product this visitor may not buy — 250 in a row filtered
+            # out after the cut. After a full page either is as likely: one
+            # more page tells which. After a short one it is usually the end,
+            # and asking every time would cost a request per pass; but while
+            # products the shop was selling have not come up, calling it the
+            # end marks them withdrawn — www.italist.com on 24.09.2026 ended
+            # on an empty page after 2,841 of its 44,342 products. Then up to
+            # GAP_PAGES are asked, so a gap of two filtered pages is read past.
+            allowed = GAP_PAGES if unlisted else 1 if previous_full else 0
+            if empties <= allowed:
                 page_number += 1
                 if page_number > LAST_PAGE:
                     break
@@ -542,7 +549,7 @@ async def fetch(
                 continue
             exhausted = True
             break
-        previous_full, probed = len(raw) >= PAGE_SIZE, False
+        previous_full, empties = len(raw) >= PAGE_SIZE, 0
         page_number += 1
         if page_number > LAST_PAGE:
             # Past the window Shopify answers at all. Asking anyway costs a

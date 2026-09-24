@@ -874,13 +874,24 @@ class TestAShopThatAskedNotToBeVisited:
         keep = dbm.upsert_store(conn, "keep.example", platform="shopify", status="ok")
         gone = dbm.upsert_store(conn, "www.gone.example", platform="shopify", status="ok")
         kept = _a_card(conn, keep, "kept", checked=ts(3))
-        dropped = _a_card(conn, gone, "dropped", checked=ts(5))
+        _a_card(conn, gone, "dropped", checked=ts(5))
         monkeypatch.setattr(dbm, "load_excluded", lambda: frozenset({"gone.example"}))
 
         assert [row["product_id"] for row in dbm.stale_offers(conn, 10, ("shopify",))] == [kept]
-        assert [
-            row["product_id"] for row in dbm.offers_to_confirm(conn, [kept, dropped], ("shopify",))
-        ] == [kept]
+
+    def test_its_old_cards_do_not_fill_the_queue(self, conn, monkeypatch):
+        """Left out after the LIMIT, an excluded shop's cards — never read again,
+        so always the oldest — took every place and nothing was checked."""
+        keep = dbm.upsert_store(conn, "keep.example", platform="shopify", status="ok")
+        gone = dbm.upsert_store(conn, "gone.example", platform="shopify", status="ok")
+        for n in range(100):
+            _a_card(conn, gone, f"old{n}", checked=ts(30))
+        kept = {_a_card(conn, keep, f"new{n}", checked=ts(2)) for n in range(30)}
+        monkeypatch.setattr(dbm, "load_excluded", lambda: frozenset({"gone.example"}))
+
+        rows = dbm.stale_offers(conn, 60, ("shopify",))
+
+        assert {row["product_id"] for row in rows} == kept
 
     def test_an_empty_list_changes_nothing(self, conn, monkeypatch):
         dbm.upsert_store(conn, "keep.example", platform="shopify")

@@ -2414,8 +2414,8 @@ async def test_a_followed_product_that_goes_and_comes_back_is_told_both_ways(
     said = [json.loads(call.request.content)["text"] for call in text.calls]
     assert not any("Снято с продажи" in message for message in said), "not on the first read"
 
-    # A day on, still not listed: now it is news.
-    conn.execute("UPDATE products SET missing_since = ? WHERE id = ?", (ts(1.5), product_id))
+    # Two days on, still not listed: now it is news.
+    conn.execute("UPDATE products SET missing_since = ? WHERE id = ?", (ts(2.5), product_id))
     make_due(conn)
     await pipeline.run(config, conn)
     said = [json.loads(call.request.content)["text"] for call in text.calls]
@@ -2464,9 +2464,9 @@ async def test_back_on_sale_with_a_size_back_in_stock_is_one_message(config, sho
     full.mock(return_value=httpx.Response(200, json=without))
     make_due(conn)
     await pipeline.run(config, conn)
-    conn.execute("UPDATE products SET missing_since = ? WHERE id = ?", (ts(1.5), product_id))
+    conn.execute("UPDATE products SET missing_since = ? WHERE id = ?", (ts(2.5), product_id))
     make_due(conn)
-    await pipeline.run(config, conn)  # told it went, a day on
+    await pipeline.run(config, conn)  # told it went, two days on
 
     back = json.loads(json.dumps(sold_out))
     back["products"][0]["variants"][0]["available"] = True
