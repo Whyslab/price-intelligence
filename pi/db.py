@@ -2062,6 +2062,50 @@ def _cheapest_per_product(
     return conn.execute(sql, ids).fetchall()
 
 
+_LAST_ASKED_SQL = """
+    WITH latest AS (
+        SELECT variant_id, price_usd, currency, price_native
+          FROM (
+            SELECT variant_id, price_usd, currency, price_native,
+                   ROW_NUMBER() OVER (PARTITION BY variant_id ORDER BY ts DESC) AS rn
+              FROM price_points
+             WHERE variant_id IN (
+                 SELECT id FROM variants WHERE product_id IN ({placeholders})
+             )
+          )
+         WHERE rn = 1
+    )
+    SELECT s.domain, s.name AS store_name, s.country, s.last_ok,
+           p.title, p.url, p.id AS product_id, p.brand_norm, p.audience,
+           MIN(latest.price_usd) AS price_usd,
+           latest.currency, latest.price_native,
+           NULL AS discount_pct
+      FROM latest
+      JOIN variants v ON v.id = latest.variant_id
+      JOIN products p ON p.id = v.product_id
+      JOIN stores   s ON s.id = p.store_id
+     WHERE p.missing_since IS NULL
+     GROUP BY p.id
+     ORDER BY price_usd
+"""
+
+
+def _last_asked_per_product(
+    conn: sqlite3.Connection, product_ids: Sequence[int]
+) -> list[sqlite3.Row]:
+    """What each of these products last cost, sold out or not, cheapest first.
+
+    For the answer that has nothing in stock: a thing sold out everywhere is
+    the thing somebody waiting for their size wants to follow, and "nothing
+    found" would leave them nothing to press.
+    """
+    ids = list(product_ids)[:MAX_LOOKUP_PRODUCTS]
+    if not ids:
+        return []
+    sql = _LAST_ASKED_SQL.format(placeholders=",".join("?" * len(ids)))
+    return conn.execute(sql, ids).fetchall()
+
+
 def _one_row_per_merchant(
     rows: list[sqlite3.Row], exclude: str | None = None
 ) -> list[sqlite3.Row]:
@@ -2250,7 +2294,7 @@ def lookup_article(conn: sqlite3.Connection, query: str, limit: int = 25) -> dic
     text = (query or "").strip()
     result: dict = {
         "query": text, "matched_by": None, "key": None, "same_thing": False,
-        "products": 0, "shops": [], "found": 0, "too_common": None,
+        "products": 0, "shops": [], "found": 0, "too_common": None, "sold_out": [],
     }
     if len(text) < 3:
         return result
@@ -2301,6 +2345,11 @@ def lookup_article(conn: sqlite3.Connection, query: str, limit: int = 25) -> dic
     # only sees the truncated list reports the limit as the answer.
     result["found"] = len(rows)
     result["shops"] = rows[:limit]
+    if not rows:
+        # Known, and in stock nowhere. `shops` stays empty — nothing here can
+        # be bought — but what it last cost is kept, so it can be followed.
+        last = _last_asked_per_product(conn, ids)
+        result["sold_out"] = (_one_row_per_merchant(last) if same_thing else last)[:limit]
     return result
 
 

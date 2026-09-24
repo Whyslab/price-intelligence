@@ -400,6 +400,8 @@ def format_lookup(found: dict) -> str:
     of them is the answer. A name is a list of different things, and calling
     the cheapest of those a saving would be a lie the layout tells by itself.
     """
+    if not found["shops"] and found.get("sold_out"):
+        return _format_sold_out(found)
     if not found["shops"]:
         if found["too_common"]:
             return (
@@ -450,14 +452,34 @@ def format_lookup(found: dict) -> str:
     return "\n".join(lines)
 
 
+def _format_sold_out(found: dict) -> str:
+    """Known, and in stock nowhere — which is when following it matters most."""
+    rows = found["sold_out"][:BOT_LOOKUP_LIMIT]
+    if found["same_thing"]:
+        head = f"<b>{escape(str(found['key']))}</b> · нет в наличии ни в одном магазине"
+    else:
+        head = "По названию нашлось, но ничего нет в наличии"
+    lines = [head, "<i>последняя цена, которую просил магазин:</i>", ""]
+    for number, row in enumerate(rows, 1):
+        shop = escape(row["store_name"] or row["domain"])
+        country = f" · {escape(row['country'])}" if row["country"] else ""
+        mark = "" if found["same_thing"] else f"{number}. "
+        lines.append(f"{mark}{_money(row['price_usd'])} — {shop}{country}")
+        if not found["same_thing"]:
+            lines.append(f"   {escape(row['title'])[:60]}")
+    lines += ["", "⭐ — напишу, когда появится в наличии."]
+    return "\n".join(lines)
+
+
 def lookup_keyboard(found: dict) -> dict | None:
     """What can be done with an answer: follow it.
 
     An article is one thing in several shops, so one button follows it in all
     of them. A name is several different things, so each gets its own button,
-    numbered like the lines above it.
+    numbered like the lines above it. Sold out everywhere is followed the same
+    way — that is what following is most often for.
     """
-    shops = found["shops"][:BOT_LOOKUP_LIMIT]
+    shops = (found["shops"] or found.get("sold_out") or [])[:BOT_LOOKUP_LIMIT]
     if not shops:
         return None
     if found["same_thing"]:

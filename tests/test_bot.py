@@ -596,7 +596,7 @@ class TestFollowingFromTheChat:
     reader the thing the second customer segment pays for: a watch on one item."""
 
     @staticmethod
-    def _stock(conn, domain, title, price, style=None):
+    def _stock(conn, domain, title, price, style=None, in_stock=True):
         store = dbm.upsert_store(conn, domain, platform="shopify", currency="USD",
                                  name=domain.split(".")[0])
         product = dbm.upsert_product(conn, store, f"p-{domain}-{title}", title,
@@ -604,7 +604,7 @@ class TestFollowingFromTheChat:
         if style:
             dbm.set_product_keys(conn, product, {("style", style)})
         variant = dbm.upsert_variant(conn, product, f"v-{domain}")
-        dbm.record_price(conn, variant, price, None, True, "USD", price, 1.0)
+        dbm.record_price(conn, variant, price, None, in_stock, "USD", price, 1.0)
         return product
 
     @staticmethod
@@ -654,6 +654,42 @@ class TestFollowingFromTheChat:
 
         assert dbm.favorite_ids(conn, 7) == {cheap, dear}
         assert "в 2 магазинах" in calls[-1][1]["text"]
+
+    @pytest.mark.asyncio
+    async def test_an_article_sold_out_everywhere_can_still_be_followed(self, robot, calls, conn):
+        """Review 24.09: it answered «Ничего не нашлось» with no star — for the
+        exact thing the second customer segment follows things for."""
+        first = self._stock(conn, "a.example", "AF1", 90.0, style="CW2288-111", in_stock=False)
+        second = self._stock(conn, "b.example", "Air Force 1", 120.0, style="CW2288-111",
+                             in_stock=False)
+
+        await robot.handle(TestRouting._message("CW2288-111"))
+
+        text = calls[-1][1]["text"]
+        assert "нет в наличии" in text and "Ничего не нашлось" not in text
+        assert "$90" in text, "with what it last cost"
+        [star] = self._buttons(calls[-1])
+        await robot.handle(TestRouting._press(star["callback_data"]))
+        assert dbm.favorite_ids(conn, 7) == {first, second}
+
+    @pytest.mark.asyncio
+    async def test_a_name_sold_out_everywhere_offers_a_star_per_thing(self, robot, calls, conn):
+        first = self._stock(conn, "a.example", "Salomon XT-6 black", 150.0, in_stock=False)
+
+        await robot.handle(TestRouting._message("salomon xt-6"))
+
+        assert "1. " in calls[-1][1]["text"]
+        assert [b["callback_data"] for b in self._buttons(calls[-1])] == [f"fw:{first}"]
+
+    @pytest.mark.asyncio
+    async def test_something_in_stock_is_answered_as_before(self, robot, calls, conn):
+        self._stock(conn, "a.example", "AF1", 90.0, style="CW2288-111", in_stock=False)
+        self._stock(conn, "b.example", "Air Force 1", 120.0, style="CW2288-111")
+
+        await robot.handle(TestRouting._message("CW2288-111"))
+
+        text = calls[-1][1]["text"]
+        assert "нет в наличии" not in text and "$120" in text and "$90" not in text
 
     @pytest.mark.asyncio
     async def test_the_list_shows_what_is_followed_and_a_cross_takes_it_off(
