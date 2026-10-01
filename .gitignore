@@ -7,6 +7,9 @@ __pycache__/
 .env
 
 # Local state
+data/demo.db
+data/.omc/
+.playwright-mcp/
 data/*.db
 data/*.db.*
 data/*.db-wal

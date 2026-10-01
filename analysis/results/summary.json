@@ -1,0 +1,112 @@
+{
+  "generated": "2026-10-01T14:02:31+00:00",
+  "definitions": {
+    "claim": "a point where the struck-through price is >2% above the price",
+    "unsupported": "no point in the data charged ≥95% of the latest struck-through price",
+    "round": "discount within 0.15 points of a multiple of 5",
+    "control": "same window, half a step away — a reference, not a proof",
+    "store kinds": {
+      "computed_tag": "round steps and a “was” price never charged",
+      "percentage_promo": "round steps, and the “was” price was charged",
+      "standing_tag": "irregular percentages, “was” price never charged",
+      "supported": "irregular percentages, “was” price was charged",
+      "mixed": "in between"
+    },
+    "store thresholds": {
+      "round": "round share ≥ 60%",
+      "unseen": "unsupported ≥ 80%",
+      "seen": "unsupported ≤ 20%"
+    }
+  },
+  "overview": {
+    "stores": 310,
+    "stores_read_ok": 181,
+    "products": 979422,
+    "variants": 4654930,
+    "price_points": 12840494,
+    "first_point": "2026-08-24T15:49:37+00:00",
+    "last_point": "2026-09-27T15:24:49+00:00",
+    "observation_days": 34.0,
+    "stores_by_status_and_platform": {
+      "ok/shopify": 144,
+      "skipped/unknown": 54,
+      "error/jsonld": 42,
+      "ok/jsonld": 36,
+      "skipped/blocked": 17,
+      "skipped/tls": 8,
+      "skipped/dead": 6,
+      "error/shopify": 2,
+      "ok/asos": 1
+    }
+  },
+  "claims": {
+    "variants_with_a_claim": 1353434,
+    "claims_over_30_percent": 1044197,
+    "cuts": {
+      "all": {
+        "variants": 1353434,
+        "unsupported": 1222545,
+        "unsupported_share": 0.9032911837592376
+      },
+      "long_watch": {
+        "variants": 82589,
+        "unsupported": 55959,
+        "unsupported_share": 0.677559965612854
+      },
+      "fresh": {
+        "variants": 74419,
+        "unsupported": 3791,
+        "unsupported_share": 0.05094129187438692
+      },
+      "standing_28d": {
+        "variants": 75157,
+        "unsupported": 55897,
+        "unsupported_share": 0.7437364450417127
+      }
+    },
+    "stores_analysed": 87,
+    "min_claims_per_store": 200,
+    "claims_in_analysed_stores": 1352505,
+    "store_kinds": {
+      "computed_tag": {
+        "stores": 32,
+        "claims": 351391
+      },
+      "percentage_promo": {
+        "stores": 2,
+        "claims": 21418
+      },
+      "standing_tag": {
+        "stores": 41,
+        "claims": 754617
+      },
+      "supported": {
+        "stores": 1,
+        "claims": 1261
+      },
+      "mixed": {
+        "stores": 11,
+        "claims": 223818
+      }
+    },
+    "median_store_unsupported": 0.971189207613512,
+    "median_round_share": 0.5137791070284128,
+    "median_control_share": 0.010895107882930999
+  },
+  "movement": {
+    "variants_seen_once": 3363404,
+    "variants_seen_once_share": 0.7225466333543147,
+    "variants_with_3plus_points": 861368,
+    "moved_over_5_percent": 183893,
+    "moved_over_20_percent": 128165
+  },
+  "cross_store": {
+    "articles": 138948,
+    "in_2plus_stores": 23864,
+    "in_3plus_stores": 11191
+  },
+  "charts": [
+    "round_vs_unsupported.png",
+    "discount_distribution.png"
+  ]
+}

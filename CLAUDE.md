@@ -13,7 +13,7 @@ The five canonical triage roles, each label string equal to its name. See `docs/
 ### Domain docs
 
 Single-context. There is no `CONTEXT.md` or `docs/adr/` yet — the domain lives in
-`README.md` (how it behaves and why), `docs/product.md` (what it is for and what is
+`docs/ru/README.md` (how it behaves and why; `README.md` is the English overview), `docs/product.md` (what it is for and what is
 next) and `docs/function-map.md` (where each thing is). See `docs/agents/domain.md`
 for the convention if an ADR is ever added.
 

@@ -21,7 +21,7 @@ jobs:
           cache: pip
 
       - name: Install
-        run: pip install -e ".[dev]"
+        run: pip install -e ".[dev,analysis]"
 
       - name: Lint
         run: ruff check .
@@ -34,3 +34,8 @@ jobs:
         run: |
           python -m pi --help
           python -m pi run --help
+
+      - name: Demo database and analysis end to end
+        run: |
+          python scripts/make_demo_db.py /tmp/demo.db
+          python analysis/discounts.py --db /tmp/demo.db --out /tmp/demo-out
