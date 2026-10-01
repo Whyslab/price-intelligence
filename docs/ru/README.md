@@ -272,7 +272,7 @@ PI_WEB_URL=https://shelf.example.com
 Вне Telegram есть явный ключ, для отладки на своей машине:
 
 ```bash
-python -m pi web --owner 123456789      # ваш Telegram user id
+python -m pi web --owner 123456789       # ваш Telegram user id
 ```
 
 Он работает только на `127.0.0.1`: на адресе, доступном другим, он раздавал бы
@@ -664,7 +664,7 @@ pi/
 
 ```bash
 pip install -e ".[dev]"
-pytest -q          # 929 тестов, сеть замокана, ~35 с
+pytest -q          # 937 тестов, сеть замокана, меньше минуты
 ruff check .
 ```
 

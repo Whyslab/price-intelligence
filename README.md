@@ -15,34 +15,35 @@ that came out of it.
 | | |
 |---|---|
 | Crawled | 979,422 products · 4.65 M variants · 12.8 M price points · 310 shops |
-| Code | ~14,700 lines of Python in `pi/`, 929 tests (no network), CI on Python 3.11 and 3.13 |
+| Code | ~14,700 lines of Python in `pi/`, 937 tests (no network), CI on Python 3.11 and 3.13 |
 | Reads | Shopify `/products.json`, schema.org JSON-LD, one bespoke JSON API (ASOS) |
 | Out | Telegram alerts with photos, a browser shelf, a CLI, a discount analysis |
 
 ## What the data says
 
 For the full write-up with caveats, see **[docs/findings.md](docs/findings.md)**. The short
-version, and the part I got wrong first:
+version:
 
-* 90% of struck-through "was" prices were never charged in the 34-day window. **I do not trust
-  that number**: a tag that was already there on our first look can never be checked against a
-  price from before it.
-* The cleaner test is a product first seen *without* a tag that later gains one. There the "was"
-  price matches a price the shop really charged **95% of the time** (74,419 variants). Shops
-  rarely invent a sale after the fact.
-* Tags that were already present and stood for four weeks are a different story: the price
-  reached them **26% of the time** (75,157 variants). That is a standing markdown or a list
-  price, not a sale.
-* Round discounts (20/30/40/50/60%) are **not** evidence on their own. A real "30% off
-  everything" sale is round too. Round *and* never-charged is the signature of a tag computed
-  backwards from the sale price: 32 of 87 analysed shops.
+* **91% of discounts of 10% or more** (1.34 M variants) carry a "was" price that was never
+  charged in the 34-day window. That alone is weaker than it sounds: a tag already on at our first
+  look cannot be checked against a price from before it.
+* The cleaner cut is a product first seen *without* a tag that later gains one. There the "was"
+  price matches a price the shop really charged **91% of the time** (84,402 variants), though
+  that cut is thin: 58 shops, and one of them supplies 39% of it.
+* The opposite cut: tags already on at first sight, on products watched for four weeks. The price
+  reached them **5% of the time** (767,611 variants). That is a standing markdown or a list
+  price, not a sale, and the label looks identical.
+* Round discounts (20/30/40/50/60%) are **not** evidence on their own: a real "30% off
+  everything" sale is round too. 32 of 87 analysed shops are round *and* never-charged
+  (`round_unseen`). The data cannot say which way their arithmetic ran, so they are labelled by
+  what is observed, not by intent.
 
 ![Round discounts against unseen was-prices, per shop](analysis/results/round_vs_unsupported.png)
 
 ## Try it in two minutes
 
-No crawl, no Telegram token. The demo database is synthetic: ten fictional shops with four
-planted behaviours (honest, round promotion, computed tag, permanent inflated tag).
+No crawl, no Telegram token. The demo database is synthetic: ten fictional shops: two never show a tag, the other eight each plant one behaviour
+(honest, round promotion, round and never charged, irregular and never charged).
 
 ```bash
 git clone https://github.com/Whyslab/price-intelligence && cd price-intelligence
@@ -54,7 +55,7 @@ export PI_DB_PATH=data/demo.db PI_FILTERS_FILE=filters.toml.example
 python -m pi reshelve                 # score the shelf from the demo data
 python -m pi web                      # http://127.0.0.1:8000
 python analysis/discounts.py --db data/demo.db --out /tmp/demo-results
-pytest -q                             # 929 tests, ~35 s, no network
+pytest -q                             # 937 tests, under a minute, no network
 ```
 
 The shelf and bot messages are in Russian (the first user's language). Code and this
@@ -67,7 +68,7 @@ documentation are in English; the original long-form Russian manual is kept in
 
 ```mermaid
 flowchart LR
-    S[data/sites.txt<br/>310 domains] --> D[detect<br/>how is this shop read?]
+    S[data/sites.txt<br/>shop list] --> D[detect<br/>how is this shop read?]
     D --> C1[Shopify<br/>/products.json]
     D --> C2[JSON-LD<br/>sitemap crawl]
     D --> C3[ASOS adapter]
@@ -89,23 +90,32 @@ A discount is judged against four references, in order of how hard they are to f
 
 ## Engineering decisions worth reading
 
-These are the places where the obvious design was wrong; each is a test in the suite.
+The places where the obvious design was wrong. Most are covered by a test; the one that is not
+is marked.
 
 * **Rate limit per platform, not per shop.** Shopify throttles by *client IP across all its
-  shops*. Sixteen parallel shops burned the shared budget and lost 58 of 138 shops in a single
-  sweep, with no `Retry-After`. One global limiter (`pi/throttle.py`) fixed it.
-* **Currency comes from the storefront**, never from the domain. A `.com` in Berlin sells in
-  euros. An unknown currency drops the price rather than treating it as dollars.
+  shops*. In a measurement at the start of the project, parallel crawling lost 58 of 138 shops in
+  one sweep, with no `Retry-After`. All Shopify requests now go through one shared limiter with a
+  circuit breaker (`pi/throttle.py`). It reduces the damage and does not remove it: the quota is a
+  rolling allowance that can run out within a run, which the module documents. *(The 58/138
+  measurement is not reproduced by a test.)*
+* **Currency comes from the storefront**, not from the domain: a `.com` in Berlin sells in
+  euros. A currency the exchange table does not know drops the price instead of pricing it in
+  dollars. A shop that reports no currency at all falls back to USD, which is a known weak spot.
 * **A price point is written only when something changed**, judged in the shop's own currency.
   Judged in dollars, every daily exchange-rate tick looked like news and turned a currency
-  wobble into an "all-time low".
+  wobble into an "all-time low". A consequence worth knowing when reading the data: the last point
+  says when a price last changed, not when it was last looked at (the analysis uses
+  `products.last_seen` for that).
 * **"Reached the end" ≠ "read everything".** A pass resumed at page 40 that ran to the end must
   not mark pages 1–39 as withdrawn. Withdrawal needs an explicit `enumerated` flag that only a
   full first-page pass sets.
-* **The alert is recorded before it is sent**, and deleted if sending fails: a crash mid-send must
-  not produce a duplicate.
-* **Adapters verify, they do not trust.** A bespoke adapter that stops working has to look like a
-  broken shop in the health report, not a healthy one.
+* **The alert is recorded before it is sent**, and deleted if sending fails, so a crash
+  mid-send cannot produce a duplicate. The price of that guarantee is that such a crash loses the
+  alert instead.
+* **Adapters verify, they do not trust.** A bespoke adapter (ASOS) is checked by `detect`, so one
+  that stops working looks like a broken shop, not a healthy one. The detection path is tested; the
+  health-report path is not.
 
 ## Layout
 
@@ -114,7 +124,7 @@ pi/                 the collector, scorer, bot and web shelf
   sources/          shopify.py · jsonld.py · asos.py · detect.py
 analysis/           discounts.py + committed results (summary.json, stores.csv, charts)
 scripts/            make_demo_db.py (synthetic data) · install-units.sh · tunnel.sh
-tests/              929 tests, every outbound request mocked
+tests/              937 tests, every outbound request mocked
 docs/               findings.md · product.md · function-map.md · subscription.md · ru/
 systemd/            timers and services (hourly sweep, daily digest, backup, prune)
 ```
@@ -124,9 +134,9 @@ systemd/            timers and services (hourly sweep, daily digest, backup, pru
 Honest list, because a portfolio piece that hides them is worse than one that shows them.
 
 * **34 days of history.** Long enough to find patterns, too short to call any shop dishonest.
-* **181 of 310 shops are readable.** 44 domains render prices in JavaScript with nothing in the
-  markup; 19 refuse even a browser fingerprint. They are marked `blocked` instead of silently
-  returning zero products.
+* **181 of 310 shops are readable.** Of the rest, some render prices in JavaScript with nothing
+  in the markup, some refuse even a browser fingerprint, some are dead. They are marked
+  (`blocked`, `tls`, `dead`, `unknown`) instead of silently returning zero products.
 * **No Norwegian shops**, and no landed-cost model for Norwegian VAT and duty beyond the optional
   `shipping.toml`.
 * **Collection is paused**, so the live shelf and bot are off. The code, tests and the analysis

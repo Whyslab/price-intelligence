@@ -15,69 +15,84 @@ it at some point in the data. Otherwise it is **unseen**. *Unseen is not the sam
 number may be a manufacturer's list price, or the shop may have charged it before the first
 observation. The point of the analysis is to find out how far that caveat stretches.
 
-## The headline number is the weakest one
+## Two kinds of discount, and the label does not say which
 
-> 1,353,434 variants wore a discount. For 90.3% of them the "was" price was never charged
-> in the data.
+> 1,335,601 variants wore a discount of 10% or more. For 90.9% of them the "was" price was
+> never charged in the data.
 
-That figure is real and I do not trust it. It is dominated by shops that put a tag on a product
-**before our first look**, and for those a price from before the window can never be seen. So I
-cut the same data three more ways, each answering the weakness of the last.
+That headline number has an obvious weakness: a tag that was already on the product at our first
+look can never be checked against a price from before the window. So the same data is cut four
+ways, each answering the weakness of the last.
 
-| Cut | Variants | "Was" price unseen | What it can and cannot say |
-|---|---:|---:|---|
-| All discounted variants | 1,353,434 | 90.3% | Biggest sample; overstates, because the past is invisible |
-| Watched ≥ 28 days | 82,589 | 67.8% | Fairer, but only variants that stay listed that long |
-| **First seen without a tag** | 74,419 | **5.1%** | The price before the tag was observed — the cleanest test |
-| **Tagged from the start, watched ≥ 28 days** | 75,157 | **74.4%** | The tag stood for the whole window and the price never reached it |
+| Cut | Variants | Shops | "Was" price unseen | What it can and cannot say |
+|---|---:|---:|---:|---|
+| All discounted variants | 1,335,601 | 100 | 90.9% | Biggest sample; the past before day one is invisible |
+| Watched ≥ 28 days | 813,930 | 93 | 90.2% | From the first point to the last time the product was seen |
+| **First seen without a tag** | 84,402 | 58 | **8.7%** | The price before the tag was observed: the cleanest test |
+| **Tag on at first sight, watched ≥ 28 days** | 767,611 | 92 | **94.8%** | The tag was already there and the price never reached it |
 
 The two bold rows tell the story, and they point in opposite directions.
 
-* **When a tag appears on a product we had seen at full price, it is almost always honest.**
-  In 94.9% of 74,419 cases the "was" price matches a price the shop really charged. Shops mostly
-  do not invent a sale after the fact.
-* **When a tag is already there on first sight and stays for four weeks, the price usually never
-  gets near it** (74.4% of 75,157). That is a standing markdown rather than a sale, or a list
-  price used as a reference. Both are common and in some jurisdictions legal. It is a different
-  thing from a sale, and the label does not say which one you are looking at.
+* **When a tag appears on a product we had seen at full price, the "was" price usually matches a
+  price the shop really charged.** That holds in 91.3% of 84,402 cases. Read it with care: the cut
+  is thin and lumpy. It rests on 58 shops, one shop (shop.simon.com) supplies 39% of it and the
+  top three 57%; 30 of the 87 shops analysed below have none at all. A shop that lists
+  every product with a tag already on cannot appear here by construction. So this says that *sales
+  that start during the window* mostly reference a real earlier price, not that shops are honest.
+* **When a tag is already there on first sight and the product is watched for four weeks, the
+  price reaches it only 5.2% of the time** (767,611 variants, 92 shops, the three largest 25%).
+  That is a standing markdown, or a list price used as a reference, not a sale. Both are common and in some jurisdictions legal.
+  The label looks the same either way, and it does not say which one you are looking at.
 
-I had first read the 90% figure as "most discounts are fake". The fresh-tag cut says that is not
-what the data supports.
+The second cut is the better supported of the two: it is spread over 92 shops, and no three of
+them make up more than a quarter of it.
 
 ## Round percentages are not the evidence
 
 Some shops show nothing but 20%, 30%, 40%, 50%, 60% off. That looks like a rule — *"−40% on
-everything"* — and the "was" price looks computed backwards from the sale price.
+everything"*.
 
 ![Where the discount percentages fall](../analysis/results/discount_distribution.png)
 
 But a real "30% off sitewide" sale is round too, and its "was" price is genuine. Round alone
-proves nothing. Round **and** unseen together is the signature of a computed tag, so each shop
-with at least 200 discounted variants (87 of them) is placed on two axes:
+proves nothing. Round **and** unseen together fits a percentage markdown applied to a price that
+was never charged, though the data cannot say which way the arithmetic ran: a price set to
+*list × 0.6* gives the same round percentage and the same unseen "was". So each shop with at least
+200 discounted variants (87 of them) is placed on two axes and given a neutral label:
 
 ![Round discounts against unseen was-prices, per shop](../analysis/results/round_vs_unsupported.png)
 
 | Kind of shop | Shops | Discounted variants |
 |---|---:|---:|
-| Computed tag — round steps, "was" never charged | 32 | 351,391 |
-| Standing tag — irregular percentages, "was" never charged | 41 | 754,617 |
-| Percentage promotion — round steps, "was" was charged | 2 | 21,418 |
-| Supported — irregular percentages, "was" was charged | 1 | 1,261 |
-| In between | 11 | 223,818 |
+| `round_unseen` — round steps, "was" never charged | 32 | 350,738 |
+| `irregular_unseen` — irregular percentages, "was" never charged | 42 | 748,072 |
+| `round_seen` — round steps, "was" was charged | 2 | 21,418 |
+| `irregular_seen` — irregular percentages, "was" was charged | 1 | 1,261 |
+| `mixed` — in between | 10 | 213,284 |
 
-The median shop has 97% of its "was" prices unseen and 51% of its discounts on a round step. Two
+The median shop has 98% of its "was" prices unseen and 53% of its discounts on a round step. Two
 shops sit at the round-and-seen corner: a real promotion looks round but passes the second test,
 so the pair of tests can tell the two cases apart. Two is a small number, and I would not build
-on it. The control window — the same width placed half a step
+on it. Shops in the `round_unseen` group that do have tags appearing mid-window mostly pass the
+fresh-tag test (`fresh_unsupported` in `stores.csv`), so for them "round and unseen" describes a
+standing markdown, not forged sale prices. The control window — the same width placed half a step
 away — catches about 1% of discounts for the median shop, so round steps are not a chance
 pattern.
 
 ## Prices move less than the shelf suggests
 
-72% of variants (3,363,404 of 4,654,930) were read exactly once: their price did not change in
-34 days, so the shop never wrote a second point. Of the 861,368 variants with three or more
-points, 183,893 moved by more than 5% and 128,165 by more than 20%. Most of the catalogue is
+73% of variants were read exactly once: their price did not change in 34 days, so the shop
+never wrote a second point (3,423,704 of about 4.7 million). Of the 851,027 with three or more
+points, 170,212 moved by more than 5% and 114,707 by more than 20%. Most of the catalogue is
 standing still; a small part moves a lot.
+
+## About the shop names
+
+`stores.csv` lists shops by domain because the figures are only checkable that way. Each row says
+what a price series showed over 34 days: whether a shown "was" price was ever charged, and how
+round the percentages were. It does not say why, and "unseen" is not "false": a manufacturer's
+list price is a legitimate reference in many places. The labels are descriptive on purpose. If
+you run a listed shop and want a row corrected or removed, open an issue.
 
 ## What I could not conclude
 
@@ -95,7 +110,15 @@ standing still; a small part moves a lot.
 ## How it was checked
 
 * The unseen test ran against the shop's own currency, not dollars, so exchange-rate ticks cannot
-  move a price (the collector avoids the same trap, see `db.record_price`).
+  move a price (the collector avoids the same trap, see `db.record_price`). A shop that switches
+  currency is not allowed to vouch for its own tag across the switch.
+* A discount counts only from 10% up. A 3% tag is "seen" by the price itself, which made the test
+  meaningless for small ones.
+* A code review caught a mistake in the first version: the "watched ≥ 28 days" window was measured
+  from the first to the *last price change*, but a price point is written only when something
+  changes, so it measured how long a price kept changing. The window now ends at the time the
+  product was last seen. The cut grew from 82,589 to 813,930 variants and the headline moved by a
+  few points; the "tag on at first sight" cut moved from 74% to 95% unseen.
 * I read raw histories for a few "unseen" variants. One example: an adidas model shown at €150 for
   the full 32 days while its price went €90 → €83. The test is doing what it says.
 * The first cut of the cross-shop comparison was wrong, and I found that by opening the top

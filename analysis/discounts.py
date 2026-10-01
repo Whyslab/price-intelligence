@@ -7,8 +7,9 @@ Reads a price-intelligence database **read-only** and answers four questions:
    near it? (``unsupported`` below)
 3. Which stores show round, same-percentage-off discounts, and does the "was"
    price behind them check out? Round alone proves nothing (a real "30% off
-   everything" sale is round too); round **and** never seen is the signature of
-   a tag computed from the sale price.
+   everything" sale is round too); round **and** never seen fits a percentage
+   markdown applied on top of a price that was never charged. The data cannot
+   say which direction the arithmetic ran, so no shop is called "computed".
 4. How often do prices move at all?
 
 Nothing here is a verdict about a single shop. A "was" price that was never
@@ -38,10 +39,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 # A struck-through price counts as a real claim only when it is at least this
-# much above the price: 2% is rounding noise and conversion jitter, not a sale.
-MIN_CLAIM = 1.02
+# much above the price: 10% off. Below that the claim is noise, and it would also
+# overlap SEEN_SHARE: a tag 3% above the price is "seen" by the price itself.
+MIN_CLAIM = 1.10
 # The "was" price counts as seen if the variant was ever charged at least this
 # share of it. 95%, not 100%, so a 0.01 rounding step cannot decide the verdict.
+# It must stay below 1 / MIN_CLAIM (0.909) or the price would vouch for the tag.
 SEEN_SHARE = 0.95
 # A discount percentage this close to a multiple of five is "round". The width
 # is a tenth of a percentage point either side, because a rule-made price is
@@ -62,10 +65,10 @@ MIN_STORES_FOR_CURVE = 5
 
 # round x unseen gives the four kinds of store the charts and the table use.
 KINDS = {
-    "computed_tag": "round steps and a “was” price never charged",
-    "percentage_promo": "round steps, and the “was” price was charged",
-    "standing_tag": "irregular percentages, “was” price never charged",
-    "supported": "irregular percentages, “was” price was charged",
+    "round_unseen": "round steps and a “was” price never charged",
+    "round_seen": "round steps, and the “was” price was charged",
+    "irregular_unseen": "irregular percentages, “was” price never charged",
+    "irregular_seen": "irregular percentages, “was” price was charged",
     "mixed": "in between",
 }
 
@@ -114,23 +117,32 @@ def build_tables(conn: sqlite3.Connection) -> None:
     """
     conn.executescript(
         f"""
+        -- One row per variant and currency, so a shop that switches currency
+        -- cannot make a price in one look like a price in the other.
         CREATE TEMP TABLE agg AS
-            SELECT variant_id,
+            SELECT variant_id, currency,
                    MAX(price_native) AS hi,
                    MIN(price_native) AS lo,
-                   COUNT(*)          AS n,
-                   MIN(ts)           AS t0,
-                   MAX(ts)           AS t1
-            FROM price_points GROUP BY variant_id;
+                   COUNT(*)          AS n
+            FROM price_points GROUP BY variant_id, currency;
 
-        -- Was the variant already wearing a tag the first time we saw it?
+        -- The window a variant was watched. A price point is written only when
+        -- something changes, so the last point says when it last *changed*, not
+        -- when it was last looked at; products.last_seen is the real end.
+        CREATE TEMP TABLE win AS
+            SELECT variant_id, MIN(ts) AS t0 FROM price_points GROUP BY variant_id;
+
+        -- Was the variant already wearing a real discount tag the first time we
+        -- saw it?
         CREATE TEMP TABLE first AS
-            SELECT variant_id, compare_at_native IS NOT NULL AS tagged_at_start, MIN(ts) AS ts
+            SELECT variant_id,
+                   compare_at_native > price_native * {MIN_CLAIM} AS tagged_at_start,
+                   MIN(ts) AS ts
             FROM price_points GROUP BY variant_id;
 
         -- The latest point on which the shop actually claimed a discount.
         CREATE TEMP TABLE tagged AS
-            SELECT variant_id, price_native AS p, compare_at_native AS c, MAX(ts) AS ts
+            SELECT variant_id, currency, price_native AS p, compare_at_native AS c, MAX(ts) AS ts
             FROM price_points
             WHERE compare_at_native > price_native * {MIN_CLAIM}
             GROUP BY variant_id;
@@ -141,10 +153,11 @@ def build_tables(conn: sqlite3.Connection) -> None:
                    t.variant_id,
                    100.0 * (1 - t.p / t.c)                        AS pct,
                    (a.hi >= {SEEN_SHARE} * t.c)                    AS seen,
-                   (julianday(a.t1) - julianday(a.t0) >= {LONG_WATCH_DAYS}) AS long_watch,
-                   (NOT f.tagged_at_start)                         AS fresh
+                   (julianday(p.last_seen) - julianday(w.t0) >= {LONG_WATCH_DAYS}) AS long_watch,
+                   (NOT COALESCE(f.tagged_at_start, 0))            AS fresh
             FROM tagged t
-            JOIN agg a      ON a.variant_id = t.variant_id
+            JOIN agg a      ON a.variant_id = t.variant_id AND a.currency = t.currency
+            JOIN win w      ON w.variant_id = t.variant_id
             JOIN first f    ON f.variant_id = t.variant_id
             JOIN variants v ON v.id = t.variant_id
             JOIN products p ON p.id = v.product_id
@@ -158,9 +171,9 @@ def build_tables(conn: sqlite3.Connection) -> None:
 def classify(round_share: float, unsupported: float) -> str:
     is_round = round_share >= ROUND_THRESHOLD
     if unsupported >= UNSEEN_THRESHOLD:
-        return "computed_tag" if is_round else "standing_tag"
+        return "round_unseen" if is_round else "irregular_unseen"
     if unsupported <= SEEN_THRESHOLD:
-        return "percentage_promo" if is_round else "supported"
+        return "round_seen" if is_round else "irregular_seen"
     return "mixed"
 
 
@@ -170,9 +183,9 @@ def per_store(conn: sqlite3.Connection) -> list[dict]:
         SELECT domain,
                COUNT(*)                                         AS claims,
                AVG(NOT seen)                                    AS unsupported,
-               AVG(pct >= 5 AND ABS(pct - 5 * ROUND(pct / 5.0)) <= {ROUND_TOLERANCE})
+               AVG(ABS(pct - 5 * ROUND(pct / 5.0)) <= {ROUND_TOLERANCE})
                                                                 AS round_share,
-               AVG(pct >= 5 AND ABS((pct - 5 * CAST(pct / 5.0 AS INTEGER)) - 2.5)
+               AVG(ABS((pct - 5 * CAST(pct / 5.0 AS INTEGER)) - 2.5)
                                     <= {ROUND_TOLERANCE})       AS control_share,
                AVG(pct)                                         AS mean_pct,
                SUM(fresh)                                       AS fresh_claims,
@@ -195,19 +208,39 @@ def _share(num, den):
     return (num or 0) / den if den else None
 
 
+def concentration(conn: sqlite3.Connection, where: str, total: int) -> dict:
+    """How many shops a cut rests on, and how much of it the three largest supply.
+
+    A share over 1.3 million variants can still be one shop's catalogue. A cut that
+    two shops dominate is a statement about those two shops.
+    """
+    rows = conn.execute(
+        f"SELECT domain, COUNT(*) FROM claim WHERE {where} GROUP BY domain ORDER BY 2 DESC"
+    ).fetchall()
+    top3 = sum(c for _, c in rows[:3])
+    return {
+        "stores": len(rows),
+        "top3_share_of_variants": (top3 / total) if total else None,
+        "top3_stores": [d for d, _ in rows[:3]],
+    }
+
+
 def claims_summary(conn: sqlite3.Connection, stores: list[dict]) -> dict:
-    """The same question answered three ways, because each one has a weakness.
+    """The same question answered four ways, because each one has a weakness.
 
     * all claims — the biggest sample, but a "was" price from before the first
       observation can never be seen, so this overstates;
-    * long watch — only variants followed for four weeks, which is fairer but
-      keeps the survivors (a variant has to stay listed for that long);
+    * long watch — only variants followed for four weeks (first point to the
+      last time the product was seen), which is fairer but keeps the survivors:
+      a variant has to stay listed that long;
     * fresh — only variants first seen *without* a tag, so the price before the
       tag appeared was actually observed. The cleanest test of a tag that
       *appeared* during the window, and blind to tags that were already there;
     * standing_28d — variants that arrived wearing a tag and were then watched
-      for four weeks. The tag has stood for the whole window; if the price
-      never once reached it, nothing was ever "reduced from" that number here.
+      for four weeks. The tag was already on at first sight and the product was
+      still listed four weeks later; if the price never once reached it, nothing
+      was ever visibly "reduced from" that number here. The tag may have changed
+      in between, so this is "a tag", not "the same tag all along".
     """
     cuts = {}
     for name, where in (
@@ -224,6 +257,9 @@ def claims_summary(conn: sqlite3.Connection, stores: list[dict]) -> dict:
             "unsupported": unsupported or 0,
             "unsupported_share": _share(unsupported, total),
         }
+    for name, where in (("all", "1"), ("long_watch", "long_watch"), ("fresh", "fresh"),
+                        ("standing_28d", "long_watch AND NOT fresh")):
+        cuts[name].update(concentration(conn, where, cuts[name]["variants"]))
     over30 = conn.execute("SELECT COUNT(*) FROM claim WHERE pct >= 30").fetchone()[0]
     kinds = {k: {"stores": 0, "claims": 0} for k in KINDS}
     for s in stores:
@@ -260,7 +296,7 @@ def movement(conn: sqlite3.Connection) -> dict:
         FROM agg
         """
     ).fetchone()
-    variants = conn.execute("SELECT COUNT(*) FROM agg").fetchone()[0]
+    variants = conn.execute("SELECT COUNT(*) FROM agg").fetchone()[0]  # variant x currency
     return {
         "variants_seen_once": single or 0,
         "variants_seen_once_share": (single or 0) / variants if variants else None,
@@ -331,10 +367,10 @@ def write_csv(path: Path, stores: list[dict]) -> None:
 
 
 COLORS = {
-    "computed_tag": "#c2410c",
-    "standing_tag": "#a16207",
-    "percentage_promo": "#2563eb",
-    "supported": "#0f766e",
+    "round_unseen": "#c2410c",
+    "irregular_unseen": "#a16207",
+    "round_seen": "#2563eb",
+    "irregular_seen": "#0f766e",
     "mixed": "#7b8794",
 }
 
@@ -391,10 +427,10 @@ def charts(out: Path, stores: list[dict], hist: dict) -> list[str]:
     made.append("round_vs_unsupported.png")
 
     # 2. The shape of the percentages. Round steps are a feature of promotions
-    # as well as of computed tags, which is why a store is judged on round *and*
+    # as well as of unseen "was" prices, which is why a store is judged on round *and*
     # unseen together, never on round alone.
     fig, ax = plt.subplots(figsize=(8.4, 4.4))
-    for label in ("computed_tag", "standing_tag", "percentage_promo", "supported"):
+    for label in ("round_unseen", "irregular_unseen", "round_seen", "irregular_seen"):
         curve = hist.get(label)
         n = sum(1 for s in stores if s["kind"] == label)
         # A curve drawn from one or two stores says more about those stores than
@@ -419,6 +455,15 @@ def charts(out: Path, stores: list[dict], hist: dict) -> list[str]:
 
 def run(db: Path, out: Path, with_charts: bool = True) -> dict:
     conn = connect_readonly(db)
+    try:
+        return _run(conn, out, with_charts)
+    except sqlite3.OperationalError as exc:
+        raise SystemExit(f"{db} does not look like a price-intelligence database: {exc}") from exc
+    finally:
+        conn.close()
+
+
+def _run(conn: sqlite3.Connection, out: Path, with_charts: bool) -> dict:
     out.mkdir(parents=True, exist_ok=True)
     build_tables(conn)
     stores = per_store(conn)
@@ -451,7 +496,6 @@ def run(db: Path, out: Path, with_charts: bool = True) -> dict:
         groups = {k: {s["domain"] for s in stores if s["kind"] == k} for k in KINDS}
         summary["charts"] = charts(out, stores, histogram(conn, groups))
         (out / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n")
-    conn.close()
     return summary
 
 

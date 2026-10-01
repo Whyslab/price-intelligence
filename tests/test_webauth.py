@@ -51,6 +51,12 @@ class TestASignatureTelegramWrote:
 
 
 class TestEverythingItMustRefuse:
+    def test_a_signature_dated_in_the_future_is_refused(self):
+        assert webauth.verify(signed(auth_date=time.time() + 3600), TOKEN) is None
+
+    def test_a_few_seconds_of_clock_skew_is_forgiven(self):
+        assert webauth.verify(signed(auth_date=time.time() + 20), TOKEN) == 42
+
     def test_another_bots_token_cannot_sign_for_this_one(self):
         assert webauth.verify(signed(token="999:OTHER"), TOKEN) is None
 

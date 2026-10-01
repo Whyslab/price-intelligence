@@ -1,15 +1,15 @@
 {
-  "generated": "2026-10-01T14:02:31+00:00",
+  "generated": "2026-10-01T14:14:01+00:00",
   "definitions": {
-    "claim": "a point where the struck-through price is >2% above the price",
+    "claim": "a point where the struck-through price is >10% above the price",
     "unsupported": "no point in the data charged ≥95% of the latest struck-through price",
     "round": "discount within 0.15 points of a multiple of 5",
     "control": "same window, half a step away — a reference, not a proof",
     "store kinds": {
-      "computed_tag": "round steps and a “was” price never charged",
-      "percentage_promo": "round steps, and the “was” price was charged",
-      "standing_tag": "irregular percentages, “was” price never charged",
-      "supported": "irregular percentages, “was” price was charged",
+      "round_unseen": "round steps and a “was” price never charged",
+      "round_seen": "round steps, and the “was” price was charged",
+      "irregular_unseen": "irregular percentages, “was” price never charged",
+      "irregular_seen": "irregular percentages, “was” price was charged",
       "mixed": "in between"
     },
     "store thresholds": {
@@ -40,65 +40,93 @@
     }
   },
   "claims": {
-    "variants_with_a_claim": 1353434,
-    "claims_over_30_percent": 1044197,
+    "variants_with_a_claim": 1335601,
+    "claims_over_30_percent": 1044359,
     "cuts": {
       "all": {
-        "variants": 1353434,
-        "unsupported": 1222545,
-        "unsupported_share": 0.9032911837592376
+        "variants": 1335601,
+        "unsupported": 1214478,
+        "unsupported_share": 0.9093119876370264,
+        "stores": 100,
+        "top3_share_of_variants": 0.28505070002193766,
+        "top3_stores": [
+          "shop.simon.com",
+          "www.dtlr.com",
+          "www.afew-store.com"
+        ]
       },
       "long_watch": {
-        "variants": 82589,
-        "unsupported": 55959,
-        "unsupported_share": 0.677559965612854
+        "variants": 813930,
+        "unsupported": 734373,
+        "unsupported_share": 0.9022557222365559,
+        "stores": 93,
+        "top3_share_of_variants": 0.25268757755580945,
+        "top3_stores": [
+          "www.afew-store.com",
+          "www.dtlr.com",
+          "www.overkillshop.com"
+        ]
       },
       "fresh": {
-        "variants": 74419,
-        "unsupported": 3791,
-        "unsupported_share": 0.05094129187438692
+        "variants": 84402,
+        "unsupported": 7355,
+        "unsupported_share": 0.0871424847752423,
+        "stores": 58,
+        "top3_share_of_variants": 0.5730669889339115,
+        "top3_stores": [
+          "shop.simon.com",
+          "www.afew-store.com",
+          "www.soleclassics.com"
+        ]
       },
       "standing_28d": {
-        "variants": 75157,
-        "unsupported": 55897,
-        "unsupported_share": 0.7437364450417127
+        "variants": 767611,
+        "unsupported": 727756,
+        "unsupported_share": 0.9480791703089195,
+        "stores": 92,
+        "top3_share_of_variants": 0.2528194619410092,
+        "top3_stores": [
+          "www.dtlr.com",
+          "www.afew-store.com",
+          "www.overkillshop.com"
+        ]
       }
     },
     "stores_analysed": 87,
     "min_claims_per_store": 200,
-    "claims_in_analysed_stores": 1352505,
+    "claims_in_analysed_stores": 1334773,
     "store_kinds": {
-      "computed_tag": {
+      "round_unseen": {
         "stores": 32,
-        "claims": 351391
+        "claims": 350738
       },
-      "percentage_promo": {
+      "round_seen": {
         "stores": 2,
         "claims": 21418
       },
-      "standing_tag": {
-        "stores": 41,
-        "claims": 754617
+      "irregular_unseen": {
+        "stores": 42,
+        "claims": 748072
       },
-      "supported": {
+      "irregular_seen": {
         "stores": 1,
         "claims": 1261
       },
       "mixed": {
-        "stores": 11,
-        "claims": 223818
+        "stores": 10,
+        "claims": 213284
       }
     },
-    "median_store_unsupported": 0.971189207613512,
-    "median_round_share": 0.5137791070284128,
-    "median_control_share": 0.010895107882930999
+    "median_store_unsupported": 0.9770559091856531,
+    "median_round_share": 0.5268306316377864,
+    "median_control_share": 0.011231748408835642
   },
   "movement": {
-    "variants_seen_once": 3363404,
-    "variants_seen_once_share": 0.7225466333543147,
-    "variants_with_3plus_points": 861368,
-    "moved_over_5_percent": 183893,
-    "moved_over_20_percent": 128165
+    "variants_seen_once": 3423704,
+    "variants_seen_once_share": 0.7283904731734892,
+    "variants_with_3plus_points": 851027,
+    "moved_over_5_percent": 170212,
+    "moved_over_20_percent": 114707
   },
   "cross_store": {
     "articles": 138948,

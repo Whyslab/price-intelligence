@@ -805,9 +805,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"user": user_id, "items": [favorite_json(i) for i in items]})
                 return
             self._json({"error": "not found"}, 404)
-        except Exception as exc:  # a browsable page must not take the process down
+        except Exception:  # a browsable page must not take the process down
             log.exception("%s failed", self.path)
-            self._json({"error": f"{type(exc).__name__}: {exc}"}, 500)
+            self._json({"error": "internal error"}, 500)
 
     do_HEAD = do_GET
 
@@ -858,9 +858,9 @@ class Handler(BaseHTTPRequestHandler):
             # same wish stated twice, and the page should not have to care.
             self._json({"product_id": product_id, "added": added}, 201 if added else 200)
             return
-        except Exception as exc:
+        except Exception:
             log.exception("%s failed", self.path)
-            self._json({"error": f"{type(exc).__name__}: {exc}"}, 500)
+            self._json({"error": "internal error"}, 500)
 
     def do_DELETE(self) -> None:
         parsed = urlparse(self.path)
@@ -885,9 +885,9 @@ class Handler(BaseHTTPRequestHandler):
                 conn.commit()
             self._json({"product_id": product_id, "removed": removed})
             return
-        except Exception as exc:
+        except Exception:
             log.exception("%s failed", self.path)
-            self._json({"error": f"{type(exc).__name__}: {exc}"}, 500)
+            self._json({"error": "internal error"}, 500)
 
 
 def serve(

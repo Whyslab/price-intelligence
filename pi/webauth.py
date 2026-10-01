@@ -38,6 +38,7 @@ log = logging.getLogger(__name__)
 # that is not a payment, and a Web App left open on a phone overnight should
 # still be able to star something in the morning.
 MAX_AGE_SECONDS = 24 * 60 * 60
+CLOCK_SKEW_SECONDS = 60
 
 
 def _check_string(fields: list[tuple[str, str]]) -> str:
@@ -79,7 +80,9 @@ def verify(
     except ValueError:
         return None
     age = (time.time() if now is None else now) - auth_date
-    if auth_date <= 0 or age > max_age:
+    # A date in the future is as wrong as one too old: a minute of clock skew is
+    # forgiven, a stolen or forged signature dated next year is not.
+    if auth_date <= 0 or age > max_age or age < -CLOCK_SKEW_SECONDS:
         log.debug("initData signature is valid but %.0f hours old", age / 3600)
         return None
 
